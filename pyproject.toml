@@ -1,0 +1,101 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tfx-quant"
+version = "0.1.0"
+description = "Windows desktop automated trading system for Yuanta Futures (元大期貨)"
+requires-python = "==3.11.*"
+readme = "README.md"
+dependencies = [
+    "pydantic>=2.6,<3",
+    "tzdata>=2024.1; sys_platform == 'win32'",
+    "wxPython>=4.2,<5",
+    "comtypes>=1.2,<2; sys_platform == 'win32'",
+    "keyring>=25,<26; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "mypy>=1.9",
+    "ruff>=0.6",
+    "import-linter>=2.0",
+]
+
+[project.scripts]
+tfx-quant-desktop = "tfx_quant.desktop.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tfx_quant"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+mypy_path = "src"
+explicit_package_bases = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = "wx.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "comtypes.*"
+ignore_missing_imports = true
+
+[tool.importlinter]
+root_package = "tfx_quant"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Domain has no dependency on other layers"
+type = "forbidden"
+source_modules = ["tfx_quant.domain"]
+forbidden_modules = [
+    "tfx_quant.application",
+    "tfx_quant.infrastructure",
+    "tfx_quant.persistence",
+    "tfx_quant.desktop",
+]
+
+[[tool.importlinter.contracts]]
+name = "Application does not depend on infrastructure, persistence, or desktop"
+type = "forbidden"
+source_modules = ["tfx_quant.application"]
+forbidden_modules = [
+    "tfx_quant.infrastructure",
+    "tfx_quant.persistence",
+    "tfx_quant.desktop",
+]
+
+[[tool.importlinter.contracts]]
+name = "Infrastructure does not depend on persistence or desktop"
+type = "forbidden"
+source_modules = ["tfx_quant.infrastructure"]
+forbidden_modules = ["tfx_quant.persistence", "tfx_quant.desktop"]
+
+[[tool.importlinter.contracts]]
+name = "Persistence does not depend on infrastructure or desktop"
+type = "forbidden"
+source_modules = ["tfx_quant.persistence"]
+forbidden_modules = ["tfx_quant.infrastructure", "tfx_quant.desktop"]

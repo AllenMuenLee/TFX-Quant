@@ -1,0 +1,13 @@
+{
+  "account_alias": "primary",
+  "environment": "TEST",
+  "selected_instrument": "MXF",
+  "contract_selection_mode": "AUTO",
+  "manual_contract_year": null,
+  "manual_contract_month": null,
+  "timezone_id": "Asia/Taipei",
+  "eod_flatten_local_time": "04:55:00",
+  "max_net_lots": 2,
+  "use_mock": true,
+  "instrument_master_path": null
+}

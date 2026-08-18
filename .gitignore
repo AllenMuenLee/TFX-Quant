@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environment
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vs/
+.idea/
+.vscode/
+
+# Vendor API packages (proprietary, installed locally per docs/secrets-management.md)
+交易API元件及說明文件/
+行情API元件及說明文件/
+
+# Local secrets and per-machine config (should never exist, but never trust that)
+*.env
+.env.*
+settings.local.json
+settings.*.local.json
+*.db
+*.sqlite3

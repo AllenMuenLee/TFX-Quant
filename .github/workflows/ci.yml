@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The whole project — domain/application included, not just
+      # infrastructure.yuanta/desktop — standardizes on a single x32 (32-bit)
+      # Python interpreter; see docs/adr/0001-python-version-and-runtime.md. There
+      # is no x64 build/test path.
+      - name: Setup Python 3.11 (x32)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: "x86"
+
+      - name: Install package (with dev extras)
+        run: pip install -e ".[dev]"
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Format check (ruff)
+        run: ruff format --check .
+
+      - name: Type-check (mypy)
+        run: mypy src
+
+      # Proves the "dependencies point toward domain" layering rule mechanically —
+      # the Python equivalent of .NET project references (see
+      # docs/adr/0003-layering-and-event-threading-model.md).
+      - name: Architecture/layering check (import-linter)
+        run: lint-imports
+
+      # No Yuanta OCX is installed on this runner and none is required: the real
+      # comtypes/wx adapters (infrastructure/yuanta/trade_ocx_adapter.py,
+      # quote_ocx_adapter.py) only need an OCX at runtime, not at import/type-check
+      # time, and every test uses the mock/fake gateways. Feature 03+ must keep this
+      # property (see src/tfx_quant/infrastructure/yuanta/README.md).
+      - name: Test (pytest)
+        run: pytest
