@@ -1,69 +1,85 @@
-"""Opt-in live smoke test against the real Yuanta test environment.
+"""Opt-in live smoke test against the real Yuanta SPARK API test environment.
 
 Skipped by default. Requires explicit opt-in (`TFX_QUANT_LIVE_YUANTA_SMOKE_TEST=1`)
-**and** real, resolvable credentials (`TFX_QUANT_YUANTA_USER_ID` env var + a Windows
-Credential Manager entry — see `docs/secrets-management.md`), per the implementation
-prompt's "以 staging/mock 提供登入 smoke test；真實帳號測試必須是明確 opt-in".
+**and** real, resolvable credentials — a test-only `TFX_QUANT_YUANTA_TEST_USER_ID` env
+var for the full SPARK API account string, plus a password already secure-stored for
+that ID via the real login screen's "安全儲存密碼" checkbox (or `keyring set
+tfx_quant.yuanta <user_id>` directly) — per the implementation prompt's "以 staging/
+mock 提供登入 smoke test；真實帳號測試必須是明確 opt-in". This deliberately reuses
+`credentials.load_stored_password`, the same production code path the login screen
+uses, rather than a separate test-only credential loader — see
+`docs/secrets-management.md`.
 
-Order submission has no code path anywhere in this repository yet (`SendOrderF` is
-never called — see `infrastructure/yuanta/README.md`; order submission is Feature
-06's job), so "預設禁止送單" is satisfied structurally rather than by a runtime flag
-guarding functionality that doesn't exist.
+Order submission has no code path anywhere in this repository yet (`SendFutureOrder` is
+never called — see `infrastructure/yuanta/README.md`; order submission is Feature 06's
+job), so "預設禁止送單" is satisfied structurally rather than by a runtime flag guarding
+functionality that doesn't exist.
 
-Also requires both OCXs to actually be loadable/registered. The project's sole venv is
-x32 (32-bit — see ADR 0001), so the `struct.calcsize` skip below is a defensive
-fallback rather than the live blocker; the real blocker as of this writing is that
-`YuantaOrd.ocx` itself won't `LoadLibrary` on this dev machine at all (an unrelated
-legacy VC90 MFC runtime issue, not a bitness one) — see
-`docs/adr/0004-broker-session-architecture.md`'s "Execution attempt findings" and
-"What's not verified".
+Also requires the .NET 8 SDK and the real `YuantaSparkAPI.dll` to be present (see
+`preflight.py`) — `raise_if_any_failed(run_preflight_checks())` below skips the test
+via a normal exception if they aren't, rather than a bespoke check here. Unlike the
+retired legacy-OCX build (which did get a real end-to-end round-trip verified in an
+earlier session), this SPARK API rewrite has not yet been run against a live server in
+any session — see `docs/adr/0004-broker-session-architecture.md`'s "What's not
+verified". This test is what closes that gap whenever someone with a real environment
+runs it.
 """
 
 from __future__ import annotations
 
 import os
-import struct
 
 import pytest
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("TFX_QUANT_LIVE_YUANTA_SMOKE_TEST") != "1",
     reason="opt-in only: set TFX_QUANT_LIVE_YUANTA_SMOKE_TEST=1 to run against the "
-    "real Yuanta test environment with real credentials",
+    "real Yuanta SPARK API test environment with real credentials",
 )
 
 
 def test_real_session_reaches_ready_against_the_test_environment() -> None:
-    if struct.calcsize("P") == 8:
-        pytest.skip("requires an x32 (32-bit) Python interpreter — see ADR 0001")
+    user_id = os.environ.get("TFX_QUANT_YUANTA_TEST_USER_ID")
+    if not user_id:
+        pytest.skip("set TFX_QUANT_YUANTA_TEST_USER_ID to the SPARK API account to smoke-test with")
+
+    from pydantic import SecretStr
 
     from tfx_quant.application.events.event_coordinator import EventCoordinator
+    from tfx_quant.application.ports.broker_session import LoginRequest
     from tfx_quant.application.settings.trading_settings import Environment
-    from tfx_quant.infrastructure.yuanta.credentials import EnvironmentAndKeyringCredentialSource
+    from tfx_quant.infrastructure.yuanta import credentials
     from tfx_quant.infrastructure.yuanta.preflight import raise_if_any_failed, run_preflight_checks
-    from tfx_quant.infrastructure.yuanta.quote_ocx_adapter import YuantaQuoteOcxAdapter
     from tfx_quant.infrastructure.yuanta.session_orchestrator import BrokerSessionOrchestrator
-    from tfx_quant.infrastructure.yuanta.trade_ocx_adapter import YuantaTradeOcxAdapter
+    from tfx_quant.infrastructure.yuanta.spark_api_adapter import SparkApiSessionAdapter
 
-    credential_source = EnvironmentAndKeyringCredentialSource()
-    raise_if_any_failed(run_preflight_checks(credential_source))
+    password = credentials.load_stored_password(user_id)
+    if not password:
+        pytest.skip(
+            f"no password secure-stored for {user_id!r} — use the login screen's "
+            "「安全儲存密碼」checkbox or `keyring set tfx_quant.yuanta <user_id>` first"
+        )
+
+    raise_if_any_failed(run_preflight_checks())
 
     event_coordinator = EventCoordinator()
     event_coordinator.start()
     try:
-        trade_adapter = YuantaTradeOcxAdapter(environment=Environment.TEST)
-        quote_adapter = YuantaQuoteOcxAdapter(environment=Environment.TEST)
+        adapter = SparkApiSessionAdapter()
         orchestrator = BrokerSessionOrchestrator(
-            trade_adapter=trade_adapter,
-            quote_adapter=quote_adapter,
-            credential_source=credential_source,
+            adapter=adapter,
             event_coordinator=event_coordinator,
             login_timeout_seconds=30.0,
         )
-        trade_adapter.bind_orchestrator(orchestrator)
-        quote_adapter.bind_orchestrator(orchestrator)
+        adapter.bind_orchestrator(orchestrator)
 
-        orchestrator.start()
+        orchestrator.start(
+            LoginRequest(
+                environment=Environment.TEST,
+                user_id=user_id,
+                password=SecretStr(password),
+            )
+        )
 
         import time
 

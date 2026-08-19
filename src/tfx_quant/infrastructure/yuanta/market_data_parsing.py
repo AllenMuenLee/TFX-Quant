@@ -1,23 +1,20 @@
-"""Pure parsing of `OnGetMktAll` raw BSTR fields into typed values.
+"""Pure parsing of SPARK API `StockTickResult` pushes into typed values.
 
 Kept separate from `session_orchestrator.py` so that module doesn't grow unrelated
-parsing responsibilities — it already has one raw-string parser (`_parse_futures_accounts`
-for `OnLogonS`'s `AccList`) as precedent for this split.
+parsing responsibilities.
 
-Two undocumented-format gaps, both flagged rather than guessed (see
-`docs/adr/0006-market-data-and-bar-aggregation.md`):
+This module previously parsed the legacy OCX API's `OnGetMktAll` BSTR fields, which had
+two undocumented-format gaps (`MatchTime`'s digit count, no per-trade sequence number —
+`TolMatchQty` stood in as a proxy). SPARK API's `SubscribeStockTick`/`StockTickResult`
+(交易/行情 docs, 分時明細訂閱 page) resolves both: `Time` is a structured `TYuantaTime`
+object (`bytHour`/`bytMin`/`bytSec`/`ushtMSec`, not a raw digit string to parse), and
+`SerialNo` is a real, documented per-symbol trade sequence number ("以股票代碼個別編序
+號，從1開始，-1代表商品清盤") — no more `TolMatchQty`-as-proxy. See
+`docs/adr/0006-market-data-and-bar-aggregation.md`'s addendum.
 
-- **`MatchTime`'s digit count is never stated** in `元大行情API.pdf` (just "char*
-  MatchTime 成交時間"). Parsed defensively: 6 digits -> HHMMSS, 9 digits -> HHMMSS plus
-  3-digit milliseconds. Any other length is rejected as malformed.
-- **No documented per-trade sequence number** — `TolMatchQty` (total cumulative volume)
-  is the closest available strictly-increasing-per-symbol field and is carried through
-  as `cumulative_volume`, the ordering/dedup key `domain.bar_aggregator.BarAggregator`
-  uses. See `domain/tick.py`.
-
-`TolMatchQty == -1` is the PDF's documented 盤前行情資料 (pre-market data) sentinel —
-`parse_market_data_push` returns `None` for that case (nothing to feed the aggregator,
-not a parse error).
+`SerialNo == -1` is the docs' documented 商品清盤 (end-of-session settlement) sentinel —
+`parse_stock_tick_push` returns `None` for that case (nothing to feed the aggregator,
+not a parse error), mirroring the old `TolMatchQty == -1` pre-market sentinel handling.
 """
 
 from __future__ import annotations
@@ -28,76 +25,87 @@ from decimal import Decimal, InvalidOperation
 
 from tfx_quant.infrastructure.yuanta.errors import MarketDataParseError
 
-_PRE_MARKET_SENTINEL = "-1"
+_SETTLEMENT_SENTINEL = -1
 
 
 @dataclass(frozen=True, slots=True)
-class ParsedMarketDataPush:
+class ParsedStockTickPush:
     vendor_symbol: str
     price: Decimal
     size: int
-    cumulative_volume: int
+    serial_no: int
     exchange_time: time
 
 
-def _parse_match_time(raw: str) -> time:
-    digits = raw.strip()
-    if len(digits) == 6 and digits.isdigit():
-        hour, minute, second = int(digits[0:2]), int(digits[2:4]), int(digits[4:6])
-        microsecond = 0
-    elif len(digits) == 9 and digits.isdigit():
-        hour, minute, second = int(digits[0:2]), int(digits[2:4]), int(digits[4:6])
-        microsecond = int(digits[6:9]) * 1000
-    else:
-        raise MarketDataParseError(f"MatchTime 格式無法辨識（需為 6 或 9 位數字）：{raw!r}")
+def _parse_yuanta_time(*, hour: int, minute: int, second: int, millisecond: int) -> time:
     try:
-        return time(hour, minute, second, microsecond)
+        return time(hour, minute, second, millisecond * 1000)
     except ValueError as exc:
-        raise MarketDataParseError(f"MatchTime 數值超出範圍：{raw!r}") from exc
+        raise MarketDataParseError(
+            f"StockTickResult.Time 數值超出範圍：{hour:02d}:{minute:02d}:{second:02d}."
+            f"{millisecond:03d}"
+        ) from exc
 
 
-def _parse_decimal(raw: str, *, label: str) -> Decimal:
+def _parse_decimal(raw: object, *, label: str) -> Decimal:
     try:
-        return Decimal(raw.strip())
+        return Decimal(str(raw))
     except InvalidOperation as exc:
         raise MarketDataParseError(f"{label} 不是有效數字：{raw!r}") from exc
 
 
-def _parse_int(raw: str, *, label: str) -> int:
+def _parse_int(raw: object, *, label: str) -> int:
     try:
-        return int(raw.strip())
-    except ValueError as exc:
+        return int(str(raw))
+    except (TypeError, ValueError) as exc:
         raise MarketDataParseError(f"{label} 不是有效整數：{raw!r}") from exc
 
 
-def parse_market_data_push(
+def parse_stock_tick_push(
     *,
-    symbol: str,
-    match_time: str,
-    match_pri: str,
-    match_qty: str,
-    tol_match_qty: str,
-) -> ParsedMarketDataPush | None:
-    """Returns `None` for a pre-market snapshot push (`TolMatchQty == -1`) — no real
+    stk_code: str,
+    serial_no: object,
+    deal_price: object,
+    deal_vol: object,
+    hour: object,
+    minute: object,
+    second: object,
+    millisecond: object,
+) -> ParsedStockTickPush | None:
+    """Returns `None` for a 商品清盤 (settlement) push (`SerialNo == -1`) — no real
     trade to feed the aggregator. Raises `MarketDataParseError` for anything malformed.
+
+    Callers pass `StockTickResult`'s fields individually (not the raw .NET object)
+    so this module stays pure-Python and independently testable, matching this
+    codebase's existing split between vendor-callback glue and parsing logic.
     """
-    if not symbol.strip():
-        raise MarketDataParseError("OnGetMktAll 的 Symbol 為空白")
+    if not stk_code.strip():
+        raise MarketDataParseError("StockTickResult 的 StkCode 為空白")
 
-    if tol_match_qty.strip() == _PRE_MARKET_SENTINEL:
+    serial_no_parsed = _parse_int(serial_no, label="SerialNo")
+    if serial_no_parsed == _SETTLEMENT_SENTINEL:
         return None
+    if serial_no_parsed < 1:
+        raise MarketDataParseError(f"SerialNo 必須 >= 1（或 -1 代表清盤），得到 {serial_no_parsed}")
 
-    price = _parse_decimal(match_pri, label="MatchPri")
+    price = _parse_decimal(deal_price, label="DealPrice")
     if price <= 0:
-        raise MarketDataParseError(f"MatchPri 必須為正數，得到 {match_pri!r}")
-    size = _parse_int(match_qty, label="MatchQty")
-    cumulative_volume = _parse_int(tol_match_qty, label="TolMatchQty")
-    exchange_time = _parse_match_time(match_time)
+        raise MarketDataParseError(f"DealPrice 必須為正數，得到 {deal_price!r}")
+    size = _parse_int(deal_vol, label="DealVol")
+    if size < 0:
+        raise MarketDataParseError(f"DealVol 必須 >= 0，得到 {size}")
 
-    return ParsedMarketDataPush(
-        vendor_symbol=symbol.strip(),
+    exchange_time = _parse_yuanta_time(
+        hour=_parse_int(hour, label="Time.bytHour"),
+        minute=_parse_int(minute, label="Time.bytMin"),
+        second=_parse_int(second, label="Time.bytSec"),
+        millisecond=_parse_int(millisecond, label="Time.ushtMSec"),
+    )
+
+    return ParsedStockTickPush(
+        vendor_symbol=stk_code.strip(),
         price=price,
         size=size,
-        cumulative_volume=cumulative_volume,
+        serial_no=serial_no_parsed,
         exchange_time=exchange_time,
     )

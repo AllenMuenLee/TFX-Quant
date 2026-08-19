@@ -1,147 +1,173 @@
 # infrastructure.yuanta — vendor API inventory
 
-Vendor deliverables live at the repo root (gitignored, proprietary, installed locally —
-never committed): `交易API元件及說明文件/` (trading) and `行情API元件及說明文件/`
-(quote).
+**2026-08-19: this codebase now targets 元大 SPARK API exclusively** — every
+implementation prompt was rewritten to mandate the official online docs
+(`https://www.yuanta.com.tw/file-repository/content/API/page/index.html` and its docs
+site) as the only valid API spec source. The legacy COM/ActiveX OCX pair this file used
+to document is confirmed **legacy, maintenance-only** on the vendor's own portal
+(`YuantaOneAPI_Com.zip`, listed alongside Delphi/WPF). See `docs/adr/0001-python-
+version-and-runtime.md`, `0002-ui-framework-and-com-hosting.md`, and
+`0004-broker-session-architecture.md` for the full rewrite rationale — this file is the
+quick-reference API inventory.
 
-Feature 02 re-extracted these facts two ways: PDF/docx text via `pypdf`/`python-docx`
-(poppler wasn't available for the usual page-render extraction), and — more
-importantly — **exact ProgIDs, CLSIDs, and method/event signatures read directly from
-each `.ocx`'s embedded COM type library** via `comtypes.client.GetModule(ocx_path)`,
-which parses the type library straight from the file and needs no COM registration.
-The type library is ground truth; the PDF is not always current — see the quote OCX
-callout below.
+## SPARK API
 
-## Trading API (交易API)
+A **.NET 8 C#** component (`YuantaSparkAPI.dll`), driven from Python via `pythonnet`.
+Cross-platform (Windows/Linux/macOS), both bitnesses on Windows (win-x64/win-x86) — no
+bitness constraint, unlike the legacy quote OCX. Official docs site (a client-rendered
+SPA — plain HTTP fetch returns empty; needs a real browser to read):
+`http://www.yuanta.com.tw/file-repository/content/sparkapi_docs/...`.
 
-COM/ActiveX OCX, MFC-based. Ships **both bitnesses**:
+Vendor deliverable (the downloaded component zip, containing `YuantaSparkAPI.dll` and
+its sibling `.dll`/`.so`/`.dylib` files plus `FunctionList.xls`) is proprietary,
+installed locally, and gitignored — never committed. Conventional local path:
+`C:\Yuanta\SparkAPI` (`infrastructure/yuanta/spark_client.py`'s
+`default_dll_directory()` — a codebase convention, not vendor-mandated). Local log
+files default to `C:\Yuanta\YuantaSparkAPI\Log` (Windows), kept 30 days.
 
-- `API/YuantaOrd.ocx` — 32-bit, ProgID `Yuanta.YuantaOrdCtrl.1`, CLSID
-  `{70AA5E9A-4564-4C29-9403-4407FE8A7358}`, dispatch IID
-  `{7AC14464-3996-4402-8CF9-1514159E157E}`, events IID
-  `{90467C91-11D5-4AE4-BE11-5052E55869C8}`
-- `API_x64/YuantaOrd64.ocx` — 64-bit, ProgID `Yuanta.YuantaOrdCtrl.64`, CLSID
-  `{361303F7-8986-4DAC-9887-3E9FDA110FB9}`, dispatch IID
-  `{CB868718-B94E-4259-991F-D1569A70433E}`, events IID
-  `{32B3B217-8408-41FD-8922-B22B3DAD2474}`
+### Session lifecycle (基礎)
 
-Every CLSID/IID above and every signature below was confirmed against the type
-library, not just the PDF — they agree for this control (unlike the quote OCX, see
-below).
+```python
+objYuantaSparkAPI = YuantaSparkAPITrader()
+objYuantaSparkAPI.SetLogType(enumLogType.COMMON)
+objYuantaSparkAPI.OnResponse += on_response  # one unified callback, see below
+objYuantaSparkAPI.Open(enumEnvironmentMode.UAT)  # or .PROD
+objYuantaSparkAPI.Login(account, password)  # Windows: 2 args only
+```
 
-Core surface (from `元大BToCAPI格式.pdf`, confirmed against the type library):
+- `Login(Account: str, Pass: str) -> bool` (Windows) — `Account` is the full account
+  string, not a "歸戶 ID": 證券 `S`+分公司代號(4)+帳號(7) (11 chars), 期貨
+  `F`+分公司代號(7+3)+帳號(7) (17 chars, e.g. `FF021000P001234567`). This codebase only
+  ever logs in with `F`-prefixed futures accounts. The `bool` return only means "call
+  accepted" — the real result (`LoginResult`) arrives via `OnResponse` with
+  `strIndex == 'Login'`.
+- **No certificate path parameter on Windows.** A certificate must be imported into the
+  OS certificate store beforehand (前言 > 測試環境&正式環境說明: "...匯入至電腦即可使
+  用") — see `credentials.ensure_certificate_imported` and `desktop/login_dialog.py`'s
+  certificate import controls. (Linux/Mac's `Login()` *does* take a cert path + cert
+  password as its first two args — irrelevant here, Windows-only codebase.)
+- `OnResponse(intMark, dwIndex, strIndex, objHandle, objValue)` — the **one** callback
+  covering every async result. `intMark`: `0`=系統回應, `1`=查詢回應, `2`=訂閱推播.
+  `strIndex` names the originating function (`'Login'`, `'GetRealReport'`,
+  `'SubscribeStockTick'`, ...); `objValue`'s shape depends on `strIndex`.
+- `LogOut()`/`Close()`/`Dispose()` — session teardown.
+- Rate limits (前言 > 使用限制說明, load-bearing for any future throttling work):
+  repeat login on an already-logged-in account is rejected; failed-login retry capped
+  at 1/4s; ≤10 subscribe calls/sec/FunctionID, ≤200 symbols/subscribe call, ≤3
+  quote/account calls/sec/FunctionID (`GetKLine` excluded, capped at 1/sec separately),
+  ≤10 trade calls/sec/FunctionID, ≤30 orders/call; per-account ≤10 concurrent
+  connections, ≤1000 logins/day, ≤3000 total subscribed symbols, 1200/600/3000
+  calls-per-minute for quote/account/trade categories (exceeding → 1-min pause; 10
+  pauses/hour → API access revoked for the account).
 
-- `SetFutOrdConnection(ID: BSTR, Pass: BSTR, IP: BSTR, Port: int) -> int` /
-  `DoLogout() -> None`, `OnLogonS(TLinkStatus: int, AccList: BSTR, Casq: BSTR, Cast:
-  BSTR)` event
-- `SendOrderF(...) -> BSTR` — 15 BSTR params: `FCode`/`CommodityType`/`BranchID`/
-  `AcNo`/`SubAcNo`/`OrdNo`/`BSCode`/`FutNo`/`Pri1`/`Qty1`/`OffSet`/`PriType`(M/L)/
-  `OrdCond`(R=ROD,F=FOK,I=IOC)/`BSCode2`/`FutNo2` — **not called anywhere in this
-  codebase**; order submission is Feature 06's job
-- `OnOrdRptF` / `OnOrdMatF` events — order/match reports (fields include `Bhno`/`Acno`/
-  `Suba`/`Symb`/`O_Kind`/`Buys`/`O_Prc`/`O_Qty`/`Work_Qty`/`Kill_Qty`/`Deal_Qty`/
-  `Order_No`/`Oseq_No`/`Err_Code`) — not subscribed to by Feature 02 (no code
-  consuming order/match pushes exists yet; that's Feature 06)
-- `ReportQuery(Func, Bhno, AcNo, Suba, Stus, Kind, Cflg) -> int` +
-  `OnReportQuery(RowCount: int, Results: BSTR)` — order query
-- `DealQuery(Func, Bhno, AcNo, Suba, Kind) -> int` + `OnDealQuery(RowCount: int,
-  Results: BSTR)` — fill query
-- `UserDefinsFunc(Params: BSTR, WorkID: BSTR) -> int` +
-  `OnUserDefinsFuncResult(RowCount: int, Results: BSTR, WorkID: BSTR)` — general
-  query; `Func=RA003` (部位狀況查詢) is the only documented mechanism for **position
-  query** — no worked example of `RA003`'s row layout exists in the PDF, so Feature 02
-  only checks this call completed, it doesn't parse the row data (see ADR 0004)
-- `SetLog(Enable: int)` — enables raw packet logging to a file. **Never called** by
-  this codebase — the packets plausibly contain the ID/password, and enabling this
-  would work against `docs/secrets-management.md`'s "never log a secret" rule.
-- A parallel `RfSendOrder` / `OnRfOrdRptRF` / `OnRfOrdMatRF` / `RfReportQuery` /
-  `RfDealQuery` path also exists (**國外期貨**, foreign futures) — out of scope, this
-  system only trades TXF/MXF (domestic).
+### Futures trading (交易 > 國內期貨下單) — Feature 06's job, not wired up yet
 
-Endpoints: test `apitest.yuantafutures.com.tw:80`, prod
-`api.yuantafutures.com.tw:80/443`.
+`SendFutureOrder(LoginAcno, List[FutureOrder], lng=Normal) -> bool`. Cancel/modify
+reuse this same method with a different `FunctionCode` on `FutureOrder` (00=新單,
+04=取消, 05=改量, 07=改價) — no separate cancel/modify method. Key `FutureOrder`
+fields: `Identity` (caller-assigned correlation id), `Account`, `OrderNo` (blank for
+new), `TradeDate` ("yyyy/MM/dd"), `CommodityID1` (order-side product code, e.g.
+`"FITX"` for TXF — **a separate code space from the real-time quote symbol**, see
+below), `SettlementMonth1` (int `YYYYMM`), `Price`, `OrderQty1`, `BuySell1` ("B"/"S"),
+`OpenOffsetKind` ("0"=新倉/"1"=平倉/"2"=自動), `OrderType` ("1"=市價/"2"=限價/"3"=範圍
+市價), `OrderCond` (ROD/FOK/IOC). Result arrives via `OnResponse` with
+`strIndex == 'SendFutureOrder'`, `objValue.ResultList[i].ReplyCode` (0=success).
 
-## Quote API (行情API)
+### Futures quote-symbol encoding (前言 > 期貨報價代碼7xxx變更規則) — now a real formula
 
-COM/ActiveX OCX `QAPI/YuantaQuote_v2.1.2.9.ocx`, ProgID `YUANTAQUOTE.YuantaQuoteCtrl.1`
-(extracted from the `.ocx`'s string table — not stated anywhere in the PDF/txt), CLSID
-`{8E7FB42A-1137-467E-98C6-830C9B02EA82}`, dispatch IID
-`{48BD1D0C-21D8-4B72-8850-9909A7D8C205}`, events IID
-`{E49166B8-9C1F-442E-A538-CD98E80CFCB1}`. **No 64-bit build shipped** — this is what
-forces the whole project to be x32 (32-bit) in production (see
-`docs/adr/0001-python-version-and-runtime.md` and
-`docs/adr/0002-ui-framework-and-com-hosting.md`). Requires a separate market-data
-agreement (via 營業員) beyond plain trading API access.
+`<root(3 chars)><month-code(1 char)><year-digit(1 char)>`. Month code:
+`"1ABCDEFGHIJKL"[month]` (near-month alias `1`, then 一月=A...十二月=L); year-digit is
+the calendar year's last digit. Worked example: `2021年台指期6月:TXFF1`. Implemented as
+`domain.instrument_master.futures_quote_symbol()`, tested against that exact example.
+This resolves the previous `-UNCONFIRMED` placeholder problem for `vendor_symbol` in
+`instrument_master.example.json` — see `docs/adr/0005-*.md`'s addendum.
 
-**The live type library disagrees with `元大行情API.pdf` in several places** — the
-shipped build is evidently newer/extended relative to what the PDF documents. Confirmed
-from the type library (authoritative — see `vendor_codes.py`):
+**`order_commodity_code` (`SendFutureOrder.CommodityID1`) is a separate, unconfirmed
+code space** — only TXF's `"FITX"` is confirmed (from the 國內期貨下單 docs page's own
+worked example); other instruments need confirmation against the vendor's
+`FunctionList.xls` before Feature 06 can place orders for them.
 
-- `SetMktLogon(user: BSTR, pass: BSTR, ip: BSTR, port: BSTR, ReqType: int, SetMap:
-  int) -> None` — PDF only shows 4 params; `ReqType`/`SetMap` are undocumented
-  anywhere available to this session.
-- `AddMktReg(symbol: BSTR, updmode: BSTR, ReqType: int, SetMap: int) -> int` — PDF's
-  `UpdateMode` (1=Snapshot, 2=Update, 4=SnapshotUpd) is real, but the live
-  dispinterface marshals it as a **string**, not an int, plus the same two extra
-  params.
-- `DelMktReg(symbol: BSTR, ReqType: int) -> int`
-- `OnMktStatusChange(Status: int, Msg: BSTR, ReqType: int)` — `Msg[0]` code table is
-  unchanged from the PDF (see `vendor_codes.QUOTE_MSG_CODE_MESSAGES`), just with a
-  trailing `ReqType` added to the event.
-- `OnRegError(symbol: BSTR, updmode: int, ErrCode: int, ReqType: int)`
-- `OnGetMktAll(...)` — same 19 fields as the PDF (`Symbol`/`RefPri`/.../`FDSQty`) plus
-  a trailing `ReqType`.
-- A whole undocumented "Tick" subsystem also exists in the live control
-  (`AddTickReg`/`DelTickReg`/`GetTickRangeData`/`OnGetTickData`/etc.) — not in the PDF
-  at all, not used by this codebase.
+### Market data (行情)
 
-`ReqType`/`SetMap` have no documented meaning found anywhere; `infrastructure/yuanta/
-quote_ocx_adapter.py` passes `0` for both as an explicitly-flagged placeholder — see
-`vendor_codes.py` and ADR 0004's "What's not verified".
+- `SubscribeStockTick(LoginAcno, List[StockTick], lng) -> bool` /
+  `UnSubscribeStockTick(...)` — `StockTick` just needs `MarketType` (hardcoded to
+  `TAIFEX` in `spark_client.py` — this codebase only trades domestic futures) and
+  `StockCode` (the quote symbol above). Push arrives via `OnResponse` with
+  `intMark == 2`, `strIndex == 'SubscribeStockTick'`, one `StockTickResult` per tick:
+  `SerialNo` (**a real per-symbol trade sequence number, starting at 1; `-1` = 商品清
+  盤/settlement** — resolves the old ADR 0006 gap that had to fake dedup via cumulative
+  volume), `Time` (structured `TYuantaTime`: `bytHour`/`bytMin`/`bytSec`/`ushtMSec`,
+  not a raw digit string), `DealPrice`, `DealVol`. See `market_data_parsing.py`'s
+  `parse_stock_tick_push`.
+- **`GetKLine` (K線查詢) is confirmed TWSE/TWOTC-listed-securities-only** — its own docs
+  attach "註1：僅提供台股上市櫃商品查詢" directly to the `MarketType` parameter. Futures
+  historical/intraday replay after reconnect stays unsupported — the existing
+  gap-on-reconnect policy (ADR 0006 decision 7) is unchanged, and this is now a
+  *confirmed* exclusion, not an assumed one.
 
-`RegErrCode` (`AddMktReg`/`DelMktReg`'s return): `0`=Success, `1`=Symbol_err (length
-<4 or >13), `2`=Mode_err, `3`=Connect_err. Separate async-only `OnRegError`
-`ErrorCode`: `1`=UserNotLogin, `2`=StkNotExist, `3`=ContractBreak (`OnRegError` "成功則
-不通知" — only fires on failure).
+### Reports (回報)
 
-Endpoints: domain `apiquote.yuantafutures.com.tw`, T session port 80/443, T+1 session
-port 82/442 (Feature 02 only connects the T session).
+`RR_RealReport` — order/fill push, **auto-subscribed on login** ("登入即訂閱，結果請從
+回應事件OnResponse接收" — no separate subscribe call). Arrives via `OnResponse` with
+`intMark == 2`, `strIndex == 'RR_RealReport'`, one `RealReport` object per push.
+`GetRealReport(Account, lng) -> bool` is the poll-based equivalent (`intMark == 1`,
+`RealReportResult.RealReportList`) — replaces the legacy API's separate
+`ReportQuery`/`DealQuery` pair with one unified call. `RptType` distinguishes
+order/fill/etc. (`2`=期貨委託, `3`=期貨成交, ...); `OrderStatus` carries the full
+status code table (0=委託成功, 8=已成交, 24=委託失效, 25=價穩失效, ...). Neither push
+nor query result is parsed into a typed `Order`/`Fill` yet — Feature 06's job (needs an
+idempotency-key mapping), same posture the legacy design always took.
 
-## Python-specific note
+### Account/position queries (帳務)
 
-`交易API元件及說明文件/元大API交易PYTHON注意事項.docx` (vendor's own Python guidance,
-text extracted this session via zip/xml parsing since it has no readable Python sample
-code, just a note) confirms:
+`GetFutStoreSummary(Account, lng) -> bool` — 期貨庫存總表查詢, a fully documented
+futures position query (`FutStoreSummaryResult.FutStoreList`, fields include
+`Trid`/`Commodity1`/`SettlementMonth1`/`BS1`/`Qty`/...). Replaces the legacy API's
+undocumented `RA003` mechanism (`UserDefinsFunc`), which had no worked example for its
+row layout. Not parsed into a typed `Position` yet — Feature 08's job.
 
-- Vendor's sample was built on **Python 3.9, wxPython 4.1.1, comtypes 1.1.11**.
-- Bitness of the OCX and the Python interpreter **must match** — no cross-bitness COM
-  marshaling is supported.
-- To use the 32-bit OCX, the sample's `AtlAxCreateControlEx` ProgID string must be
-  changed from `"Yuanta.YuantaOrdCtrl.64"` to `"Yuanta.YuantaOrdCtrl.1"`.
+## Python setup notes
 
-This codebase deliberately targets **Python 3.11** instead of the vendor's 3.9 (EOL
-Oct 2025) — see `docs/adr/0001-python-version-and-runtime.md`. `ocx_host.py` hosts
-both controls via `AtlAxCreateControlEx` exactly as this note describes, but wraps the
-returned control pointer using bindings generated at runtime from the `.ocx`'s type
-library (`comtypes.client.GetModule`) rather than hand-written ones — see ADR 0004.
+Official 前言 > Python設定 page's Windows/Mac setup:
+
+```python
+from pythonnet import load
+
+load("coreclr")
+import clr, sys, os, pathlib
+
+sys.path.append(str(pathlib.Path(__file__).parent.resolve()))
+if sys.platform == "win32":
+    os.add_dll_directory(str(pathlib.Path(__file__).parent.resolve()))
+clr.AddReference("YuantaSparkAPI")  # no file extension
+from YuantaOneAPI import YuantaSparkAPITrader, enumEnvironmentMode, enumLogType
+```
+
+`infrastructure/yuanta/spark_client.py` implements exactly this pattern, pointed at
+`default_dll_directory()` (`C:\Yuanta\SparkAPI` by convention) instead of the script's
+own folder. Requires the **.NET 8 SDK** installed system-wide (not a pip package) —
+`infrastructure/yuanta/preflight.py` checks for it via `dotnet --list-runtimes`.
 
 ## Session/login (Feature 02)
 
 `session_orchestrator.py`'s `BrokerSessionOrchestrator` is the login/session-lifecycle
-implementation (`IBrokerSession`). **Verified working end-to-end** against the real
-vendor `.ocx` files this session (2026-08-16): activation, per-user COM registration
-(no admin rights — `com_registration.py`), real dispatch-method invocation, and
-event-sink delivery all confirmed via a live network round-trip to the vendor's test
-endpoint (`SetFutOrdConnection` → real `OnLogonS` with a real `TLinkStatus`). See
-`docs/adr/0004-broker-session-architecture.md` for the full design and its "Execution
-attempt findings"/"What's confirmed working"/"What's still not verified" sections for
-the complete, honest trail — including three real bugs found and fixed along the way
-(wrong `AtlAxCreateControlEx` argument form, wrong DLL search path, and a discarded
-COM event-connection reference that silently killed event delivery).
+implementation (`IBrokerSession`), driven by `spark_api_adapter.py`'s
+`SparkApiSessionAdapter` (the real `pythonnet`-backed `SparkAdapterPort`). **Not yet
+executed against a real login this session** — no .NET 8 SDK/vendor DLL/real futures
+account available in this environment; written strictly from the documented API
+signatures. See `docs/adr/0004-broker-session-architecture.md`'s "What's confirmed vs.
+what's not verified" for the honest status — check there before assuming any of this
+has been exercised against a live server.
 
-To actually run the real (non-mock) gateway locally: copy the vendor's component
-folders to `C:\Yuanta\API` and `C:\Yuanta\QAPI` (the vendor's own documented layout —
-see `使用說明.txt` in each package), then set `use_mock: false` — `composition.py`
-handles COM registration automatically. `tests/infrastructure/
-test_yuanta_ocx_activation.py` (opt-in, `TFX_QUANT_OCX_ACTIVATION_TEST=1`) exercises
-this same path as an automated regression check whenever the vendor files are present.
+To actually run the real (non-mock) gateway: download the SPARK API component from the
+official portal, extract it to `C:\Yuanta\SparkAPI` (or point
+`spark_client.default_dll_directory()` elsewhere), install the .NET 8 SDK, then set
+`use_mock: false`.
+
+## Legacy OCX API (superseded, historical reference only)
+
+The retired COM/ActiveX pair (`YuantaOrd.ocx` trading, `YuantaQuote_v2.1.2.9.ocx`
+quote) and its 32-bit-only bitness constraint, ProgID/CLSID registration, and
+`AtlAxCreateControlEx` hosting mechanism are fully documented in git history (see the
+pre-2026-08-19 revisions of this file and `docs/adr/0002`/`0004`) — not reproduced
+here since none of it applies to SPARK API. Don't build on any of it going forward.

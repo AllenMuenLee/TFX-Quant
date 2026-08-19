@@ -1,10 +1,10 @@
 """Yuanta adapter exceptions.
 
 Not `DomainError` subclasses — these are infrastructure-layer failures (missing
-credentials, an unregistered COM control, a login timeout), not domain-rule
-violations. Every message here is meant to be shown to the operator as-is, so each one
-must be actionable and must never interpolate a secret (password, full account
-number) into the text.
+credentials, a login timeout, a malformed vendor push), not domain-rule violations.
+Every message here is meant to be shown to the operator as-is, so each one must be
+actionable and must never interpolate a secret (password, full account number) into
+the text.
 """
 
 from __future__ import annotations
@@ -22,21 +22,18 @@ class PreflightCheckFailed(YuantaSessionError):
     """
 
 
-class CredentialsUnavailableError(YuantaSessionError):
-    """The configured credential source could not resolve a user ID or password.
-
-    Never includes the attempted value in the message — only which name/entry was
-    missing.
-    """
-
-
 class LoginTimeoutError(YuantaSessionError):
-    """No login callback arrived within the configured timeout."""
+    """No `Login` result arrived via `OnResponse` within the configured timeout."""
 
 
 class AccountSelectionError(YuantaSessionError):
     """`select_account()` was called with an account not present in `accounts`, or
     the session reached a point requiring a unique account with none resolved."""
+
+
+class CertificateImportError(YuantaSessionError):
+    """`credentials.ensure_certificate_imported` failed — the certificate file was
+    missing/invalid, the password was wrong, or `certutil` itself failed."""
 
 
 class InstrumentMasterFileError(YuantaSessionError):
@@ -47,12 +44,11 @@ class InstrumentMasterFileError(YuantaSessionError):
 
 
 class MarketDataSubscriptionError(YuantaSessionError):
-    """A synchronous `AddMktReg`/`DelMktReg` call was attempted while the broker
-    session isn't `READY`, or the vendor synchronously rejected the registration
-    (non-zero `RegErrCode`)."""
+    """A `SubscribeStockTick`/`UnSubscribeStockTick` call was attempted while the
+    broker session isn't `READY`, or the vendor synchronously rejected the call."""
 
 
 class MarketDataParseError(YuantaSessionError):
-    """An `OnGetMktAll` push's fields couldn't be parsed into typed values (blank
-    symbol, non-numeric price/quantity, malformed `MatchTime`) — see
+    """A `StockTickResult` push's fields couldn't be parsed into typed values (blank
+    symbol, non-numeric price/quantity, out-of-range time) — see
     `market_data_parsing.py`."""

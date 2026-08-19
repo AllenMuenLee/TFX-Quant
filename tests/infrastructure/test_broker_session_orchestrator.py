@@ -8,7 +8,6 @@ from pydantic import SecretStr
 
 from tfx_quant.application.events.events import (
     BrokerCapabilitiesChanged,
-    BrokerDuplicateLoginRejected,
     BrokerLoggedOut,
     BrokerLoginFailed,
     BrokerLoginSucceeded,
@@ -18,59 +17,54 @@ from tfx_quant.application.events.events import (
     Event,
     MarketDataTickReceived,
 )
+from tfx_quant.application.ports.broker_session import LoginRequest
+from tfx_quant.application.settings.trading_settings import Environment
 from tfx_quant.domain.account import TradingAccount
 from tfx_quant.infrastructure.yuanta.backoff import BackoffPolicy
-from tfx_quant.infrastructure.yuanta.credentials import BrokerCredentials, StaticCredentialSource
+from tfx_quant.infrastructure.yuanta.credentials import BrokerCredentials
 from tfx_quant.infrastructure.yuanta.errors import (
     AccountSelectionError,
     MarketDataSubscriptionError,
 )
 from tfx_quant.infrastructure.yuanta.session_orchestrator import BrokerSessionOrchestrator
 
-_ACCOUNT_1 = TradingAccount(branch_id="F00", account_no="9808900", sub_account="")
-_ACCOUNT_2 = TradingAccount(branch_id="F00", account_no="1234567", sub_account="0001")
-_ACC_LIST_ONE = "2-F00-9808900- -路人甲"
-_ACC_LIST_TWO = "2-F00-9808900- -路人甲;2-F00-1234567-0001-路人乙"
+_ACCOUNT_1 = TradingAccount(branch_id="0000000001", account_no="2345678", sub_account="")
+_ACCOUNT_2 = TradingAccount(branch_id="0000000002", account_no="7654321", sub_account="")
+_ACCOUNT_1_STRING = "F00000000012345678"
+_ACCOUNT_2_STRING = "F00000000027654321"
+_ENTRIES_ONE = ((_ACCOUNT_1_STRING, "路人甲", "A123456789", "55"),)
+_ENTRIES_TWO = (
+    (_ACCOUNT_1_STRING, "路人甲", "A123456789", "55"),
+    (_ACCOUNT_2_STRING, "路人乙", "B123456789", "56"),
+)
 
 
-class FakeTradeAdapter:
-    def __init__(self) -> None:
+class FakeAdapter:
+    def __init__(self, *, subscribe_ok: dict[str, bool] | None = None) -> None:
         self.calls: list[tuple[object, ...]] = []
+        self._subscribe_ok = subscribe_ok or {}
 
-    def connect(self, credentials: BrokerCredentials, *, generation: int) -> None:
-        self.calls.append(("connect", generation))
+    def open_and_login(
+        self, credentials: BrokerCredentials, *, generation: int, environment: Environment
+    ) -> None:
+        self.calls.append(("open_and_login", generation))
 
     def disconnect(self) -> None:
         self.calls.append(("disconnect",))
 
-    def query_open_orders(self, account: TradingAccount) -> None:
-        self.calls.append(("query_open_orders", account))
-
-    def query_fills(self, account: TradingAccount) -> None:
-        self.calls.append(("query_fills", account))
+    def query_real_report(self, account: TradingAccount) -> None:
+        self.calls.append(("query_real_report", account))
 
     def query_positions(self, account: TradingAccount) -> None:
         self.calls.append(("query_positions", account))
 
+    def subscribe(self, symbol: str, account: TradingAccount) -> None:
+        self.calls.append(("subscribe", symbol, account))
+        if not self._subscribe_ok.get(symbol, True):
+            raise MarketDataSubscriptionError(f"商品 {symbol} 行情訂閱呼叫失敗")
 
-class FakeQuoteAdapter:
-    def __init__(self, *, subscribe_results: dict[str, int] | None = None) -> None:
-        self.calls: list[tuple[object, ...]] = []
-        self._subscribe_results = subscribe_results or {}
-
-    def connect(self, credentials: BrokerCredentials, *, generation: int) -> None:
-        self.calls.append(("connect", generation))
-
-    def disconnect(self) -> None:
-        self.calls.append(("disconnect",))
-
-    def subscribe(self, symbol: str) -> int:
-        self.calls.append(("subscribe", symbol))
-        return self._subscribe_results.get(symbol, 0)
-
-    def unsubscribe(self, symbol: str) -> int:
-        self.calls.append(("unsubscribe", symbol))
-        return 0
+    def unsubscribe(self, symbol: str, account: TradingAccount) -> None:
+        self.calls.append(("unsubscribe", symbol, account))
 
 
 class _FakeCancellable:
@@ -113,8 +107,10 @@ class RecordingEventPublisher:
         return [e for e in self.events if isinstance(e, event_type)]
 
 
-def _credentials() -> StaticCredentialSource:
-    return StaticCredentialSource(BrokerCredentials(user_id="A123456789", password=SecretStr("x")))
+def _login_request(*, environment: Environment = Environment.TEST) -> LoginRequest:
+    return LoginRequest(
+        environment=environment, user_id="F00000000012345678", password=SecretStr("x")
+    )
 
 
 def make_orchestrator(
@@ -122,22 +118,13 @@ def make_orchestrator(
     market_data_symbols: tuple[str, ...] = (),
     account_no_hint: str | None = None,
     max_attempts: int = 3,
-    quote_subscribe_results: dict[str, int] | None = None,
-) -> tuple[
-    BrokerSessionOrchestrator,
-    FakeTradeAdapter,
-    FakeQuoteAdapter,
-    RecordingEventPublisher,
-    FakeScheduler,
-]:
-    trade = FakeTradeAdapter()
-    quote = FakeQuoteAdapter(subscribe_results=quote_subscribe_results)
+    subscribe_ok: dict[str, bool] | None = None,
+) -> tuple[BrokerSessionOrchestrator, FakeAdapter, RecordingEventPublisher, FakeScheduler]:
+    adapter = FakeAdapter(subscribe_ok=subscribe_ok)
     events = RecordingEventPublisher()
     scheduler = FakeScheduler()
     orchestrator = BrokerSessionOrchestrator(
-        trade_adapter=trade,
-        quote_adapter=quote,
-        credential_source=_credentials(),
+        adapter=adapter,
         event_coordinator=events,
         market_data_symbols=market_data_symbols,
         account_no_hint=account_no_hint,
@@ -150,30 +137,33 @@ def make_orchestrator(
         ),
         scheduler=scheduler,
     )
-    return orchestrator, trade, quote, events, scheduler
+    return orchestrator, adapter, events, scheduler
 
 
 def _drive_to_ready(
     orchestrator: BrokerSessionOrchestrator,
     *,
     generation: int = 1,
-    acc_list: str = _ACC_LIST_ONE,
+    entries: tuple[tuple[str, str, str, str], ...] = _ENTRIES_ONE,
 ) -> None:
-    orchestrator.handle_trade_login_result(generation, 2, acc_list, "", "")
-    orchestrator.handle_order_query_result(generation, 0, "")
-    orchestrator.handle_deal_query_result(generation, 0, "")
-    orchestrator.handle_user_defined_func_result(generation, 0, "RETC=00000", "RA003")
-    orchestrator.handle_quote_status_changed(generation, 2, "0")
+    orchestrator.handle_login_result(generation, "0001", "執行成功!", entries)
+    orchestrator.handle_real_report_query_result(generation)
+    orchestrator.handle_position_query_result(generation)
+
+
+def _drive_login_and_report_query_only(orchestrator: BrokerSessionOrchestrator) -> None:
+    orchestrator.handle_login_result(1, "0001", "執行成功!", _ENTRIES_ONE)
+    orchestrator.handle_real_report_query_result(1)
 
 
 # -- Success ----------------------------------------------------------------------
 
 
 def test_full_success_sequence_reaches_session_ready() -> None:
-    orchestrator, trade, quote, events, _scheduler = make_orchestrator()
-    orchestrator.start()
+    orchestrator, adapter, events, _scheduler = make_orchestrator()
+    orchestrator.start(_login_request())
 
-    assert trade.calls == [("connect", 1)]
+    assert adapter.calls == [("open_and_login", 1)]
 
     _drive_to_ready(orchestrator)
 
@@ -182,99 +172,98 @@ def test_full_success_sequence_reaches_session_ready() -> None:
     ready_events = events.of_type(BrokerSessionReady)
     assert len(ready_events) == 1
     assert ready_events[0].account == _ACCOUNT_1  # type: ignore[attr-defined]
-    assert trade.calls == [
-        ("connect", 1),
-        ("query_open_orders", _ACCOUNT_1),
-        ("query_fills", _ACCOUNT_1),
+    assert adapter.calls == [
+        ("open_and_login", 1),
+        ("query_real_report", _ACCOUNT_1),
         ("query_positions", _ACCOUNT_1),
     ]
-    assert quote.calls == [("connect", 1)]
 
 
 def test_success_with_market_data_symbols_subscribes_each_before_ready() -> None:
-    orchestrator, trade, quote, events, _scheduler = make_orchestrator(
-        market_data_symbols=("TXFE9", "MXFE9")
+    orchestrator, adapter, _events, _scheduler = make_orchestrator(
+        market_data_symbols=("TXFH6", "MXFH6")
     )
-    orchestrator.start()
+    orchestrator.start(_login_request())
     _drive_to_ready(orchestrator)
 
     assert orchestrator.capabilities.is_session_ready
-    assert quote.calls == [("connect", 1), ("subscribe", "TXFE9"), ("subscribe", "MXFE9")]
+    assert ("subscribe", "TXFH6", _ACCOUNT_1) in adapter.calls
+    assert ("subscribe", "MXFH6", _ACCOUNT_1) in adapter.calls
 
 
 def test_multiple_accounts_require_explicit_selection() -> None:
-    orchestrator, trade, quote, events, _scheduler = make_orchestrator()
-    orchestrator.start()
+    orchestrator, adapter, _events, _scheduler = make_orchestrator()
+    orchestrator.start(_login_request())
 
-    orchestrator.handle_trade_login_result(1, 2, _ACC_LIST_TWO, "", "")
+    orchestrator.handle_login_result(1, "0001", "執行成功!", _ENTRIES_TWO)
 
     assert orchestrator.accounts == (_ACCOUNT_1, _ACCOUNT_2)
     assert orchestrator.selected_account is None
-    assert trade.calls == [("connect", 1)]  # no query issued yet
+    assert adapter.calls == [("open_and_login", 1)]  # no query issued yet
 
     orchestrator.select_account(_ACCOUNT_2)
 
     assert orchestrator.selected_account == _ACCOUNT_2
-    assert ("query_open_orders", _ACCOUNT_2) in trade.calls
+    assert ("query_real_report", _ACCOUNT_2) in adapter.calls
 
 
 def test_account_no_hint_auto_selects_among_multiple_accounts() -> None:
-    orchestrator, trade, _quote, _events, _scheduler = make_orchestrator(account_no_hint="1234567")
-    orchestrator.start()
+    orchestrator, adapter, _events, _scheduler = make_orchestrator(account_no_hint="7654321")
+    orchestrator.start(_login_request())
 
-    orchestrator.handle_trade_login_result(1, 2, _ACC_LIST_TWO, "", "")
+    orchestrator.handle_login_result(1, "0001", "執行成功!", _ENTRIES_TWO)
 
     assert orchestrator.selected_account == _ACCOUNT_2
-    assert ("query_open_orders", _ACCOUNT_2) in trade.calls
+    assert ("query_real_report", _ACCOUNT_2) in adapter.calls
 
 
 def test_select_account_rejects_unknown_account() -> None:
-    orchestrator, _trade, _quote, _events, _scheduler = make_orchestrator()
-    orchestrator.start()
-    orchestrator.handle_trade_login_result(1, 2, _ACC_LIST_TWO, "", "")
+    orchestrator, _adapter, _events, _scheduler = make_orchestrator()
+    orchestrator.start(_login_request())
+    orchestrator.handle_login_result(1, "0001", "執行成功!", _ENTRIES_TWO)
 
     with pytest.raises(AccountSelectionError):
-        orchestrator.select_account(TradingAccount(branch_id="F99", account_no="0000001"))
+        orchestrator.select_account(TradingAccount(branch_id="9999999999", account_no="0000001"))
 
 
 # -- Timeout ------------------------------------------------------------------------
 
 
 def test_login_timeout_publishes_event_and_retries_with_backoff() -> None:
-    orchestrator, trade, _quote, events, scheduler = make_orchestrator(max_attempts=3)
-    orchestrator.start()
+    orchestrator, adapter, events, scheduler = make_orchestrator(max_attempts=3)
+    orchestrator.start(_login_request())
 
     scheduler.fire_latest()  # fires the armed login timeout
 
     assert len(events.of_type(BrokerLoginTimedOut)) == 1
     assert len(events.of_type(BrokerLoginFailed)) == 1
-    assert trade.calls == [("connect", 1)]  # retry not yet fired
+    assert adapter.calls == [("open_and_login", 1)]  # retry not yet fired
 
     scheduler.fire_latest()  # fires the scheduled retry
 
-    assert trade.calls == [("connect", 1), ("connect", 2)]
+    assert adapter.calls == [("open_and_login", 1), ("open_and_login", 2)]
 
 
 def test_timeout_after_cancel_start_does_not_retry() -> None:
-    orchestrator, trade, _quote, _events, scheduler = make_orchestrator()
-    orchestrator.start()
+    orchestrator, adapter, _events, scheduler = make_orchestrator()
+    orchestrator.start(_login_request())
     orchestrator.cancel_start()
 
     scheduler.fire_latest()  # the (already-cancelled) login timeout timer
 
-    assert trade.calls.count(("connect", 1)) == 1
-    assert all(call[0] != "connect" or call[1] != 2 for call in trade.calls)
+    assert adapter.calls.count(("open_and_login", 1)) == 1
+    assert all(call[0] != "open_and_login" or call[1] != 2 for call in adapter.calls)
 
 
-# -- Error codes ----------------------------------------------------------------------
+# -- MsgCode handling -----------------------------------------------------------------
 
 
-@pytest.mark.parametrize("tlink_status", [4, 5, -100, -10])
-def test_non_retriable_trade_login_failure_does_not_schedule_retry(tlink_status: int) -> None:
-    orchestrator, trade, _quote, events, scheduler = make_orchestrator(max_attempts=5)
-    orchestrator.start()
+@pytest.mark.parametrize("msg_code", ["0102", "0112", "9999"])
+def test_non_retriable_login_failure_does_not_schedule_retry(msg_code: str) -> None:
+    orchestrator, _adapter, events, scheduler = make_orchestrator(max_attempts=5)
+    orchestrator.start(_login_request())
 
-    orchestrator.handle_trade_login_result(1, tlink_status, "", "", "")
+    orchestrator.handle_login_result(1, msg_code, "密碼錯誤或無權限", ())
 
     failures = events.of_type(BrokerLoginFailed)
     assert len(failures) == 1
@@ -282,149 +271,122 @@ def test_non_retriable_trade_login_failure_does_not_schedule_retry(tlink_status:
     assert scheduler.pending_count == 0  # no timeout timer left armed, no retry scheduled
 
 
-@pytest.mark.parametrize("tlink_status", [-1, -2])
-def test_retriable_trade_login_failure_schedules_retry(tlink_status: int) -> None:
-    orchestrator, trade, _quote, events, scheduler = make_orchestrator(max_attempts=5)
-    orchestrator.start()
+def test_retriable_login_failure_schedules_retry() -> None:
+    orchestrator, adapter, events, scheduler = make_orchestrator(max_attempts=5)
+    orchestrator.start(_login_request())
 
-    orchestrator.handle_trade_login_result(1, tlink_status, "", "", "")
+    orchestrator.handle_login_result(1, "0000", "執行失敗", ())
 
     failures = events.of_type(BrokerLoginFailed)
     assert failures[0].retriable is True  # type: ignore[attr-defined]
     assert scheduler.pending_count == 1
 
     scheduler.fire_latest()
-    assert trade.calls == [("connect", 1), ("connect", 2)]
+    assert adapter.calls == [("open_and_login", 1), ("open_and_login", 2)]
+
+
+def test_login_success_with_unparseable_account_list_is_a_failure() -> None:
+    orchestrator, _adapter, events, _scheduler = make_orchestrator()
+    orchestrator.start(_login_request())
+
+    orchestrator.handle_login_result(1, "0001", "執行成功!", (("S98875005091", "x", "y", "z"),))
+
+    failures = events.of_type(BrokerLoginFailed)
+    assert len(failures) == 1
+    assert failures[0].retriable is False  # type: ignore[attr-defined]
 
 
 def test_backoff_exhaustion_stops_retrying() -> None:
-    orchestrator, trade, _quote, events, scheduler = make_orchestrator(max_attempts=2)
-    orchestrator.start()
+    orchestrator, adapter, events, scheduler = make_orchestrator(max_attempts=2)
+    orchestrator.start(_login_request())
 
-    orchestrator.handle_trade_login_result(1, -1, "", "", "")  # attempt 1 fails, retry scheduled
+    orchestrator.handle_login_result(1, "0000", "執行失敗", ())  # attempt 1 fails, retry scheduled
     scheduler.fire_latest()  # attempt 2 begins
-    orchestrator.handle_trade_login_result(2, -1, "", "", "")  # attempt 2 fails, exhausted
+    orchestrator.handle_login_result(2, "0000", "執行失敗", ())  # attempt 2 fails, exhausted
 
     assert len(events.of_type(BrokerLoginFailed)) == 2
     assert scheduler.pending_count == 0
-    assert trade.calls == [("connect", 1), ("connect", 2)]
-
-
-# -- Duplicate login ------------------------------------------------------------------
-
-
-def test_quote_duplicate_login_publishes_dedicated_event() -> None:
-    orchestrator, _trade, _quote, events, _scheduler = make_orchestrator()
-    orchestrator.start()
-    _drive_login_and_queries_only(orchestrator)
-
-    orchestrator.handle_quote_status_changed(1, -3, "1duplicate")
-
-    duplicate_events = events.of_type(BrokerDuplicateLoginRejected)
-    assert len(duplicate_events) == 1
-    assert duplicate_events[0].source == "quote"  # type: ignore[attr-defined]
-    assert not orchestrator.capabilities.is_session_ready
-
-
-def _drive_login_and_queries_only(orchestrator: BrokerSessionOrchestrator) -> None:
-    orchestrator.handle_trade_login_result(1, 2, _ACC_LIST_ONE, "", "")
-    orchestrator.handle_order_query_result(1, 0, "")
-    orchestrator.handle_deal_query_result(1, 0, "")
-    orchestrator.handle_user_defined_func_result(1, 0, "RETC=00000", "RA003")
+    assert adapter.calls == [("open_and_login", 1), ("open_and_login", 2)]
 
 
 # -- Duplicate / out-of-order callbacks -----------------------------------------------
 
 
 def test_duplicate_login_callback_is_ignored() -> None:
-    orchestrator, trade, _quote, events, _scheduler = make_orchestrator()
-    orchestrator.start()
+    orchestrator, adapter, events, _scheduler = make_orchestrator()
+    orchestrator.start(_login_request())
 
-    orchestrator.handle_trade_login_result(1, 2, _ACC_LIST_ONE, "", "")
-    # A second, replayed OnLogonS for the same generation arrives after we've already
-    # moved on to querying orders.
-    orchestrator.handle_trade_login_result(1, 2, _ACC_LIST_ONE, "", "")
+    orchestrator.handle_login_result(1, "0001", "執行成功!", _ENTRIES_ONE)
+    # A second, replayed Login response for the same generation arrives after we've
+    # already moved on to querying reports.
+    orchestrator.handle_login_result(1, "0001", "執行成功!", _ENTRIES_ONE)
 
     assert len(events.of_type(BrokerLoginSucceeded)) == 1
-    assert trade.calls.count(("query_open_orders", _ACCOUNT_1)) == 1
+    assert adapter.calls.count(("query_real_report", _ACCOUNT_1)) == 1
 
 
 def test_duplicate_query_result_callback_is_ignored() -> None:
-    orchestrator, trade, _quote, _events, _scheduler = make_orchestrator()
-    orchestrator.start()
-    orchestrator.handle_trade_login_result(1, 2, _ACC_LIST_ONE, "", "")
+    orchestrator, adapter, _events, _scheduler = make_orchestrator()
+    orchestrator.start(_login_request())
+    orchestrator.handle_login_result(1, "0001", "執行成功!", _ENTRIES_ONE)
 
-    orchestrator.handle_order_query_result(1, 0, "")
-    orchestrator.handle_order_query_result(1, 0, "")  # duplicate — already in QUERYING_FILLS
+    orchestrator.handle_real_report_query_result(1)
+    orchestrator.handle_real_report_query_result(1)  # duplicate — already in QUERYING_POSITIONS
 
-    assert trade.calls.count(("query_fills", _ACCOUNT_1)) == 1
+    assert adapter.calls.count(("query_positions", _ACCOUNT_1)) == 1
 
 
 def test_stale_generation_callback_after_retry_is_ignored() -> None:
-    orchestrator, trade, _quote, events, scheduler = make_orchestrator(max_attempts=5)
-    orchestrator.start()
-    orchestrator.handle_trade_login_result(1, -1, "", "", "")  # generation 1 fails, retriable
+    orchestrator, _adapter, events, scheduler = make_orchestrator(max_attempts=5)
+    orchestrator.start(_login_request())
+    orchestrator.handle_login_result(1, "0000", "執行失敗", ())  # generation 1 fails, retriable
     scheduler.fire_latest()  # generation 2 begins
 
     # A stale success for the superseded generation 1 arrives late.
-    orchestrator.handle_trade_login_result(1, 2, _ACC_LIST_ONE, "", "")
+    orchestrator.handle_login_result(1, "0001", "執行成功!", _ENTRIES_ONE)
 
     assert orchestrator.selected_account is None
     assert len(events.of_type(BrokerLoginSucceeded)) == 0
 
     # The current generation's own result is still accepted normally.
-    orchestrator.handle_trade_login_result(2, 2, _ACC_LIST_ONE, "", "")
+    orchestrator.handle_login_result(2, "0001", "執行成功!", _ENTRIES_ONE)
     assert orchestrator.selected_account == _ACCOUNT_1
 
 
 def test_out_of_order_callback_wrong_phase_is_ignored() -> None:
-    orchestrator, trade, _quote, _events, _scheduler = make_orchestrator()
-    orchestrator.start()
+    orchestrator, adapter, _events, _scheduler = make_orchestrator()
+    orchestrator.start(_login_request())
 
-    # A fill-query result arrives before login even completed.
-    orchestrator.handle_deal_query_result(1, 0, "")
+    # A position-query result arrives before login even completed.
+    orchestrator.handle_position_query_result(1)
 
-    assert trade.calls == [("connect", 1)]  # nothing progressed
-
-
-# -- Mid-session disconnect / invalidation --------------------------------------------
+    assert adapter.calls == [("open_and_login", 1)]  # nothing progressed
 
 
-def test_post_ready_quote_disconnect_invalidates_session() -> None:
-    orchestrator, _trade, _quote, events, _scheduler = make_orchestrator()
-    orchestrator.start()
+# -- Mid-session invalidation ----------------------------------------------------------
+
+
+def test_session_invalidated_after_ready_collapses_capabilities() -> None:
+    orchestrator, _adapter, events, _scheduler = make_orchestrator()
+    orchestrator.start(_login_request())
     _drive_to_ready(orchestrator)
     assert orchestrator.capabilities.is_session_ready
 
-    orchestrator.handle_quote_status_changed(1, -1, "")
+    orchestrator.handle_session_invalidated(1, "連線中斷")
 
     assert not orchestrator.capabilities.login
     assert not orchestrator.capabilities.is_session_ready
     assert len(events.of_type(BrokerSessionInvalidated)) == 1
 
 
-def test_post_ready_registration_error_invalidates_session() -> None:
-    orchestrator, _trade, _quote, events, _scheduler = make_orchestrator(
-        market_data_symbols=("TXFE9",)
-    )
-    orchestrator.start()
-    _drive_to_ready(orchestrator)
-    assert orchestrator.capabilities.is_session_ready
-
-    orchestrator.handle_quote_registration_error(1, "TXFE9", 4, 3)
-
-    assert len(events.of_type(BrokerSessionInvalidated)) == 1
-    assert not orchestrator.capabilities.is_session_ready
-
-
 def test_subscription_failure_during_startup_is_a_login_failure() -> None:
-    orchestrator, _trade, _quote, events, _scheduler = make_orchestrator(
-        market_data_symbols=("TXFE9",), quote_subscribe_results={"TXFE9": 1}
+    orchestrator, _adapter, events, _scheduler = make_orchestrator(
+        market_data_symbols=("BAD",), subscribe_ok={"BAD": False}
     )
-    orchestrator.start()
-    _drive_login_and_queries_only(orchestrator)
+    orchestrator.start(_login_request())
+    _drive_login_and_report_query_only(orchestrator)
 
-    orchestrator.handle_quote_status_changed(1, 2, "0")
+    orchestrator.handle_position_query_result(1)
 
     failures = events.of_type(BrokerLoginFailed)
     assert len(failures) == 1
@@ -435,33 +397,29 @@ def test_subscription_failure_during_startup_is_a_login_failure() -> None:
 
 
 def test_stop_sequencing_order_when_ready() -> None:
-    orchestrator, trade, quote, events, _scheduler = make_orchestrator(
-        market_data_symbols=("TXFE9",)
-    )
-    orchestrator.start()
+    orchestrator, adapter, events, _scheduler = make_orchestrator(market_data_symbols=("TXFH6",))
+    orchestrator.start(_login_request())
     _drive_to_ready(orchestrator)
-    trade.calls.clear()
-    quote.calls.clear()
+    adapter.calls.clear()
 
     orchestrator.stop()
 
-    assert trade.calls == [
-        ("query_open_orders", _ACCOUNT_1),
+    assert adapter.calls == [
+        ("query_real_report", _ACCOUNT_1),
+        ("unsubscribe", "TXFH6", _ACCOUNT_1),
         ("disconnect",),
     ]
-    assert quote.calls == [("unsubscribe", "TXFE9"), ("disconnect",)]
     assert len(events.of_type(BrokerLoggedOut)) == 1
     assert not orchestrator.capabilities.is_session_ready
 
 
 def test_stop_before_start_is_a_safe_no_op() -> None:
-    orchestrator, trade, quote, events, _scheduler = make_orchestrator()
+    orchestrator, adapter, events, _scheduler = make_orchestrator()
 
     orchestrator.stop()  # should not raise
 
-    assert all(call[0] != "query_open_orders" for call in trade.calls)
-    assert trade.calls == [("disconnect",)]
-    assert quote.calls == [("disconnect",)]
+    assert all(call[0] != "query_real_report" for call in adapter.calls)
+    assert adapter.calls == [("disconnect",)]
     assert len(events.of_type(BrokerLoggedOut)) == 1
 
 
@@ -469,9 +427,9 @@ def test_stop_before_start_is_a_safe_no_op() -> None:
 
 
 def test_capabilities_independent_before_queries_complete() -> None:
-    orchestrator, _trade, _quote, _events, _scheduler = make_orchestrator()
-    orchestrator.start()
-    orchestrator.handle_trade_login_result(1, 2, _ACC_LIST_ONE, "", "")
+    orchestrator, _adapter, _events, _scheduler = make_orchestrator()
+    orchestrator.start(_login_request())
+    orchestrator.handle_login_result(1, "0001", "執行成功!", _ENTRIES_ONE)
 
     capabilities = orchestrator.capabilities
     assert capabilities.login is True
@@ -483,9 +441,9 @@ def test_capabilities_independent_before_queries_complete() -> None:
 
 
 def test_capabilities_changed_event_published_on_change() -> None:
-    orchestrator, _trade, _quote, events, _scheduler = make_orchestrator()
-    orchestrator.start()
-    orchestrator.handle_trade_login_result(1, 2, _ACC_LIST_ONE, "", "")
+    orchestrator, _adapter, events, _scheduler = make_orchestrator()
+    orchestrator.start(_login_request())
+    orchestrator.handle_login_result(1, "0001", "執行成功!", _ENTRIES_ONE)
 
     changes = events.of_type(BrokerCapabilitiesChanged)
     assert len(changes) >= 1
@@ -495,27 +453,25 @@ def test_capabilities_changed_event_published_on_change() -> None:
 
 
 def test_subscribe_market_data_calls_adapter_once_ready() -> None:
-    orchestrator, _trade, quote, _events, _scheduler = make_orchestrator()
-    orchestrator.start()
+    orchestrator, adapter, _events, _scheduler = make_orchestrator()
+    orchestrator.start(_login_request())
     _drive_to_ready(orchestrator)
-    quote.calls.clear()
+    adapter.calls.clear()
 
-    orchestrator.subscribe_market_data("MXFU6")
+    orchestrator.subscribe_market_data("MXFI6")
 
-    assert quote.calls == [("subscribe", "MXFU6")]
+    assert adapter.calls == [("subscribe", "MXFI6", _ACCOUNT_1)]
 
 
 def test_subscribe_market_data_before_ready_raises() -> None:
-    orchestrator, _trade, _quote, _events, _scheduler = make_orchestrator()
+    orchestrator, _adapter, _events, _scheduler = make_orchestrator()
     with pytest.raises(MarketDataSubscriptionError):
-        orchestrator.subscribe_market_data("MXFU6")
+        orchestrator.subscribe_market_data("MXFI6")
 
 
 def test_subscribe_market_data_propagates_registration_failure() -> None:
-    orchestrator, _trade, _quote, _events, _scheduler = make_orchestrator(
-        quote_subscribe_results={"BAD": 1}
-    )
-    orchestrator.start()
+    orchestrator, _adapter, _events, _scheduler = make_orchestrator(subscribe_ok={"BAD": False})
+    orchestrator.start(_login_request())
     _drive_to_ready(orchestrator)
 
     with pytest.raises(MarketDataSubscriptionError):
@@ -523,69 +479,70 @@ def test_subscribe_market_data_propagates_registration_failure() -> None:
 
 
 def test_subscribe_market_data_does_not_perturb_startup_capability_set() -> None:
-    orchestrator, _trade, _quote, _events, _scheduler = make_orchestrator(
-        market_data_symbols=("TXFE9",)
-    )
-    orchestrator.start()
+    orchestrator, _adapter, _events, _scheduler = make_orchestrator(market_data_symbols=("TXFH6",))
+    orchestrator.start(_login_request())
     _drive_to_ready(orchestrator)
     assert orchestrator.capabilities.market_data is True
 
-    orchestrator.subscribe_market_data("MXFU6")
+    orchestrator.subscribe_market_data("MXFI6")
 
     assert orchestrator.capabilities.market_data is True
 
 
 def test_unsubscribe_market_data_calls_adapter_once_ready() -> None:
-    orchestrator, _trade, quote, _events, _scheduler = make_orchestrator()
-    orchestrator.start()
+    orchestrator, adapter, _events, _scheduler = make_orchestrator()
+    orchestrator.start(_login_request())
     _drive_to_ready(orchestrator)
-    orchestrator.subscribe_market_data("MXFU6")
-    quote.calls.clear()
+    orchestrator.subscribe_market_data("MXFI6")
+    adapter.calls.clear()
 
-    orchestrator.unsubscribe_market_data("MXFU6")
+    orchestrator.unsubscribe_market_data("MXFI6")
 
-    assert quote.calls == [("unsubscribe", "MXFU6")]
+    assert adapter.calls == [("unsubscribe", "MXFI6", _ACCOUNT_1)]
 
 
 def test_unsubscribe_market_data_before_ready_is_a_safe_no_op() -> None:
-    orchestrator, _trade, quote, _events, _scheduler = make_orchestrator()
-    orchestrator.unsubscribe_market_data("MXFU6")  # should not raise
-    assert quote.calls == []
+    orchestrator, adapter, _events, _scheduler = make_orchestrator()
+    orchestrator.unsubscribe_market_data("MXFI6")  # should not raise
+    assert adapter.calls == []
 
 
 def test_unsubscribe_market_data_included_in_stop_teardown() -> None:
-    orchestrator, _trade, quote, _events, _scheduler = make_orchestrator()
-    orchestrator.start()
+    orchestrator, adapter, _events, _scheduler = make_orchestrator()
+    orchestrator.start(_login_request())
     _drive_to_ready(orchestrator)
-    orchestrator.subscribe_market_data("MXFU6")
-    quote.calls.clear()
+    orchestrator.subscribe_market_data("MXFI6")
+    adapter.calls.clear()
 
     orchestrator.stop()
 
-    assert ("unsubscribe", "MXFU6") in quote.calls
+    assert ("unsubscribe", "MXFI6", _ACCOUNT_1) in adapter.calls
 
 
-# -- Market data push (Feature 04's OnGetMktAll wiring) ------------------------------
+# -- Market data push (Feature 04's SubscribeStockTick wiring) -----------------------
 
 
 def _push(
     orchestrator: BrokerSessionOrchestrator,
     *,
     generation: int = 1,
-    symbol: str = "TXFU6",
-    match_time: str = "093015",
-    match_pri: str = "17500",
-    match_qty: str = "1",
-    tol_match_qty: str = "42",
+    symbol: str = "TXFI6",
+    serial_no: object = 42,
+    deal_price: object = "17500",
+    deal_vol: object = "1",
+    hour: object = 9,
+    minute: object = 30,
+    second: object = 15,
+    millisecond: object = 0,
 ) -> None:
     orchestrator.handle_market_data_push(
-        generation, symbol, match_time, match_pri, match_qty, tol_match_qty
+        generation, symbol, serial_no, deal_price, deal_vol, hour, minute, second, millisecond
     )
 
 
 def test_market_data_push_publishes_tick_once_ready() -> None:
-    orchestrator, _trade, _quote, events, _scheduler = make_orchestrator()
-    orchestrator.start()
+    orchestrator, _adapter, events, _scheduler = make_orchestrator()
+    orchestrator.start(_login_request())
     _drive_to_ready(orchestrator)
 
     _push(orchestrator)
@@ -593,14 +550,14 @@ def test_market_data_push_publishes_tick_once_ready() -> None:
     ticks = events.of_type(MarketDataTickReceived)
     assert len(ticks) == 1
     tick = ticks[0]
-    assert tick.vendor_symbol == "TXFU6"  # type: ignore[attr-defined]
+    assert tick.vendor_symbol == "TXFI6"  # type: ignore[attr-defined]
     assert tick.price == Decimal("17500")  # type: ignore[attr-defined]
-    assert tick.cumulative_volume == 42  # type: ignore[attr-defined]
+    assert tick.serial_no == 42  # type: ignore[attr-defined]
 
 
 def test_market_data_push_before_ready_is_ignored() -> None:
-    orchestrator, _trade, _quote, events, _scheduler = make_orchestrator()
-    orchestrator.start()
+    orchestrator, _adapter, events, _scheduler = make_orchestrator()
+    orchestrator.start(_login_request())
 
     _push(orchestrator)
 
@@ -608,8 +565,8 @@ def test_market_data_push_before_ready_is_ignored() -> None:
 
 
 def test_market_data_push_with_stale_generation_is_ignored() -> None:
-    orchestrator, _trade, _quote, events, _scheduler = make_orchestrator()
-    orchestrator.start()
+    orchestrator, _adapter, events, _scheduler = make_orchestrator()
+    orchestrator.start(_login_request())
     _drive_to_ready(orchestrator)
 
     _push(orchestrator, generation=0)  # a superseded attempt's stale generation
@@ -617,21 +574,21 @@ def test_market_data_push_with_stale_generation_is_ignored() -> None:
     assert events.of_type(MarketDataTickReceived) == []
 
 
-def test_market_data_push_pre_market_sentinel_publishes_nothing() -> None:
-    orchestrator, _trade, _quote, events, _scheduler = make_orchestrator()
-    orchestrator.start()
+def test_market_data_push_settlement_sentinel_publishes_nothing() -> None:
+    orchestrator, _adapter, events, _scheduler = make_orchestrator()
+    orchestrator.start(_login_request())
     _drive_to_ready(orchestrator)
 
-    _push(orchestrator, tol_match_qty="-1")
+    _push(orchestrator, serial_no=-1)
 
     assert events.of_type(MarketDataTickReceived) == []
 
 
 def test_market_data_push_malformed_field_is_dropped_not_raised() -> None:
-    orchestrator, _trade, _quote, events, _scheduler = make_orchestrator()
-    orchestrator.start()
+    orchestrator, _adapter, events, _scheduler = make_orchestrator()
+    orchestrator.start(_login_request())
     _drive_to_ready(orchestrator)
 
-    _push(orchestrator, match_pri="not-a-number")  # should not raise
+    _push(orchestrator, deal_price="not-a-number")  # should not raise
 
     assert events.of_type(MarketDataTickReceived) == []

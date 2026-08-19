@@ -5,11 +5,21 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import SecretStr
 
-from tfx_quant.application.settings.trading_settings import validate_startup
+from tfx_quant.application.ports.broker_session import LoginRequest
+from tfx_quant.application.settings.trading_settings import Environment, validate_startup
 from tfx_quant.desktop.composition import build_services, compute_readiness, load_settings
 from tfx_quant.domain.instrument import Instrument
 from tfx_quant.infrastructure.yuanta.errors import PreflightCheckFailed
+
+
+def _login_request() -> LoginRequest:
+    return LoginRequest(
+        environment=Environment.TEST,
+        user_id="F00000000012345678",
+        password=SecretStr("x"),
+    )
 
 
 def test_load_settings_reads_and_validates_json(
@@ -47,7 +57,7 @@ def test_build_services_wires_a_broker_session_when_use_mock_true(
     services = build_services(settings)
     assert services.broker_session.capabilities.login is False
 
-    services.broker_session.start()
+    services.broker_session.start(_login_request())
 
     assert services.broker_session.capabilities.is_session_ready is True
     readiness = dict(compute_readiness(services))
@@ -59,13 +69,19 @@ def test_build_services_wires_a_broker_session_when_use_mock_true(
 
 
 def test_build_services_raises_actionable_preflight_error_when_use_mock_false(
-    valid_settings_raw: dict[str, Any],
+    valid_settings_raw: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """This dev machine's sole venv is x32, so the bitness check passes, but neither
-    OCX is COM-registered and no credentials are configured — the real branch must
-    still fail loudly at startup with an aggregated, actionable message for whatever
-    *does* fail, never silently fall back to a fake — per
-    docs/adr/0004-broker-session-architecture.md."""
+    """The real branch must fail loudly at startup with an aggregated, actionable
+    message for whatever preflight check fails, never silently fall back to a fake —
+    per docs/adr/0004-broker-session-architecture.md. The DLL-directory check is forced
+    to fail here (pointed at an empty tmp dir, guaranteed to lack `YuantaSparkAPI.dll`)
+    so the assertion is deterministic regardless of host state. Credentials are no
+    longer checked at startup at all (they're entered on the login screen, not
+    available until then — see docs/secrets-management.md)."""
+    import tfx_quant.infrastructure.yuanta.preflight as preflight
+
+    monkeypatch.setattr(preflight, "default_dll_directory", lambda: tmp_path)
+
     valid_settings_raw["use_mock"] = False
     settings = validate_startup(valid_settings_raw)
 

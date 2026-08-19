@@ -1,24 +1,29 @@
-"""BrokerSessionOrchestrator — the testable core of the Yuanta session lifecycle.
+"""BrokerSessionOrchestrator — the testable core of the Yuanta SPARK API session
+lifecycle.
 
-Deliberately pure Python: no comtypes, no wx, no real network/COM I/O. It is driven
-entirely by (1) the thin `TradeAdapterPort`/`QuoteAdapterPort` protocols it calls out
-to, and (2) `handle_*` callback methods that a real adapter (see
-`trade_ocx_adapter.py`/`quote_ocx_adapter.py`) or a test double calls when the
-underlying vendor control fires an event. This split is what makes the login
-sequencing, retry/backoff, capability tracking, and duplicate/out-of-order callback
-guarding fully unit-testable without any real OCX — see
+Deliberately pure Python: no `pythonnet`/`clr`, no wx, no real network/CLR I/O. It is
+driven entirely by (1) the thin `SparkAdapterPort` protocol it calls out to, and (2)
+`handle_*` callback methods that a real adapter (`spark_api_adapter.py`) or a test
+double calls when the underlying `OnResponse` dispatch fires. This split is what makes
+the login sequencing, retry/backoff, capability tracking, and duplicate/out-of-order
+callback guarding fully unit-testable without any real vendor DLL — see
 `docs/adr/0004-broker-session-architecture.md`.
 
-Sequencing follows the implementation prompt literally: 登入 → 委託查詢 → 成交查詢 →
-持倉查詢 → 行情訂閱 → session-ready. Every step must complete before the next begins;
-`SessionCapabilities` is only ever all-True once every step has actually succeeded.
+SPARK API collapses the legacy OCX API's five-step sequence (trade login -> order
+query -> fill query -> position query -> quote login -> subscribe) into one login
+covering trading, market data, and reports together — see ADR 0004. This orchestrator
+still runs two safety queries (`GetRealReport`, `GetFutStoreSummary`) before declaring
+`READY`, preserving the "no unknown orders/positions before startup" safety property
+the implementation prompt's global rules require — just against the new, single-session
+API shape: 登入 -> (帳號選擇，若回傳超過一組) -> 回報查詢 -> 庫存查詢 -> 行情訂閱 ->
+session-ready.
 
 Every `handle_*` callback carries the `generation` the adapter captured when it issued
-the underlying request. `generation` bumps on every `start()`/retry attempt; a
-callback whose generation doesn't match the current one is stale (from a superseded
-attempt) and is ignored. Combined with the internal phase check (a callback is only
-accepted while the orchestrator is in the exact phase that expects it), this is what
-makes duplicate and out-of-order callbacks safe to ignore rather than corrupt state.
+the underlying request. `generation` bumps on every `start()`/retry attempt; a callback
+whose generation doesn't match the current one is stale (from a superseded attempt) and
+is ignored. Combined with the internal phase check (a callback is only accepted while
+the orchestrator is in the exact phase that expects it), this is what makes duplicate
+and out-of-order callbacks safe to ignore rather than corrupt state.
 """
 
 from __future__ import annotations
@@ -31,7 +36,6 @@ from typing import Protocol
 
 from tfx_quant.application.events.events import (
     BrokerCapabilitiesChanged,
-    BrokerDuplicateLoginRejected,
     BrokerLoggedOut,
     BrokerLoginFailed,
     BrokerLoginSucceeded,
@@ -41,59 +45,61 @@ from tfx_quant.application.events.events import (
     Event,
     MarketDataTickReceived,
 )
-from tfx_quant.application.ports.broker_session import LogoutReason, SessionCapabilities
+from tfx_quant.application.ports.broker_session import (
+    LoginRequest,
+    LogoutReason,
+    SessionCapabilities,
+)
+from tfx_quant.application.settings.trading_settings import Environment
 from tfx_quant.domain.account import TradingAccount
 from tfx_quant.domain.errors import DomainError
 from tfx_quant.domain.timestamp import Timestamp
 from tfx_quant.infrastructure.yuanta.backoff import BackoffPolicy
-from tfx_quant.infrastructure.yuanta.credentials import BrokerCredentials, CredentialSource
+from tfx_quant.infrastructure.yuanta.credentials import BrokerCredentials
 from tfx_quant.infrastructure.yuanta.errors import (
     AccountSelectionError,
     MarketDataParseError,
     MarketDataSubscriptionError,
 )
-from tfx_quant.infrastructure.yuanta.market_data_parsing import parse_market_data_push
-from tfx_quant.infrastructure.yuanta.vendor_codes import (
-    QUOTE_MSG_CODE_DUPLICATE_LOGIN,
-    QUOTE_TLINK_IN_PROGRESS,
-    QUOTE_TLINK_RETRIABLE,
-    QUOTE_TLINK_SUCCESS,
-    REG_ERR_SUCCESS,
-    TRADE_TLINK_IN_PROGRESS,
-    TRADE_TLINK_RETRIABLE,
-    TRADE_TLINK_SUCCESS,
-    quote_msg_message,
-    reg_err_message,
-    trade_tlink_message,
-)
+from tfx_quant.infrastructure.yuanta.market_data_parsing import parse_stock_tick_push
 
-FUTURES_MARKET_CODE = "2"
-"""市場別 code for futures in `OnLogonS`'s `AccList` — see
-`infrastructure/yuanta/README.md`."""
+_RETRIABLE_LOGIN_MSG_CODES = frozenset({"0000"})
+"""登入 docs page's `MsgCode` table: `0000`=執行失敗 (generic execution failure — the
+only one plausibly transient/network-related, so the only one this orchestrator retries
+automatically). `0102`(密碼凍結或未啟用)/`0112`(無此權限使用功能) and any other
+unrecognized code are treated as non-retriable — retrying a frozen password or a
+permissions problem automatically would just repeat a guaranteed failure, and the docs'
+"若登入失敗，不允許太頻繁執行登入作業（每4秒1次）" rate limit makes blind retries risky
+for an unknown code."""
+
+_LOGIN_SUCCESS_MSG_CODES = frozenset({"0001", "00001"})
+"""Both spellings appear across different docs pages' worked Python examples (`if
+strMsgCode == '0001' or strMsgCode == '00001'`) — kept as a set rather than picking one,
+matching the docs' own defensive handling."""
 
 
-class TradeAdapterPort(Protocol):
-    """Thin wrapper over the trading OCX's connection/query calls — see
-    `trade_ocx_adapter.py` for the real comtypes-backed implementation and
-    `tests/infrastructure/test_broker_session_orchestrator.py` for the fake."""
+class SparkAdapterPort(Protocol):
+    """Thin wrapper over the SPARK API session object's calls — see
+    `spark_api_adapter.py` for the real `pythonnet`-backed implementation and
+    `tests/infrastructure/test_broker_session_orchestrator.py` for the fake.
 
-    def connect(self, credentials: BrokerCredentials, *, generation: int) -> None: ...
+    One adapter now covers what the legacy OCX API needed two separate adapters
+    (trade/quote) for — SPARK API is a single unified session."""
+
+    def open_and_login(
+        self, credentials: BrokerCredentials, *, generation: int, environment: Environment
+    ) -> None: ...
     def disconnect(self) -> None: ...
-    def query_open_orders(self, account: TradingAccount) -> None: ...
-    def query_fills(self, account: TradingAccount) -> None: ...
+    def query_real_report(self, account: TradingAccount) -> None: ...
     def query_positions(self, account: TradingAccount) -> None: ...
-
-
-class QuoteAdapterPort(Protocol):
-    """Thin wrapper over the quote OCX's connection/registration calls."""
-
-    def connect(self, credentials: BrokerCredentials, *, generation: int) -> None: ...
-    def disconnect(self) -> None: ...
-    def subscribe(self, symbol: str) -> int:
-        """Returns the vendor's synchronous `RegErrCode` (0 == success)."""
+    def subscribe(self, symbol: str, account: TradingAccount) -> None:
+        """`account` is required — SPARK API's `SubscribeStockTick(LoginAcno, ...)`
+        takes the account explicitly, unlike the legacy quote OCX's session-implicit
+        `AddMktReg`. Raises `MarketDataSubscriptionError` if the vendor synchronously
+        rejects the call (`SubscribeStockTick` returning `False`)."""
         ...
 
-    def unsubscribe(self, symbol: str) -> int: ...
+    def unsubscribe(self, symbol: str, account: TradingAccount) -> None: ...
 
 
 class _Cancellable(Protocol):
@@ -127,12 +133,10 @@ class ThreadingScheduler:
 
 class _Phase(StrEnum):
     IDLE = auto()
-    CONNECTING_TRADE = auto()
+    CONNECTING = auto()
     AWAITING_ACCOUNT_SELECTION = auto()
-    QUERYING_ORDERS = auto()
-    QUERYING_FILLS = auto()
+    QUERYING_REPORTS = auto()
     QUERYING_POSITIONS = auto()
-    CONNECTING_QUOTE = auto()
     SUBSCRIBING_MARKET_DATA = auto()
     READY = auto()
     FAILED = auto()
@@ -143,11 +147,14 @@ class _Phase(StrEnum):
 class _SessionState:
     accounts: tuple[TradingAccount, ...] = ()
     selected_account: TradingAccount | None = None
-    trade_login_done: bool = False
-    orders_done: bool = False
-    fills_done: bool = False
-    positions_done: bool = False
-    quote_login_done: bool = False
+    login_done: bool = False
+    reports_query_done: bool = False
+    positions_query_done: bool = False
+    market_data_subscription_attempted: bool = False
+    """Set once `_begin_market_data_subscription` has run (after both safety queries
+    complete), regardless of whether `market_data_symbols` is empty — this is what
+    keeps `market_data` from vacuously becoming `True` the instant login succeeds when
+    no startup symbols are configured (an empty-set subset check is trivially true)."""
     subscribed_symbols: set[str] = field(default_factory=set)
 
 
@@ -157,9 +164,7 @@ class BrokerSessionOrchestrator:
     def __init__(
         self,
         *,
-        trade_adapter: TradeAdapterPort,
-        quote_adapter: QuoteAdapterPort,
-        credential_source: CredentialSource,
+        adapter: SparkAdapterPort,
         event_coordinator: EventPublisher,
         market_data_symbols: Sequence[str] = (),
         account_no_hint: str | None = None,
@@ -167,22 +172,19 @@ class BrokerSessionOrchestrator:
         backoff_factory: Callable[[], BackoffPolicy] | None = None,
         scheduler: Scheduler | None = None,
     ) -> None:
-        """`market_data_symbols` are already-resolved broker-format symbol codes
-        (e.g. the EasyWin-style code Feature 03 will produce) — this orchestrator
+        """`market_data_symbols` are already-resolved SPARK API quote symbols (e.g.
+        `domain.instrument_master.futures_quote_symbol`'s output) — this orchestrator
         deliberately does not translate an `Instrument`/`ContractMonth` into a vendor
-        symbol string itself; that mapping isn't documented in the extracted PDFs (see
-        `infrastructure/yuanta/README.md`) and guessing it would violate the
-        implementation prompt's "不要猜測...欄位" rule. An empty sequence means the
-        market-data step is vacuously satisfied as soon as the quote login succeeds.
+        symbol string itself. An empty sequence means the market-data step is
+        vacuously satisfied as soon as the safety queries finish.
 
-        `account_no_hint` mirrors `TFX_QUANT_YUANTA_ACCOUNT_NO` (see
-        `credentials.py`) — when more than one futures account is returned and one of
-        them matches this account number, it's auto-selected; otherwise
-        `select_account()` must be called externally before the session can complete.
+        `account_no_hint` — when more than one account is returned and one of them
+        matches this account number, it's auto-selected; otherwise `select_account()`
+        must be called externally before the session can complete. Sourced by the
+        caller from `infrastructure.yuanta.login_preferences` (the previously-selected
+        account, remembered non-secretly across runs), not from this class.
         """
-        self._trade_adapter = trade_adapter
-        self._quote_adapter = quote_adapter
-        self._credential_source = credential_source
+        self._adapter = adapter
         self._event_coordinator = event_coordinator
         self._market_data_symbols = tuple(market_data_symbols)
         self._account_no_hint = account_no_hint
@@ -195,6 +197,7 @@ class BrokerSessionOrchestrator:
         self._generation = 0
         self._state = _SessionState()
         self._credentials: BrokerCredentials | None = None
+        self._environment: Environment | None = None
         self._pending_timer: _Cancellable | None = None
         self._last_capabilities = SessionCapabilities()
         self._ready_published = False
@@ -216,7 +219,7 @@ class BrokerSessionOrchestrator:
         with self._lock:
             return self._state.selected_account
 
-    def start(self) -> None:
+    def start(self, request: LoginRequest) -> None:
         with self._lock:
             if self._phase not in (
                 _Phase.IDLE,
@@ -224,12 +227,15 @@ class BrokerSessionOrchestrator:
                 _Phase.LOGGED_OUT,
             ):
                 return  # already starting/started — not a no-op only when terminal
-            self._credentials = self._credential_source.load()
+            self._credentials = BrokerCredentials(
+                user_id=request.user_id.strip(), password=request.password
+            )
+            self._environment = request.environment
             self._backoff.reset()
             self._state = _SessionState()
             self._ready_published = False
             self._generation += 1
-            self._begin_trade_connect()
+            self._begin_connect()
 
     def select_account(self, account: TradingAccount) -> None:
         with self._lock:
@@ -240,15 +246,14 @@ class BrokerSessionOrchestrator:
             if self._phase != _Phase.AWAITING_ACCOUNT_SELECTION:
                 raise AccountSelectionError("目前並非等待帳號選擇的狀態，無法選擇帳號")
             self._state.selected_account = account
-            self._begin_order_query()
+            self._begin_report_query()
 
     def cancel_start(self) -> None:
         with self._lock:
             self._backoff.cancel()
             self._cancel_pending_timer()
             if self._phase not in (_Phase.READY, _Phase.LOGGED_OUT, _Phase.IDLE):
-                self._trade_adapter.disconnect()
-                self._quote_adapter.disconnect()
+                self._adapter.disconnect()
                 self._phase = _Phase.FAILED
                 self._collapse_and_publish_capabilities()
 
@@ -260,14 +265,9 @@ class BrokerSessionOrchestrator:
         perturbs `_current_capabilities()`'s `market_data` flag."""
         with self._lock:
             if self._phase != _Phase.READY:
-                raise MarketDataSubscriptionError(
-                    "尚未完成登入與初始行情訂閱，無法訂閱新商品行情"
-                )
-            reg_err = self._quote_adapter.subscribe(symbol)
-            if reg_err != REG_ERR_SUCCESS:
-                raise MarketDataSubscriptionError(
-                    f"商品 {symbol} 行情註冊失敗：{reg_err_message(reg_err)}"
-                )
+                raise MarketDataSubscriptionError("尚未完成登入與初始行情訂閱，無法訂閱新商品行情")
+            assert self._state.selected_account is not None
+            self._adapter.subscribe(symbol, self._state.selected_account)
             self._state.subscribed_symbols.add(symbol)
 
     def unsubscribe_market_data(self, symbol: str) -> None:
@@ -276,7 +276,8 @@ class BrokerSessionOrchestrator:
         with self._lock:
             if self._phase != _Phase.READY:
                 return
-            self._quote_adapter.unsubscribe(symbol)
+            assert self._state.selected_account is not None
+            self._adapter.unsubscribe(symbol, self._state.selected_account)
             self._state.subscribed_symbols.discard(symbol)
 
     def stop(self) -> None:
@@ -286,56 +287,66 @@ class BrokerSessionOrchestrator:
 
             if self._state.selected_account is not None and self._phase in (
                 _Phase.READY,
-                _Phase.QUERYING_ORDERS,
-                _Phase.QUERYING_FILLS,
+                _Phase.QUERYING_REPORTS,
                 _Phase.QUERYING_POSITIONS,
-                _Phase.CONNECTING_QUOTE,
                 _Phase.SUBSCRIBING_MARKET_DATA,
             ):
                 # Best-effort final order-status check. Feature 02 has no order
                 # cancellation/resend capability (that's Feature 06+), so this can
                 # only surface an ambiguous state, not resolve it — it deliberately
                 # does not claim a clean shutdown by skipping the check.
-                self._trade_adapter.query_open_orders(self._state.selected_account)
+                self._adapter.query_real_report(self._state.selected_account)
 
-            for symbol in list(self._state.subscribed_symbols):
-                self._quote_adapter.unsubscribe(symbol)
+            if self._state.selected_account is not None:
+                for symbol in list(self._state.subscribed_symbols):
+                    self._adapter.unsubscribe(symbol, self._state.selected_account)
 
-            self._trade_adapter.disconnect()
-            # No documented quote-side logout function exists (see
-            # infrastructure/yuanta/README.md) — disconnect() on the real adapter
-            # only tears down the local COM object/host, it doesn't call a vendor
-            # logout.
-            self._quote_adapter.disconnect()
+            self._adapter.disconnect()
 
             self._phase = _Phase.LOGGED_OUT
             self._state = _SessionState()
+            # Per the login-input implementation prompt: credentials only live in
+            # memory for as long as the current login needs them, cleared on logout.
+            self._credentials = None
             self._collapse_and_publish_capabilities()
             self._publish(BrokerLoggedOut(at=Timestamp.now(), reason=LogoutReason.USER_REQUESTED))
 
-    # -- Trade login ----------------------------------------------------------------
+    # -- Login ----------------------------------------------------------------------
 
-    def _begin_trade_connect(self) -> None:
-        self._phase = _Phase.CONNECTING_TRADE
+    def _begin_connect(self) -> None:
+        self._phase = _Phase.CONNECTING
         assert self._credentials is not None
-        self._trade_adapter.connect(self._credentials, generation=self._generation)
+        assert self._environment is not None
+        self._adapter.open_and_login(
+            self._credentials, generation=self._generation, environment=self._environment
+        )
         self._arm_timeout()
 
-    def handle_trade_login_result(
-        self, generation: int, tlink_status: int, acc_list: str, cert_seq: str, cert_status: str
+    def handle_login_result(
+        self,
+        generation: int,
+        msg_code: str,
+        msg_content: str,
+        login_entries: Sequence[tuple[str, str, str, str]],
     ) -> None:
+        """`login_entries` is `(Account, Name, InvestorID, SellerNo)` per
+        `LoginResult.LoginList` entry — the real adapter extracts these primitives
+        from the `.NET` objects so this method (and its tests) stay pure Python."""
         with self._lock:
-            if generation != self._generation or self._phase != _Phase.CONNECTING_TRADE:
+            if generation != self._generation or self._phase != _Phase.CONNECTING:
                 return  # stale/duplicate/out-of-order — ignore
-            if tlink_status in TRADE_TLINK_IN_PROGRESS:
-                return  # not a terminal result yet
 
             self._cancel_pending_timer()
 
-            if tlink_status == TRADE_TLINK_SUCCESS:
-                accounts = _parse_futures_accounts(acc_list)
+            if msg_code in _LOGIN_SUCCESS_MSG_CODES:
+                accounts = _parse_login_accounts(login_entries)
+                if not accounts:
+                    self._handle_startup_failure(
+                        "登入成功，但回傳帳號清單無法解析為有效期貨帳號", retriable=False
+                    )
+                    return
                 self._state.accounts = accounts
-                self._state.trade_login_done = True
+                self._state.login_done = True
                 self._backoff.reset()
                 self._publish(BrokerLoginSucceeded(at=Timestamp.now(), accounts=accounts))
                 self._publish_capabilities_if_changed()
@@ -343,190 +354,128 @@ class BrokerSessionOrchestrator:
                 resolved = _resolve_account(accounts, self._account_no_hint)
                 if resolved is not None:
                     self._state.selected_account = resolved
-                    self._begin_order_query()
+                    self._begin_report_query()
                 else:
                     self._phase = _Phase.AWAITING_ACCOUNT_SELECTION
                 return
 
-            reason = trade_tlink_message(tlink_status)
-            retriable = tlink_status in TRADE_TLINK_RETRIABLE
+            reason = msg_content or f"登入失敗（代碼 {msg_code}）"
+            retriable = msg_code in _RETRIABLE_LOGIN_MSG_CODES
             self._handle_startup_failure(reason, retriable)
 
-    def handle_trade_disconnected(self, generation: int, tlink_status: int) -> None:
-        """Best-effort seam for a passive mid-session disconnect on the trading side.
-
-        The extracted trading-OCX PDF documents no distinct "disconnected" event
-        (unlike the quote OCX's `OnMktStatusChange`, which is an ongoing status
-        stream) — `OnLogonS` is documented only as a one-shot login-result event. This
-        method exists so the orchestrator's behavior is testable and so a future
-        confirmed mechanism (e.g. polling `TLinkStatus`, or a vendor event this
-        session didn't find) can be wired in without changing the orchestrator. Not
-        wired to any real callback yet — see `docs/adr/0004-*.md`.
-        """
+    def handle_session_invalidated(self, generation: int, reason: str) -> None:
+        """Best-effort seam for a post-ready session becoming unusable (passive
+        disconnect, broker-side error). SPARK API's docs don't document a distinct
+        "disconnected" push event the way the legacy quote OCX's `OnMktStatusChange`
+        was an ongoing status stream — this method exists so the orchestrator's
+        behavior is testable and so a real mechanism, if one is confirmed later, can be
+        wired in without changing the orchestrator. See `docs/adr/0004-*.md`."""
         with self._lock:
             if generation != self._generation or self._phase != _Phase.READY:
                 return
-            self._invalidate_session(trade_tlink_message(tlink_status))
+            self._invalidate_session(reason)
 
-    # -- Query sequence ---------------------------------------------------------
+    # -- Safety queries ---------------------------------------------------------
 
-    def _begin_order_query(self) -> None:
-        self._phase = _Phase.QUERYING_ORDERS
+    def _begin_report_query(self) -> None:
+        self._phase = _Phase.QUERYING_REPORTS
         assert self._state.selected_account is not None
-        self._trade_adapter.query_open_orders(self._state.selected_account)
+        self._adapter.query_real_report(self._state.selected_account)
 
-    def handle_order_query_result(self, generation: int, row_count: int, raw: str) -> None:
+    def handle_real_report_query_result(self, generation: int) -> None:
+        """`GetRealReport` (即時回報查詢) — this deliberately does not parse the
+        returned `RealReportList` into typed `Order`/`Fill` domain objects: building
+        one needs an idempotency key mapping that's Feature 06's job, same posture the
+        legacy-API design always took for `ReportQuery`/`DealQuery`. Only completion is
+        tracked here, for sequencing/capability purposes."""
         with self._lock:
-            if generation != self._generation or self._phase != _Phase.QUERYING_ORDERS:
+            if generation != self._generation or self._phase != _Phase.QUERYING_REPORTS:
                 return
-            self._state.orders_done = True
+            self._state.reports_query_done = True
             self._publish_capabilities_if_changed()
-            self._phase = _Phase.QUERYING_FILLS
-            assert self._state.selected_account is not None
-            self._trade_adapter.query_fills(self._state.selected_account)
+            self._begin_position_query()
 
-    def handle_deal_query_result(self, generation: int, row_count: int, raw: str) -> None:
+    def _begin_position_query(self) -> None:
+        self._phase = _Phase.QUERYING_POSITIONS
+        assert self._state.selected_account is not None
+        self._adapter.query_positions(self._state.selected_account)
+
+    def handle_position_query_result(self, generation: int) -> None:
+        """`GetFutStoreSummary` (期貨庫存總表查詢) — same "track completion only, don't
+        parse into typed `Position` yet" posture as `handle_real_report_query_result`;
+        Feature 08 (position reconciliation) is what builds a typed `Position` from
+        this."""
         with self._lock:
-            if generation != self._generation or self._phase != _Phase.QUERYING_FILLS:
+            if generation != self._generation or self._phase != _Phase.QUERYING_POSITIONS:
                 return
-            self._state.fills_done = True
+            self._state.positions_query_done = True
             self._publish_capabilities_if_changed()
-            self._phase = _Phase.QUERYING_POSITIONS
-            assert self._state.selected_account is not None
-            self._trade_adapter.query_positions(self._state.selected_account)
+            self._begin_market_data_subscription()
 
-    def handle_user_defined_func_result(
-        self, generation: int, row_count: int, results: str, work_id: str
-    ) -> None:
-        """`work_id="RA003"` is 部位狀況查詢 (position query) — see README. This
-        deliberately does not parse `results` into a structured position: the vendor
-        doc gives no worked example for `RA003`'s row layout (unlike `ReportQuery`/
-        `DealQuery`, which do), so building a typed `Position` here would mean
-        guessing the field order — left for whichever feature confirms it (position
-        reconciliation is Feature 08's job)."""
-        with self._lock:
-            if (
-                generation != self._generation
-                or self._phase != _Phase.QUERYING_POSITIONS
-                or work_id != "RA003"
-            ):
-                return
-            self._state.positions_done = True
-            self._publish_capabilities_if_changed()
-            self._begin_quote_connect()
-
-    # -- Quote login + subscription -----------------------------------------------
-
-    def _begin_quote_connect(self) -> None:
-        self._phase = _Phase.CONNECTING_QUOTE
-        assert self._credentials is not None
-        self._quote_adapter.connect(self._credentials, generation=self._generation)
-        self._arm_timeout()
-
-    def handle_quote_status_changed(self, generation: int, status: int, msg: str) -> None:
-        with self._lock:
-            if generation != self._generation:
-                return
-
-            if self._phase == _Phase.READY:
-                if status in QUOTE_TLINK_IN_PROGRESS or status == QUOTE_TLINK_SUCCESS:
-                    return
-                self._invalidate_session(quote_msg_message(msg))
-                return
-
-            if self._phase != _Phase.CONNECTING_QUOTE:
-                return  # stale/duplicate/out-of-order
-            if status in QUOTE_TLINK_IN_PROGRESS:
-                return
-
-            self._cancel_pending_timer()
-
-            if status == QUOTE_TLINK_SUCCESS:
-                self._state.quote_login_done = True
-                self._publish_capabilities_if_changed()
-                self._begin_market_data_subscription()
-                return
-
-            if msg and msg[0] == QUOTE_MSG_CODE_DUPLICATE_LOGIN:
-                self._publish(BrokerDuplicateLoginRejected(at=Timestamp.now(), source="quote"))
-                self._collapse_and_publish_capabilities()
-                self._phase = _Phase.FAILED
-                return
-
-            retriable = status in QUOTE_TLINK_RETRIABLE
-            self._handle_startup_failure(quote_msg_message(msg), retriable)
+    # -- Market data subscription + push --------------------------------------------
 
     def _begin_market_data_subscription(self) -> None:
         self._phase = _Phase.SUBSCRIBING_MARKET_DATA
         if not self._market_data_symbols:
+            self._state.market_data_subscription_attempted = True
             self._complete_session()
             return
+        assert self._state.selected_account is not None
         for symbol in self._market_data_symbols:
-            reg_err = self._quote_adapter.subscribe(symbol)
-            if reg_err != REG_ERR_SUCCESS:
-                self._handle_startup_failure(
-                    f"商品 {symbol} 行情註冊失敗：{reg_err_message(reg_err)}", retriable=False
-                )
+            try:
+                self._adapter.subscribe(symbol, self._state.selected_account)
+            except MarketDataSubscriptionError as exc:
+                self._handle_startup_failure(f"商品 {symbol} 行情訂閱失敗：{exc}", retriable=False)
                 return
             self._state.subscribed_symbols.add(symbol)
+        self._state.market_data_subscription_attempted = True
         self._complete_session()
-
-    def handle_quote_registration_error(
-        self, generation: int, symbol: str, mode: int, error_code: int
-    ) -> None:
-        """Async failure notice — per the doc, `OnRegError` "成功則不通知" (only fires
-        on failure), so a synchronous `RegErrCode` of 0 from `subscribe()` may still
-        be followed by this. Only meaningful while still subscribing; a late arrival
-        after `READY` is treated as a market-data disruption."""
-        with self._lock:
-            if generation != self._generation:
-                return
-            message = f"商品 {symbol} 行情註冊發生錯誤（代碼 {error_code}）"
-            if self._phase == _Phase.SUBSCRIBING_MARKET_DATA:
-                self._handle_startup_failure(message, retriable=False)
-            elif self._phase == _Phase.READY:
-                self._invalidate_session(message)
-
-    # -- Market data --------------------------------------------------------------
 
     def handle_market_data_push(
         self,
         generation: int,
-        symbol: str,
-        match_time: str,
-        match_pri: str,
-        match_qty: str,
-        tol_match_qty: str,
+        vendor_symbol: str,
+        serial_no: object,
+        deal_price: object,
+        deal_vol: object,
+        hour: object,
+        minute: object,
+        second: object,
+        millisecond: object,
     ) -> None:
-        """`OnGetMktAll` push, forwarded via `quote_ocx_adapter.py`. Only accepted
-        while `READY` — a stale-generation or pre-subscription push is ignored, the
-        same guard every other `handle_*` callback here applies. Deliberately does not
-        translate `symbol` into `Instrument`/`ContractMonth` itself — same boundary
-        this orchestrator already keeps for `market_data_symbols` (see `__init__`'s
-        docstring); `MarketDataBarService` (which already knows the active selection)
-        does that translation."""
+        """`SubscribeStockTick`'s ongoing `StockTickResult` push (`OnResponse` with
+        `intMark == 2`), forwarded via `spark_api_adapter.py`. Only accepted while
+        `READY` — a stale-generation or pre-subscription push is ignored, the same
+        guard every other `handle_*` callback here applies. Deliberately does not
+        translate `vendor_symbol` into `Instrument`/`ContractMonth` itself — same
+        boundary this orchestrator already keeps for `market_data_symbols` (see
+        `__init__`'s docstring); `MarketDataBarService` (which already knows the active
+        selection) does that translation."""
         with self._lock:
             if generation != self._generation or self._phase != _Phase.READY:
                 return
         try:
-            parsed = parse_market_data_push(
-                symbol=symbol,
-                match_time=match_time,
-                match_pri=match_pri,
-                match_qty=match_qty,
-                tol_match_qty=tol_match_qty,
+            parsed = parse_stock_tick_push(
+                stk_code=vendor_symbol,
+                serial_no=serial_no,
+                deal_price=deal_price,
+                deal_vol=deal_vol,
+                hour=hour,
+                minute=minute,
+                second=second,
+                millisecond=millisecond,
             )
         except MarketDataParseError:
-            return  # malformed push — dropped rather than raised into a COM callback
+            return  # malformed push — dropped rather than raised into the dispatch loop
         if parsed is None:
-            return  # pre-market snapshot (TolMatchQty == -1) — nothing to feed downstream
+            return  # 商品清盤 (settlement) sentinel — nothing to feed downstream
         self._publish(
             MarketDataTickReceived(
                 at=Timestamp.now(),
                 vendor_symbol=parsed.vendor_symbol,
                 price=parsed.price,
                 size=parsed.size,
-                cumulative_volume=parsed.cumulative_volume,
+                serial_no=parsed.serial_no,
                 exchange_time=parsed.exchange_time,
             )
         )
@@ -562,7 +511,7 @@ class BrokerSessionOrchestrator:
                 return
             self._generation += 1
             self._state = _SessionState()
-            self._begin_trade_connect()
+            self._begin_connect()
 
     def _invalidate_session(self, reason: str) -> None:
         self._publish(BrokerSessionInvalidated(at=Timestamp.now(), reason=reason))
@@ -574,7 +523,7 @@ class BrokerSessionOrchestrator:
         with self._lock:
             if generation != self._generation:
                 return
-            if self._phase not in (_Phase.CONNECTING_TRADE, _Phase.CONNECTING_QUOTE):
+            if self._phase != _Phase.CONNECTING:
                 return
             self._publish(BrokerLoginTimedOut(at=Timestamp.now()))
             self._handle_startup_failure("登入逾時", retriable=True)
@@ -593,22 +542,21 @@ class BrokerSessionOrchestrator:
     # -- Capabilities ---------------------------------------------------------------
 
     def _current_capabilities(self) -> SessionCapabilities:
-        queries_done = (
-            self._state.orders_done and self._state.fills_done and self._state.positions_done
-        )
+        queries_done = self._state.reports_query_done and self._state.positions_query_done
         # Subset, not equality: `subscribe_market_data()` (Feature 03's runtime
         # instrument-switch path) may add symbols beyond this fixed startup set —
         # that must not retroactively invalidate the market_data capability.
         symbols_subscribed = set(self._market_data_symbols) <= self._state.subscribed_symbols
         return SessionCapabilities(
-            login=self._state.trade_login_done,
-            market_data=self._state.quote_login_done and symbols_subscribed,
+            login=self._state.login_done,
+            # SPARK API auto-subscribes 即時回報 (RR_RealReport) on login — no
+            # separate opt-in call exists (見 回報 > 即時回報訂閱：「登入即訂閱」) — so
+            # this capability tracks login itself, not a distinct step.
+            order_reports=self._state.login_done,
+            market_data=self._state.market_data_subscription_attempted and symbols_subscribed,
             trading=(
-                self._state.trade_login_done
-                and self._state.selected_account is not None
-                and queries_done
+                self._state.login_done and self._state.selected_account is not None and queries_done
             ),
-            order_reports=self._state.trade_login_done,
             queries=queries_done,
         )
 
@@ -619,11 +567,10 @@ class BrokerSessionOrchestrator:
             self._publish(BrokerCapabilitiesChanged(at=Timestamp.now(), capabilities=current))
 
     def _collapse_and_publish_capabilities(self) -> None:
-        self._state.trade_login_done = False
-        self._state.orders_done = False
-        self._state.fills_done = False
-        self._state.positions_done = False
-        self._state.quote_login_done = False
+        self._state.login_done = False
+        self._state.reports_query_done = False
+        self._state.positions_query_done = False
+        self._state.market_data_subscription_attempted = False
         self._state.subscribed_symbols = set()
         self._publish_capabilities_if_changed()
 
@@ -631,28 +578,28 @@ class BrokerSessionOrchestrator:
         self._event_coordinator.publish(event)
 
 
-def _parse_futures_accounts(acc_list: str) -> tuple[TradingAccount, ...]:
-    """Parse `OnLogonS`'s `AccList`, e.g. "2-F00-9808900- -路人甲;2-F00-9808900-0001-
-    路人乙" = 市場別-Branch-Account-SubAccount-姓名, keeping only 市場別=='2' (futures)
-    entries. Malformed entries are skipped, not raised on — a single bad entry
-    shouldn't take down the whole login."""
+def _parse_login_accounts(
+    entries: Sequence[tuple[str, str, str, str]],
+) -> tuple[TradingAccount, ...]:
+    """Builds `TradingAccount`s from `LoginResult.LoginList` entries — `(Account,
+    Name, InvestorID, SellerNo)` tuples, `Account` in SPARK API's documented futures
+    format `F + 分公司代號(7+3) + 帳號(7)` (登入 docs page), e.g.
+    `"FF0210132243219588"`. Only `F`-prefixed (futures) entries are kept — this
+    codebase never trades securities. The `7+3`/`7` split is a best-effort reading of
+    the docs' own notation (`分公司代號(7+3)+帳號(7)`), not independently confirmed
+    against a real login response this session — see
+    `docs/adr/0004-broker-session-architecture.md`'s open-questions section.
+    Malformed entries are skipped, not raised on."""
     accounts: list[TradingAccount] = []
-    for entry in acc_list.split(";"):
-        entry = entry.strip()
-        if not entry:
-            continue
-        parts = entry.split("-", 4)
-        if len(parts) < 4:
-            continue
-        market = parts[0]
-        if market != FUTURES_MARKET_CODE:
-            continue
-        branch_id, account_no, sub_account = parts[1], parts[2], parts[3]
+    for account_str, _name, _investor_id, _seller_no in entries:
+        account_str = account_str.strip()
+        if not account_str.startswith("F") or len(account_str) != 18:
+            continue  # not a futures account in the documented 18-char (F+17) format
+        digits = account_str[1:]
+        branch_id, account_no = digits[:10], digits[10:]
         try:
             accounts.append(
-                TradingAccount(
-                    branch_id=branch_id, account_no=account_no, sub_account=sub_account.strip()
-                )
+                TradingAccount(branch_id=branch_id, account_no=account_no, sub_account="")
             )
         except DomainError:
             continue

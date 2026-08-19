@@ -47,8 +47,9 @@ class FillReceived(Event):
 
 @dataclass(frozen=True, slots=True)
 class BrokerLoginSucceeded(Event):
-    """`OnLogonS` reported success. `accounts` is the parsed, futures-only account
-    list — session-ready still requires queries + market data subscription too."""
+    """SPARK API's `Login` result (`OnResponse`, `strIndex == 'Login'`) reported
+    success. `accounts` is the parsed, futures-only account list — session-ready still
+    requires the safety queries + market data subscription too."""
 
     accounts: tuple[TradingAccount, ...]
 
@@ -68,7 +69,7 @@ class BrokerLoginFailed(Event):
 
 @dataclass(frozen=True, slots=True)
 class BrokerLoginTimedOut(Event):
-    """No `OnLogonS` (or equivalent) callback arrived within the configured timeout."""
+    """No `Login` result arrived via `OnResponse` within the configured timeout."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,7 +131,7 @@ class InstrumentSwitchCompleted(Event):
 
 @dataclass(frozen=True, slots=True)
 class MarketDataTickReceived(Event):
-    """A raw, parsed `OnGetMktAll` push — see `infrastructure/yuanta/
+    """A raw, parsed SPARK API `StockTickResult` push — see `infrastructure/yuanta/
     market_data_parsing.py`. Still vendor-symbol-addressed, not yet translated to
     `Instrument`/`ContractMonth`: `MarketDataBarService` (which already knows the
     currently active selection) does that translation and validates the symbol match,
@@ -140,11 +141,12 @@ class MarketDataTickReceived(Event):
     vendor_symbol: str
     price: Decimal
     size: int
-    """This push's incremental traded quantity (`MatchQty`)."""
-    cumulative_volume: int
-    """Total traded volume since session open (`TolMatchQty`) — see `domain/tick.py`."""
+    """This push's traded quantity (`DealVol`)."""
+    serial_no: int
+    """Per-symbol trade sequence number (`SerialNo`) — see `domain/tick.py`."""
     exchange_time: time
-    """The bare exchange time-of-day from `MatchTime`, not yet date-resolved."""
+    """The bare exchange time-of-day from `StockTickResult.Time`, not yet
+    date-resolved."""
 
 
 @dataclass(frozen=True, slots=True)

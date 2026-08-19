@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted (Feature 04).
+Accepted (Feature 04). **Addendum (2026-08-19, SPARK API pivot)**: decisions 4, 5, and
+7 are **resolved or superseded** — see "Addendum: SPARK API resolves the sequence-
+number and MatchTime gaps" below. Decisions 1, 2, 3, 6, 8, 9 are unaffected.
 
 ## Context
 
@@ -161,3 +163,41 @@ path that would otherwise race against `clear()` over which one "wins" first.
   handle_market_data_push`) is unit-tested against fixture pushes but — like the rest of
   the quote OCX's event-firing behavior — not verified against a live vendor connection
   this session; see decisions 4/5's flagged gaps.
+
+## Addendum: SPARK API resolves the sequence-number and MatchTime gaps (2026-08-19)
+
+Every implementation prompt now mandates the official 元大 SPARK API as the only valid
+spec source (see ADR 0001's addendum), replacing the legacy OCX `OnGetMktAll` API this
+ADR was written against. Two of that legacy API's flagged gaps are resolved outright:
+
+- **Decision 4's `TolMatchQty`-as-sequence-number substitution is no longer needed.**
+  SPARK API's `SubscribeStockTick`/`StockTickResult` (行情 > 分時明細訂閱 docs page)
+  documents a real per-symbol trade sequence number, `SerialNo` — "以股票代碼個別編序
+  號，從1開始，-1代表商品清盤" (numbered per stock code, starting from 1; -1 means
+  end-of-session settlement). `domain/tick.py`'s `Tick.serial_no` and
+  `domain/bar_aggregator.py`'s dedup check now use this directly —
+  `Tick.cumulative_volume`/`TolMatchQty` are gone from the codebase. `SerialNo == -1`
+  replaces the old `TolMatchQty == -1` pre-market sentinel with a settlement sentinel
+  (same handling: `infrastructure/yuanta/market_data_parsing.py`'s
+  `parse_stock_tick_push` returns `None`).
+- **Decision 5's `MatchTime` digit-count ambiguity is resolved.** SPARK API's `Time`
+  field is a structured `TYuantaTime` object (`bytHour`/`bytMin`/`bytSec`/`ushtMSec`),
+  not a raw digit string requiring defensive length-sniffing.
+- **Decision 7's "no confirmed historical/tick-replay mechanism" still holds**, now for
+  a different, more precisely confirmed reason: SPARK API's `GetKLine` (K線查詢, the
+  obvious candidate for backfilling a forming bar after reconnect) documents "註1：僅提
+  供台股上市櫃商品查詢" (Note 1: only provides queries for TWSE/TWOTC-listed products)
+  directly attached to its `MarketType` parameter — futures/TAIFEX is not a queryable
+  market for this call. This is a *confirmed exclusion*, not an undocumented gap this
+  codebase is guessing about; the no-history-replay/gap-on-reconnect policy stays
+  exactly as decision 7 describes, unchanged.
+
+**Handoff note**: `infrastructure/yuanta/session_orchestrator.py`'s
+`handle_market_data_push` (and its `parse_market_data_push` import) still reflect the
+old OCX-callback shape as of this addendum — that file is being rewritten wholesale
+around SPARK API's unified `OnResponse` dispatch (see the in-progress ADR 0004
+rewrite), which is where the new `parse_stock_tick_push`/`ParsedStockTickPush` and
+`MarketDataTickReceived.serial_no` get wired up to a real `SubscribeStockTick`
+subscription. Domain (`Tick`, `BarAggregator`) and the parsing module
+(`market_data_parsing.py`) are already fully on the new shape and independently
+tested; only that one wiring point is a known, tracked gap, not a silent one.

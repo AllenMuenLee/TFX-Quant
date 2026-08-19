@@ -6,71 +6,74 @@ from decimal import Decimal
 import pytest
 
 from tfx_quant.infrastructure.yuanta.errors import MarketDataParseError
-from tfx_quant.infrastructure.yuanta.market_data_parsing import parse_market_data_push
+from tfx_quant.infrastructure.yuanta.market_data_parsing import parse_stock_tick_push
 
 
-def _push(**overrides: str) -> dict[str, str]:
-    defaults = {
-        "symbol": "TXFU6",
-        "match_time": "093015",
-        "match_pri": "17500",
-        "match_qty": "1",
-        "tol_match_qty": "42",
+def _push(**overrides: object) -> dict[str, object]:
+    defaults: dict[str, object] = {
+        "stk_code": "TXFU6",
+        "serial_no": 42,
+        "deal_price": "17500",
+        "deal_vol": 1,
+        "hour": 9,
+        "minute": 30,
+        "second": 15,
+        "millisecond": 0,
     }
     defaults.update(overrides)
     return defaults
 
 
-def test_parses_valid_hhmmss_push() -> None:
-    result = parse_market_data_push(**_push())
+def test_parses_valid_push() -> None:
+    result = parse_stock_tick_push(**_push())
     assert result is not None
     assert result.vendor_symbol == "TXFU6"
     assert result.price == Decimal("17500")
     assert result.size == 1
-    assert result.cumulative_volume == 42
+    assert result.serial_no == 42
     assert result.exchange_time == time(9, 30, 15)
 
 
-def test_parses_valid_hhmmssmmm_push_with_milliseconds() -> None:
-    result = parse_market_data_push(**_push(match_time="093015123"))
+def test_parses_push_with_milliseconds() -> None:
+    result = parse_stock_tick_push(**_push(millisecond=123))
     assert result is not None
     assert result.exchange_time == time(9, 30, 15, 123_000)
 
 
-def test_pre_market_sentinel_returns_none() -> None:
-    assert parse_market_data_push(**_push(tol_match_qty="-1")) is None
+def test_settlement_sentinel_returns_none() -> None:
+    assert parse_stock_tick_push(**_push(serial_no=-1)) is None
 
 
-def test_rejects_blank_symbol() -> None:
+def test_rejects_blank_stk_code() -> None:
     with pytest.raises(MarketDataParseError):
-        parse_market_data_push(**_push(symbol="   "))
+        parse_stock_tick_push(**_push(stk_code="   "))
 
 
-def test_rejects_malformed_match_time_length() -> None:
+def test_rejects_serial_no_below_one_and_not_settlement_sentinel() -> None:
     with pytest.raises(MarketDataParseError):
-        parse_market_data_push(**_push(match_time="9301"))
+        parse_stock_tick_push(**_push(serial_no=0))
 
 
-def test_rejects_out_of_range_match_time() -> None:
+def test_rejects_out_of_range_time() -> None:
     with pytest.raises(MarketDataParseError):
-        parse_market_data_push(**_push(match_time="996099"))
+        parse_stock_tick_push(**_push(hour=99, minute=99, second=99))
 
 
 def test_rejects_non_numeric_price() -> None:
     with pytest.raises(MarketDataParseError):
-        parse_market_data_push(**_push(match_pri="abc"))
+        parse_stock_tick_push(**_push(deal_price="abc"))
 
 
 def test_rejects_non_positive_price() -> None:
     with pytest.raises(MarketDataParseError):
-        parse_market_data_push(**_push(match_pri="0"))
+        parse_stock_tick_push(**_push(deal_price="0"))
 
 
-def test_rejects_non_numeric_size() -> None:
+def test_rejects_negative_size() -> None:
     with pytest.raises(MarketDataParseError):
-        parse_market_data_push(**_push(match_qty="abc"))
+        parse_stock_tick_push(**_push(deal_vol=-1))
 
 
-def test_rejects_non_numeric_cumulative_volume() -> None:
+def test_rejects_non_numeric_serial_no() -> None:
     with pytest.raises(MarketDataParseError):
-        parse_market_data_push(**_push(tol_match_qty="abc"))
+        parse_stock_tick_push(**_push(serial_no="abc"))

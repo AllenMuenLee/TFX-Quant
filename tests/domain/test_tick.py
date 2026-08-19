@@ -22,7 +22,7 @@ def _tick(**overrides: object) -> Tick:
         "at": _AT,
         "price": Price(Decimal("17500")),
         "size": 1,
-        "cumulative_volume": 100,
+        "serial_no": 100,
     }
     defaults.update(overrides)
     return Tick(**defaults)  # type: ignore[arg-type]
@@ -31,7 +31,7 @@ def _tick(**overrides: object) -> Tick:
 def test_valid_tick_constructs() -> None:
     tick = _tick()
     assert tick.size == 1
-    assert tick.cumulative_volume == 100
+    assert tick.serial_no == 100
 
 
 def test_rejects_negative_size() -> None:
@@ -39,9 +39,9 @@ def test_rejects_negative_size() -> None:
         _tick(size=-1)
 
 
-def test_rejects_negative_cumulative_volume() -> None:
+def test_rejects_non_positive_serial_no() -> None:
     with pytest.raises(InvalidTickError):
-        _tick(cumulative_volume=-1)
+        _tick(serial_no=0)
 
 
 def test_allows_zero_size_snapshot_push() -> None:

@@ -8,6 +8,14 @@ constraint) with a `refresh()` the parent frame calls. `ReadinessFrame` — not 
 `wx.CallAfter` hop off the `EventCoordinator` consumer thread, same as it already does
 for broker session events — keeping subscription lifecycle in one place (the frame's
 existing `_on_close` teardown) rather than duplicating it per embedded panel.
+
+The closed-bar list is a single view backed by `MarketDataBarService.query_history()`
+(persisted history, up to the rolling two-month window) rather than two separate
+"recent" vs "historical" lists — a bar that closed moments ago and a bar from three
+weeks ago are the same kind of record once persisted, so they share one list and one
+date-range query. The date pickers/查詢 button are for quickly jumping to a different
+day; every `_refresh()` (i.e. every market-data event) re-runs the *current* date range
+so today's view keeps updating live without the user needing to press 查詢 again.
 """
 
 from __future__ import annotations
@@ -26,9 +34,8 @@ _CANDLE_LABEL_ZH = {
     CandleColor.BLACK: "黑",
     CandleColor.DOJI: "十字",
 }
-_RECENT_BARS_SHOWN = 10
-_HISTORY_ROWS_SHOWN = 200
-_DEFAULT_HISTORY_QUERY_DAYS = 7
+_BAR_ROWS_SHOWN = 200
+_DEFAULT_QUERY_DAYS = 7
 
 
 def _format_bar(bar: Bar) -> str:
@@ -81,40 +88,35 @@ class MarketDataPanel(wx.Panel):
         forming_row.Add(self._forming_label, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 6)
         sizer.Add(forming_row, 0)
 
-        sizer.Add(wx.StaticText(self, label="最近收盤 K 棒："), 0, wx.ALL, 6)
-        self._recent_list = wx.ListBox(self, size=(-1, 140))
-        sizer.Add(self._recent_list, 0, wx.EXPAND | wx.ALL, 6)
+        self._range_label = wx.StaticText(self, label="（尚未收錄任何資料）")
+        sizer.Add(self._range_label, 0, wx.ALL, 6)
 
-        sizer.Add(wx.StaticLine(self), 0, wx.EXPAND | wx.ALL, 6)
-        sizer.Add(
-            wx.StaticText(self, label="歷史 K 棒（本機自行收錄，最多滾動兩個月）："), 0, wx.ALL, 6
-        )
-        self._history_range_label = wx.StaticText(self, label="（尚未收錄任何資料）")
-        sizer.Add(self._history_range_label, 0, wx.ALL, 6)
+        sizer.Add(wx.StaticLine(self), 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
 
-        history_query_row = wx.BoxSizer(wx.HORIZONTAL)
-        history_query_row.Add(
-            wx.StaticText(self, label="起："), 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 6
+        nav_row = wx.BoxSizer(wx.HORIZONTAL)
+        nav_row.Add(
+            wx.StaticText(self, label="收盤 K 棒（本機自行收錄）　查詢日期 起："),
+            0,
+            wx.ALL | wx.ALIGN_CENTER_VERTICAL,
+            6,
         )
         default_end = wx.DateTime.Now()
-        default_start_date = date.today() - timedelta(days=_DEFAULT_HISTORY_QUERY_DAYS)
+        default_start_date = date.today() - timedelta(days=_DEFAULT_QUERY_DAYS)
         default_start = _date_to_wx_date(default_start_date)
-        self._history_start_picker = wx.adv.DatePickerCtrl(self)
-        self._history_start_picker.SetValue(default_start)
-        history_query_row.Add(self._history_start_picker, 0, wx.ALL, 6)
-        history_query_row.Add(
-            wx.StaticText(self, label="迄："), 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 6
-        )
-        self._history_end_picker = wx.adv.DatePickerCtrl(self)
-        self._history_end_picker.SetValue(default_end)
-        history_query_row.Add(self._history_end_picker, 0, wx.ALL, 6)
-        self._history_query_button = wx.Button(self, label="查詢 (Query)")
-        self._history_query_button.Bind(wx.EVT_BUTTON, self._on_query_history)
-        history_query_row.Add(self._history_query_button, 0, wx.ALL, 6)
-        sizer.Add(history_query_row, 0)
+        self._start_picker = wx.adv.DatePickerCtrl(self)
+        self._start_picker.SetValue(default_start)
+        nav_row.Add(self._start_picker, 0, wx.ALL, 6)
+        nav_row.Add(wx.StaticText(self, label="迄："), 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 6)
+        self._end_picker = wx.adv.DatePickerCtrl(self)
+        self._end_picker.SetValue(default_end)
+        nav_row.Add(self._end_picker, 0, wx.ALL, 6)
+        self._query_button = wx.Button(self, label="查詢 (Query)")
+        self._query_button.Bind(wx.EVT_BUTTON, self._on_query)
+        nav_row.Add(self._query_button, 0, wx.ALL, 6)
+        sizer.Add(nav_row, 0)
 
-        self._history_list = wx.ListBox(self, size=(-1, 160))
-        sizer.Add(self._history_list, 0, wx.EXPAND | wx.ALL, 6)
+        self._bar_list = wx.ListBox(self, size=(-1, 220))
+        sizer.Add(self._bar_list, 0, wx.EXPAND | wx.ALL, 6)
 
         self.SetSizer(sizer)
         self._refresh()
@@ -124,17 +126,13 @@ class MarketDataPanel(wx.Panel):
         event — see module docstring for why the subscriptions live there."""
         self._refresh()
 
-    def _on_query_history(self, _event: wx.CommandEvent) -> None:
-        current = self._services.instrument_selection.current
-        if current is None:
-            return
-        start_date = _wx_date_to_date(self._history_start_picker.GetValue())
-        end_date = _wx_date_to_date(self._history_end_picker.GetValue())
-        records = self._services.market_data_bar_service.query_history(
-            current.instrument, current.contract, start_date=start_date, end_date=end_date
-        )
-        self._history_list.Set(
-            [_format_record(r) for r in reversed(records[-_HISTORY_ROWS_SHOWN:])]
+    def _on_query(self, _event: wx.CommandEvent) -> None:
+        self._refresh()
+
+    def _selected_date_range(self) -> tuple[date, date]:
+        return (
+            _wx_date_to_date(self._start_picker.GetValue()),
+            _wx_date_to_date(self._end_picker.GetValue()),
         )
 
     def _refresh(self) -> None:
@@ -142,9 +140,8 @@ class MarketDataPanel(wx.Panel):
         if current is None:
             self._status_label.SetLabel("（尚未選擇契約）")
             self._forming_label.SetLabel("（尚無資料）")
-            self._recent_list.Set([])
-            self._history_range_label.SetLabel("（尚未收錄任何資料）")
-            self._history_list.Set([])
+            self._range_label.SetLabel("（尚未收錄任何資料）")
+            self._bar_list.Set([])
             return
 
         service = self._services.market_data_bar_service
@@ -152,16 +149,14 @@ class MarketDataPanel(wx.Panel):
 
         recorded_range = service.recorded_range(instrument, contract)
         if recorded_range is None:
-            self._history_range_label.SetLabel(
+            self._range_label.SetLabel(
                 "尚無收錄資料 — 本軟體僅在運行期間自行聚合行情，首次啟用時歷史為空"
             )
         else:
             since_str = recorded_range.earliest_at.value.strftime("%Y-%m-%d %H:%M")
             latest_str = recorded_range.latest_at.value.strftime("%Y-%m-%d %H:%M")
             note = "" if recorded_range.covers_full_window else "（尚未滿兩個月，屬正常狀態）"
-            self._history_range_label.SetLabel(
-                f"自 {since_str} 起開始收錄，最新至 {latest_str}{note}"
-            )
+            self._range_label.SetLabel(f"自 {since_str} 起開始收錄，最新至 {latest_str}{note}")
 
         is_stale = service.is_stale(instrument, contract)
         has_gap = service.has_gap(instrument, contract)
@@ -181,5 +176,8 @@ class MarketDataPanel(wx.Panel):
         forming = service.forming_bar(instrument, contract)
         self._forming_label.SetLabel("（尚無資料）" if forming is None else _format_bar(forming))
 
-        recent = service.recent_closed_bars(instrument, contract, limit=_RECENT_BARS_SHOWN)
-        self._recent_list.Set([_format_bar(bar) for bar in reversed(recent)])
+        start_date, end_date = self._selected_date_range()
+        records = service.query_history(
+            instrument, contract, start_date=start_date, end_date=end_date
+        )
+        self._bar_list.Set([_format_record(r) for r in reversed(records[-_BAR_ROWS_SHOWN:])])

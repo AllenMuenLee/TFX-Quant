@@ -132,8 +132,7 @@ def _order(instrument: Instrument, contract: ContractMonth) -> Order:
 
 def test_consistent_when_nothing_selected_is_false() -> None:
     assert (
-        check_quote_position_order_consistent(current=None, positions=(), open_orders=())
-        is False
+        check_quote_position_order_consistent(current=None, positions=(), open_orders=()) is False
     )
 
 

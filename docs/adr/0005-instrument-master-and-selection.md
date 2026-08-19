@@ -2,7 +2,11 @@
 
 ## Status
 
-Accepted (Feature 03).
+Accepted (Feature 03). **Addendum (2026-08-19, SPARK API pivot)**: decision 1's
+"`vendor_symbol` is undecipherable, must be controlled data" reasoning is **partly
+superseded** — see "Addendum: `vendor_symbol` is now a documented formula" below. The
+rest of this ADR (controlled JSON for everything else, the switch-workflow decisions,
+the `SafetyChecklist` extension) is unaffected by the vendor pivot.
 
 ## Context
 
@@ -132,3 +136,36 @@ longer raising) can translate `Instrument`/`ContractMonth` → `vendor_symbol` v
   `desktop/composition.py` in place of `NullBarSignalStateStore` — until then, the
   "清空 K 棒／訊號狀態" step is a documented no-op, matching Feature 02's own pattern of
   flagging forward-dependent gaps rather than faking them.
+
+## Addendum: `vendor_symbol` is now a documented formula (2026-08-19, SPARK API pivot)
+
+Decision 1's original point 2 ("Can the EasyWin-format vendor symbol be computed... no,
+the encoding is Yuanta/EasyWin-internal and not derivable") was true of the legacy
+OCX/EasyWin API this ADR was originally written against. It is **not true** of the new
+official 元大 SPARK API, which every implementation prompt now mandates as the only
+valid spec source (see `docs/adr/0001-python-version-and-runtime.md`'s addendum). The
+SPARK API docs site's 期貨報價代碼7xxx變更規則 page publishes the real-time quote
+symbol's encoding precisely: `<root><month-code><year-digit>`, with a worked example
+("2021年台指期6月:TXFF1") that matches exactly. `domain/instrument_master.py`'s
+`futures_quote_symbol()` implements this formula and is unit-tested against that worked
+example (`tests/domain/test_instrument_master.py`).
+
+This resolves the old `-UNCONFIRMED` placeholder problem for `vendor_symbol`:
+`instrument_master.example.json`'s values are now `futures_quote_symbol()`'s actual
+output, not a guess. `vendor_symbol` stays a stored literal field rather than becoming
+a computed property — keeps `InstrumentMasterEntry` a plain value object and lets an
+operator eyeball/override a value directly in the JSON — but there is no longer any
+excuse for a wrong one in the shipped example file.
+
+A **new, separate** unconfirmed-code problem replaces it: SPARK API's order-side
+`SendFutureOrder.CommodityID1` (e.g. "FITX" for TXF, confirmed from the 交易 > 國內期貨
+下單 docs page's own worked example) is a completely different code space from
+`vendor_symbol` — a fact the old EasyWin-era ADR had no way to know, since the legacy
+API's `SendOrderF`/`FutNo` conflated order and quote symbols into one field. The new
+`InstrumentMasterEntry.order_commodity_code` field carries this, defaulting to `""`
+(unresolved) for any instrument without a confirmed docs example — MXF's code isn't
+in any SPARK API docs page found this session, only in the vendor's downloadable
+`FunctionList.xls` (股名檔對照表), which isn't fetchable as a web page. Feature 06
+(order/fill state machine) must refuse to place an order for an entry with an empty
+`order_commodity_code` rather than guessing one, same posture this ADR always took for
+`vendor_symbol`.

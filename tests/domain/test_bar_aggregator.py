@@ -40,16 +40,14 @@ def _ts(d: date, hour: int, minute: int, second: int = 0) -> Timestamp:
     return Timestamp(datetime(d.year, d.month, d.day, hour, minute, second, tzinfo=TAIPEI_TZ))
 
 
-def _tick(
-    at: Timestamp, price: str, *, size: int = 1, cumulative_volume: int
-) -> Tick:
+def _tick(at: Timestamp, price: str, *, size: int = 1, serial_no: int) -> Tick:
     return Tick(
         instrument=_INSTRUMENT,
         contract=_CONTRACT,
         at=at,
         price=Price(Decimal(price)),
         size=size,
-        cumulative_volume=cumulative_volume,
+        serial_no=serial_no,
     )
 
 
@@ -61,9 +59,9 @@ def _aggregator() -> BarAggregator:
 
 def test_ohlcv_correctness_within_one_bar() -> None:
     agg = _aggregator()
-    agg.on_tick(_tick(_ts(_WEDNESDAY, 8, 50), "17500", cumulative_volume=1))
-    agg.on_tick(_tick(_ts(_WEDNESDAY, 9, 0), "17510", cumulative_volume=3, size=2))
-    agg.on_tick(_tick(_ts(_WEDNESDAY, 9, 10), "17490", cumulative_volume=4))
+    agg.on_tick(_tick(_ts(_WEDNESDAY, 8, 50), "17500", serial_no=1))
+    agg.on_tick(_tick(_ts(_WEDNESDAY, 9, 0), "17510", serial_no=3, size=2))
+    agg.on_tick(_tick(_ts(_WEDNESDAY, 9, 10), "17490", serial_no=4))
     forming = agg.forming_bar_snapshot()
     assert forming is not None
     assert forming.open.amount == Decimal("17500")
@@ -77,8 +75,8 @@ def test_ohlcv_correctness_within_one_bar() -> None:
 
 def test_bar_closes_and_emits_when_boundary_crossed() -> None:
     agg = _aggregator()
-    agg.on_tick(_tick(_ts(_WEDNESDAY, 8, 50), "17500", cumulative_volume=1))
-    closed = agg.on_tick(_tick(_ts(_WEDNESDAY, 9, 50), "17600", cumulative_volume=2))
+    agg.on_tick(_tick(_ts(_WEDNESDAY, 8, 50), "17500", serial_no=1))
+    closed = agg.on_tick(_tick(_ts(_WEDNESDAY, 9, 50), "17600", serial_no=2))
     assert len(closed) == 1
     bar = closed[0]
     assert bar.start.value.time() == time(8, 45)
@@ -94,8 +92,8 @@ def test_bar_closes_and_emits_when_boundary_crossed() -> None:
 
 def test_tick_exactly_at_boundary_belongs_to_next_bar() -> None:
     agg = _aggregator()
-    agg.on_tick(_tick(_ts(_WEDNESDAY, 8, 50), "17500", cumulative_volume=1))
-    closed = agg.on_tick(_tick(_ts(_WEDNESDAY, 9, 45, 0), "17600", cumulative_volume=2))
+    agg.on_tick(_tick(_ts(_WEDNESDAY, 8, 50), "17500", serial_no=1))
+    closed = agg.on_tick(_tick(_ts(_WEDNESDAY, 9, 45, 0), "17600", serial_no=2))
     assert len(closed) == 1
     assert closed[0].start.value.time() == time(8, 45)
     forming = agg.forming_bar_snapshot()
@@ -105,8 +103,8 @@ def test_tick_exactly_at_boundary_belongs_to_next_bar() -> None:
 
 def test_duplicate_tick_is_dropped() -> None:
     agg = _aggregator()
-    agg.on_tick(_tick(_ts(_WEDNESDAY, 8, 50), "17500", cumulative_volume=5))
-    agg.on_tick(_tick(_ts(_WEDNESDAY, 8, 51), "17999", cumulative_volume=5))  # duplicate push
+    agg.on_tick(_tick(_ts(_WEDNESDAY, 8, 50), "17500", serial_no=5))
+    agg.on_tick(_tick(_ts(_WEDNESDAY, 8, 51), "17999", serial_no=5))  # duplicate push
     forming = agg.forming_bar_snapshot()
     assert forming is not None
     assert forming.close.amount == Decimal("17500")
@@ -116,9 +114,9 @@ def test_duplicate_tick_is_dropped() -> None:
 
 def test_out_of_order_tick_is_dropped() -> None:
     agg = _aggregator()
-    agg.on_tick(_tick(_ts(_WEDNESDAY, 8, 50), "17500", cumulative_volume=10))
+    agg.on_tick(_tick(_ts(_WEDNESDAY, 8, 50), "17500", serial_no=10))
     # a late/out-of-order push whose cumulative volume regresses
-    agg.on_tick(_tick(_ts(_WEDNESDAY, 8, 51), "16000", cumulative_volume=9))
+    agg.on_tick(_tick(_ts(_WEDNESDAY, 8, 51), "16000", serial_no=9))
     forming = agg.forming_bar_snapshot()
     assert forming is not None
     assert forming.close.amount == Decimal("17500")
@@ -128,11 +126,11 @@ def test_out_of_order_tick_is_dropped() -> None:
 
 def test_late_tick_after_bar_already_closed_is_dropped() -> None:
     agg = _aggregator()
-    agg.on_tick(_tick(_ts(_WEDNESDAY, 8, 50), "17500", cumulative_volume=1))
-    closed = agg.on_tick(_tick(_ts(_WEDNESDAY, 9, 50), "17600", cumulative_volume=2))
+    agg.on_tick(_tick(_ts(_WEDNESDAY, 8, 50), "17500", serial_no=1))
+    closed = agg.on_tick(_tick(_ts(_WEDNESDAY, 9, 50), "17600", serial_no=2))
     assert len(closed) == 1
     # a tick that arrives late, timestamped inside the already-closed 08:45 bar
-    late = agg.on_tick(_tick(_ts(_WEDNESDAY, 9, 30), "99999", cumulative_volume=3))
+    late = agg.on_tick(_tick(_ts(_WEDNESDAY, 9, 30), "99999", serial_no=3))
     assert late == []
     forming = agg.forming_bar_snapshot()
     assert forming is not None
@@ -141,8 +139,8 @@ def test_late_tick_after_bar_already_closed_is_dropped() -> None:
 
 def test_midnight_crossing_closes_and_opens_across_dates() -> None:
     agg = _aggregator()
-    agg.on_tick(_tick(_ts(_WEDNESDAY, 23, 10), "17700", cumulative_volume=1))
-    closed = agg.on_tick(_tick(_ts(_THURSDAY, 0, 15), "17650", cumulative_volume=2))
+    agg.on_tick(_tick(_ts(_WEDNESDAY, 23, 10), "17700", serial_no=1))
+    closed = agg.on_tick(_tick(_ts(_THURSDAY, 0, 15), "17650", serial_no=2))
     assert len(closed) == 1
     bar = closed[0]
     assert bar.start.value.date() == _WEDNESDAY
@@ -157,9 +155,9 @@ def test_midnight_crossing_closes_and_opens_across_dates() -> None:
 
 def test_no_trade_interval_bar_is_never_synthesized() -> None:
     agg = _aggregator()
-    agg.on_tick(_tick(_ts(_WEDNESDAY, 8, 50), "17500", cumulative_volume=1))
+    agg.on_tick(_tick(_ts(_WEDNESDAY, 8, 50), "17500", serial_no=1))
     # no ticks at all during the 09:45-10:45 slot — jump straight to 11:00
-    closed = agg.on_tick(_tick(_ts(_WEDNESDAY, 11, 0), "17800", cumulative_volume=2))
+    closed = agg.on_tick(_tick(_ts(_WEDNESDAY, 11, 0), "17800", serial_no=2))
     assert len(closed) == 1
     assert closed[0].start.value.time() == time(8, 45)
     forming = agg.forming_bar_snapshot()
@@ -169,7 +167,7 @@ def test_no_trade_interval_bar_is_never_synthesized() -> None:
 
 def test_on_clock_closes_forming_bar_without_a_new_tick() -> None:
     agg = _aggregator()
-    agg.on_tick(_tick(_ts(_WEDNESDAY, 8, 50), "17500", cumulative_volume=1))
+    agg.on_tick(_tick(_ts(_WEDNESDAY, 8, 50), "17500", serial_no=1))
     closed = agg.on_clock(_ts(_WEDNESDAY, 9, 46))
     assert len(closed) == 1
     assert closed[0].close.amount == Decimal("17500")
@@ -186,17 +184,17 @@ def test_candle_streak_counter_tracks_consecutive_same_color() -> None:
     counter = CandleStreakCounter()
     agg = _aggregator()
     # bar A (08:45-09:45): open 100, close 105 -> RED
-    agg.on_tick(_tick(_ts(_WEDNESDAY, 8, 50), "100", cumulative_volume=1))
-    agg.on_tick(_tick(_ts(_WEDNESDAY, 9, 0), "105", cumulative_volume=2))
+    agg.on_tick(_tick(_ts(_WEDNESDAY, 8, 50), "100", serial_no=1))
+    agg.on_tick(_tick(_ts(_WEDNESDAY, 9, 0), "105", serial_no=2))
     # this tick crosses the boundary: closes bar A, opens bar B
-    for bar in agg.on_tick(_tick(_ts(_WEDNESDAY, 9, 50), "110", cumulative_volume=3)):
+    for bar in agg.on_tick(_tick(_ts(_WEDNESDAY, 9, 50), "110", serial_no=3)):
         counter.on_bar_closed(bar)
     assert counter.color is CandleColor.RED
     assert counter.length == 1
 
     # bar B (09:45-10:45): open 110, close 115 -> RED
-    agg.on_tick(_tick(_ts(_WEDNESDAY, 10, 0), "115", cumulative_volume=4))
-    for bar in agg.on_tick(_tick(_ts(_WEDNESDAY, 10, 50), "120", cumulative_volume=5)):
+    agg.on_tick(_tick(_ts(_WEDNESDAY, 10, 0), "115", serial_no=4))
+    for bar in agg.on_tick(_tick(_ts(_WEDNESDAY, 10, 50), "120", serial_no=5)):
         counter.on_bar_closed(bar)
     assert counter.color is CandleColor.RED
     assert counter.length == 2
@@ -206,16 +204,16 @@ def test_candle_streak_counter_doji_resets_streak() -> None:
     counter = CandleStreakCounter()
     agg = _aggregator()
     # bar A (08:45-09:45): open 100, close 105 -> RED, streak = 1
-    agg.on_tick(_tick(_ts(_WEDNESDAY, 8, 50), "100", cumulative_volume=1))
-    agg.on_tick(_tick(_ts(_WEDNESDAY, 9, 0), "105", cumulative_volume=2))
-    for bar in agg.on_tick(_tick(_ts(_WEDNESDAY, 9, 50), "110", cumulative_volume=3)):
+    agg.on_tick(_tick(_ts(_WEDNESDAY, 8, 50), "100", serial_no=1))
+    agg.on_tick(_tick(_ts(_WEDNESDAY, 9, 0), "105", serial_no=2))
+    for bar in agg.on_tick(_tick(_ts(_WEDNESDAY, 9, 50), "110", serial_no=3)):
         counter.on_bar_closed(bar)
     assert counter.length == 1
 
     # bar B (09:45-10:45): open 110, dips to 100, closes back at 110 -> DOJI, resets
-    agg.on_tick(_tick(_ts(_WEDNESDAY, 10, 0), "100", cumulative_volume=4))
-    agg.on_tick(_tick(_ts(_WEDNESDAY, 10, 30), "110", cumulative_volume=5))
-    closed = agg.on_tick(_tick(_ts(_WEDNESDAY, 10, 50), "120", cumulative_volume=6))
+    agg.on_tick(_tick(_ts(_WEDNESDAY, 10, 0), "100", serial_no=4))
+    agg.on_tick(_tick(_ts(_WEDNESDAY, 10, 30), "110", serial_no=5))
+    closed = agg.on_tick(_tick(_ts(_WEDNESDAY, 10, 50), "120", serial_no=6))
     assert closed[0].candle_color is CandleColor.DOJI
     counter.on_bar_closed(closed[0])
     assert counter.length == 0

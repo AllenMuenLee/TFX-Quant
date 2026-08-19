@@ -1,6 +1,6 @@
 # 元大期貨自動交易系統：Implementation Prompts
 
-本目錄把客戶需求拆成 16 個可獨立開發與驗收的 feature。每個子目錄的 `implementation-prompt.md` 都是可直接交給實作者或 coding agent 的工作指令；實作時仍須先確認元大期貨 API 的實際版本、事件名稱、欄位與部署限制，不得憑空假設券商介面。
+本目錄把客戶需求拆成 16 個可獨立開發與驗收的 feature。每個 prompt 都是可直接交給實作者或 coding agent 的工作指令。所有元大 API 功能一律以[元大 SPARK API 官方入口](https://www.yuanta.com.tw/file-repository/content/API/page/index.html)及其下方連結的 API 說明文件、範例、元件下載與換版資訊為唯一規格來源；不得讀取專案內既有資料夾、舊 SDK 文件、舊範例或既有程式碼來建立或反推 API 功能。實作時須記錄查閱日期與元件版本，且不得憑空假設介面。
 
 ## 強制技術要求：Python
 

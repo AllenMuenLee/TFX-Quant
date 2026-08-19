@@ -28,7 +28,11 @@ from tfx_quant.application.events.events import (
     BrokerSessionReady,
     Event,
 )
-from tfx_quant.application.ports.broker_session import LogoutReason, SessionCapabilities
+from tfx_quant.application.ports.broker_session import (
+    LoginRequest,
+    LogoutReason,
+    SessionCapabilities,
+)
 from tfx_quant.domain.account import TradingAccount
 from tfx_quant.domain.timestamp import Timestamp
 from tfx_quant.infrastructure.yuanta.errors import AccountSelectionError
@@ -68,7 +72,10 @@ class MockBrokerSession:
     def selected_account(self) -> TradingAccount | None:
         return self._selected_account
 
-    def start(self) -> None:
+    def start(self, request: LoginRequest) -> None:
+        """`request` is accepted for `IBrokerSession` compliance but ignored — this
+        mock always runs the scripted happy path below; use the `simulate_*` methods
+        to script other outcomes."""
         self.simulate_login_success((_DEFAULT_MOCK_ACCOUNT,))
 
     def select_account(self, account: TradingAccount) -> None:

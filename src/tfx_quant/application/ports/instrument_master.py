@@ -20,9 +20,7 @@ from tfx_quant.domain.instrument_master import InstrumentMasterEntry
 
 
 class InstrumentMasterRepository(Protocol):
-    def get(
-        self, instrument: Instrument, contract: ContractMonth
-    ) -> InstrumentMasterEntry | None:
+    def get(self, instrument: Instrument, contract: ContractMonth) -> InstrumentMasterEntry | None:
         """None means "主檔缺漏" — no controlled data exists for this pair."""
         ...
 

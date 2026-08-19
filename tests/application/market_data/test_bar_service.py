@@ -307,7 +307,7 @@ def _push(
     at: Timestamp,
     exchange_time: time,
     price: str,
-    cumulative_volume: int,
+    serial_no: int,
     size: int = 1,
     vendor_symbol: str = _VENDOR_SYMBOL,
 ) -> None:
@@ -317,7 +317,7 @@ def _push(
             vendor_symbol=vendor_symbol,
             price=Decimal(price),
             size=size,
-            cumulative_volume=cumulative_volume,
+            serial_no=serial_no,
             exchange_time=exchange_time,
         )
     )
@@ -348,7 +348,7 @@ def test_clear_activates_contract_with_empty_forming_bar() -> None:
 
 def test_tick_for_inactive_contract_is_ignored() -> None:
     service, bus, clock = _build()
-    _push(service, bus, clock.now(), time(9, 0), "17500", cumulative_volume=1)
+    _push(service, bus, clock.now(), time(9, 0), "17500", serial_no=1)
     assert service.forming_bar(_INSTRUMENT, _CONTRACT) is None
 
 
@@ -361,7 +361,7 @@ def test_tick_with_symbol_mismatch_is_ignored() -> None:
         clock.now(),
         time(9, 0),
         "17500",
-        cumulative_volume=1,
+        serial_no=1,
         vendor_symbol="SOMETHING-ELSE",
     )
     assert service.forming_bar(_INSTRUMENT, _CONTRACT) is None
@@ -372,7 +372,7 @@ def test_tick_updates_forming_bar_and_clears_staleness() -> None:
     service.clear(_INSTRUMENT, _CONTRACT)
     assert service.is_stale(_INSTRUMENT, _CONTRACT) is True  # nothing received yet
 
-    _push(service, bus, clock.now(), time(9, 0), "17500", cumulative_volume=1)
+    _push(service, bus, clock.now(), time(9, 0), "17500", serial_no=1)
 
     forming = service.forming_bar(_INSTRUMENT, _CONTRACT)
     assert forming is not None
@@ -385,10 +385,10 @@ def test_tick_updates_forming_bar_and_clears_staleness() -> None:
 def test_bar_closed_published_when_boundary_crossed() -> None:
     service, bus, clock = _build(now=_ts(8, 50))
     service.clear(_INSTRUMENT, _CONTRACT)
-    _push(service, bus, clock.now(), time(8, 50), "17500", cumulative_volume=1)
+    _push(service, bus, clock.now(), time(8, 50), "17500", serial_no=1)
 
     clock.advance(60 * 60)  # 09:50
-    _push(service, bus, clock.now(), time(9, 50), "17600", cumulative_volume=2)
+    _push(service, bus, clock.now(), time(9, 50), "17600", serial_no=2)
 
     closed_events = [e for e in bus.published if isinstance(e, BarClosed)]
     assert len(closed_events) == 1
@@ -399,7 +399,7 @@ def test_bar_closed_published_when_boundary_crossed() -> None:
 def test_on_clock_tick_marks_stale_after_threshold_with_no_new_ticks() -> None:
     service, bus, clock = _build(now=_ts(9, 0), stale_after_seconds=5.0)
     service.clear(_INSTRUMENT, _CONTRACT)
-    _push(service, bus, clock.now(), time(9, 0), "17500", cumulative_volume=1)
+    _push(service, bus, clock.now(), time(9, 0), "17500", serial_no=1)
     assert service.is_stale(_INSTRUMENT, _CONTRACT) is False
 
     clock.advance(10.0)
@@ -413,7 +413,7 @@ def test_on_clock_tick_marks_stale_after_threshold_with_no_new_ticks() -> None:
 def test_on_clock_tick_closes_forming_bar_with_no_new_tick() -> None:
     service, bus, clock = _build(now=_ts(8, 50))
     service.clear(_INSTRUMENT, _CONTRACT)
-    _push(service, bus, clock.now(), time(8, 50), "17500", cumulative_volume=1)
+    _push(service, bus, clock.now(), time(8, 50), "17500", serial_no=1)
 
     clock.advance(60 * 60)  # past the 09:45 boundary, no new tick arrives
     service.on_clock_tick()
@@ -432,9 +432,9 @@ def test_broker_session_ready_flags_gap_until_next_bar_closes_cleanly() -> None:
     gap_events = [e for e in bus.published if isinstance(e, MarketDataGapDetected)]
     assert len(gap_events) == 1
 
-    _push(service, bus, clock.now(), time(8, 50), "17500", cumulative_volume=1)
+    _push(service, bus, clock.now(), time(8, 50), "17500", serial_no=1)
     clock.advance(60 * 60)
-    _push(service, bus, clock.now(), time(9, 50), "17600", cumulative_volume=2)
+    _push(service, bus, clock.now(), time(9, 50), "17600", serial_no=2)
 
     assert service.has_gap(_INSTRUMENT, _CONTRACT) is False
     cleared_events = [e for e in bus.published if isinstance(e, MarketDataGapCleared)]
@@ -451,7 +451,7 @@ def test_broker_session_ready_with_no_active_contract_is_a_no_op() -> None:
 def test_clear_resets_previous_forming_bar_state() -> None:
     service, bus, clock = _build(now=_ts(8, 50))
     service.clear(_INSTRUMENT, _CONTRACT)
-    _push(service, bus, clock.now(), time(8, 50), "17500", cumulative_volume=1)
+    _push(service, bus, clock.now(), time(8, 50), "17500", serial_no=1)
     assert service.forming_bar(_INSTRUMENT, _CONTRACT) is not None
 
     service.clear(_INSTRUMENT, _CONTRACT)
@@ -467,9 +467,9 @@ def test_bar_closed_is_persisted_via_background_writer() -> None:
     service.clear(_INSTRUMENT, _CONTRACT)
     service.start()
     try:
-        _push(service, bus, clock.now(), time(8, 50), "17500", cumulative_volume=1)
+        _push(service, bus, clock.now(), time(8, 50), "17500", serial_no=1)
         clock.advance(60 * 60)
-        _push(service, bus, clock.now(), time(9, 50), "17600", cumulative_volume=2)
+        _push(service, bus, clock.now(), time(9, 50), "17600", serial_no=2)
         _wait_until(lambda: len(repo.all_records()) == 1)
     finally:
         service.stop()
@@ -490,9 +490,9 @@ def test_bar_closed_after_gap_is_flagged_is_gap_recovery() -> None:
     service.start()
     try:
         bus.publish(BrokerSessionReady(at=clock.now(), account=_ACCOUNT))
-        _push(service, bus, clock.now(), time(8, 50), "17500", cumulative_volume=1)
+        _push(service, bus, clock.now(), time(8, 50), "17500", serial_no=1)
         clock.advance(60 * 60)
-        _push(service, bus, clock.now(), time(9, 50), "17600", cumulative_volume=2)
+        _push(service, bus, clock.now(), time(9, 50), "17600", serial_no=2)
         _wait_until(lambda: len(repo.all_records()) == 1)
     finally:
         service.stop()
@@ -506,11 +506,11 @@ def test_write_queue_full_marks_degraded_without_blocking_tick_processing() -> N
     service.clear(_INSTRUMENT, _CONTRACT)
     # Deliberately never start() the writer thread — nothing drains the queue, so a
     # second bar close overflows a maxsize=1 queue without any real I/O involved.
-    _push(service, bus, clock.now(), time(8, 50), "17500", cumulative_volume=1)
+    _push(service, bus, clock.now(), time(8, 50), "17500", serial_no=1)
     clock.advance(60 * 60)
-    _push(service, bus, clock.now(), time(9, 50), "17600", cumulative_volume=2)
+    _push(service, bus, clock.now(), time(9, 50), "17600", serial_no=2)
     clock.advance(60 * 60)
-    _push(service, bus, clock.now(), time(10, 50), "17700", cumulative_volume=3)
+    _push(service, bus, clock.now(), time(10, 50), "17700", serial_no=3)
 
     assert service.is_persistence_degraded() is True
     # The tick pipeline itself never raised or blocked — bars still closed normally.
@@ -526,13 +526,13 @@ def test_persistent_write_failure_marks_degraded_then_recovers() -> None:
     service.clear(_INSTRUMENT, _CONTRACT)
     service.start()
     try:
-        _push(service, bus, clock.now(), time(8, 50), "17500", cumulative_volume=1)
+        _push(service, bus, clock.now(), time(8, 50), "17500", serial_no=1)
         clock.advance(60 * 60)
-        _push(service, bus, clock.now(), time(9, 50), "17600", cumulative_volume=2)
+        _push(service, bus, clock.now(), time(9, 50), "17600", serial_no=2)
         _wait_until(lambda: service.is_persistence_degraded() is True)
 
         clock.advance(60 * 60)
-        _push(service, bus, clock.now(), time(10, 50), "17700", cumulative_volume=3)
+        _push(service, bus, clock.now(), time(10, 50), "17700", serial_no=3)
         _wait_until(lambda: service.is_persistence_degraded() is False)
     finally:
         service.stop()

@@ -1,0 +1,380 @@
+"""LoginDialog — the Yuanta SPARK API login screen (Feature 02 extension).
+
+Implements `implementation prompt/02-yuanta-api-session/login-input-implementation-
+prompt.md`: collects 執行環境, 帳號, 密碼, 記住帳號, and 安全儲存密碼 from the operator,
+builds a `LoginRequest` (`application/ports/broker_session.py`), and hands it to
+`services.broker_session.start()`. Never touches the `pythonnet`/CLR layer directly —
+that stays inside the adapter `IBrokerSession` wraps.
+
+The validation/DTO-building logic (`build_login_request`) is deliberately a plain,
+wx-free function so it's unit-testable without a live `wx.App` — the same split this
+codebase already uses between `BrokerSessionOrchestrator` (pure) and the `pythonnet`/wx
+glue around it. `LoginDialog` itself is a thin shell that calls it.
+
+Also hosts the one-time SPARK API certificate import (帳號/密碼 aren't enough on
+Windows in production — see 前言 > 測試環境&正式環境說明: a certificate must be
+imported into the OS certificate store before `Login()` will succeed). This is a
+`certutil`-based, app-level convenience (see `infrastructure.yuanta.credentials.
+ensure_certificate_imported`'s docstring for why it's not a documented vendor API call)
+— a separate action from submitting a login, not part of `LoginRequest`.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import wx
+from pydantic import SecretStr
+
+from tfx_quant.application.events.events import (
+    BrokerLoginFailed,
+    BrokerLoginSucceeded,
+    BrokerLoginTimedOut,
+)
+from tfx_quant.application.ports.broker_session import LoginRequest
+from tfx_quant.application.settings.trading_settings import Environment
+from tfx_quant.desktop.composition import ServiceContainer
+from tfx_quant.infrastructure.yuanta import credentials, login_preferences
+from tfx_quant.infrastructure.yuanta.errors import CertificateImportError
+
+_ENVIRONMENT_CHOICES: tuple[Environment, ...] = (Environment.TEST, Environment.PRODUCTION)
+_ENVIRONMENT_LABELS = ("測試 UAT (TEST)", "正式 PROD (PRODUCTION)")
+
+_ACCOUNT_HINT = "證券：S+分公司代號(4)+帳號(7)；期貨：F+分公司代號(7+3)+帳號(7)"
+
+_PRODUCTION_CONFIRM_MESSAGE = (
+    "即將以「正式環境」登入元大期貨 API，登入成功後可能影響真實帳戶／交易相關資料。\n"
+    "請確認您確實要使用正式環境登入。"
+)
+
+
+class LoginFormError(Exception):
+    """A field failed validation — the dialog shows `str(exc)` to the operator."""
+
+
+def build_login_request(
+    *,
+    environment: Environment,
+    user_id: str,
+    password: str,
+    stored_password: str | None,
+) -> LoginRequest:
+    """Pure validation + DTO construction — no wx, no I/O.
+
+    `user_id` has its surrounding whitespace stripped (the implementation prompt's
+    "去除 ID 首尾空白但不得改寫密碼"); `password` is never stripped/altered. If
+    `password` is left blank and a previously secure-stored password exists for this
+    ID (`stored_password`, fetched by the caller via `credentials.load_stored_password`
+    regardless of the current "安全儲存密碼" checkbox state), that stored value is used
+    — the checkbox only controls whether *this* submission's password gets (re)saved
+    afterward, not whether a blank field can fall back to what's already stored.
+    """
+    user_id = user_id.strip()
+    if not user_id:
+        raise LoginFormError("帳號不可空白")
+
+    if not password:
+        password = stored_password or ""
+    if not password:
+        raise LoginFormError("密碼不可空白")
+
+    return LoginRequest(
+        environment=environment,
+        user_id=user_id,
+        password=SecretStr(password),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _FormValues:
+    environment: Environment
+    user_id: str
+    password: str
+    remember_id: bool
+    secure_store: bool
+
+
+class LoginDialog(wx.Dialog):
+    """Modal login form. `ShowModal()` returns `wx.ID_OK` once `BrokerLoginSucceeded`
+    is observed, or `wx.ID_CANCEL` if the operator cancels."""
+
+    def __init__(self, parent: wx.Window | None, services: ServiceContainer) -> None:
+        super().__init__(parent, title="元大 SPARK API 登入", style=wx.DEFAULT_DIALOG_STYLE)
+        self._services = services
+        self._connecting = False
+        self._pending_secure_store = False
+        self._password_masked = True
+
+        prefs = login_preferences.load()
+
+        panel = wx.Panel(self)
+        self._panel = panel
+        sizer = wx.BoxSizer(wx.VERTICAL)
+
+        self._environment_radio = wx.RadioBox(
+            panel, label="執行環境", choices=list(_ENVIRONMENT_LABELS)
+        )
+        self._environment_radio.SetSelection(0)  # 預設測試
+        sizer.Add(self._environment_radio, 0, wx.ALL | wx.EXPAND, 8)
+
+        id_row = wx.BoxSizer(wx.HORIZONTAL)
+        id_row.Add(wx.StaticText(panel, label="帳號："), 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 6)
+        self._user_id_ctrl = wx.TextCtrl(panel, value=prefs.remembered_user_id or "")
+        id_row.Add(self._user_id_ctrl, 1, wx.ALL | wx.EXPAND, 6)
+        sizer.Add(id_row, 0, wx.EXPAND)
+        id_hint = wx.StaticText(panel, label=_ACCOUNT_HINT)
+        id_hint.Wrap(360)
+        sizer.Add(id_hint, 0, wx.LEFT | wx.RIGHT, 8)
+
+        self._password_row_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self._password_row_sizer.Add(
+            wx.StaticText(panel, label="密碼："), 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 6
+        )
+        self._password_ctrl: wx.TextCtrl = self._make_password_ctrl(masked=True)
+        self._password_row_sizer.Add(self._password_ctrl, 1, wx.ALL | wx.EXPAND, 6)
+        self._toggle_password_button = wx.Button(panel, label="顯示", style=wx.BU_EXACTFIT)
+        self._toggle_password_button.Bind(wx.EVT_BUTTON, self._on_toggle_password_visibility)
+        self._password_row_sizer.Add(self._toggle_password_button, 0, wx.ALL, 6)
+        sizer.Add(self._password_row_sizer, 0, wx.EXPAND)
+
+        self._remember_id_checkbox = wx.CheckBox(panel, label="記住帳號")
+        self._remember_id_checkbox.SetValue(prefs.remembered_user_id is not None)
+        sizer.Add(self._remember_id_checkbox, 0, wx.ALL, 6)
+
+        self._secure_store_checkbox = wx.CheckBox(panel, label="安全儲存密碼（Windows 認證管理員）")
+        sizer.Add(self._secure_store_checkbox, 0, wx.ALL, 6)
+
+        sizer.Add(wx.StaticLine(panel), 0, wx.EXPAND | wx.ALL, 6)
+
+        cert_label = wx.StaticText(
+            panel,
+            label="正式環境需先將憑證匯入本機（一次性設定，與每次登入無關）：",
+        )
+        cert_label.Wrap(360)
+        sizer.Add(cert_label, 0, wx.ALL, 6)
+
+        cert_path_row = wx.BoxSizer(wx.HORIZONTAL)
+        cert_path_row.Add(
+            wx.StaticText(panel, label="憑證檔案："), 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 6
+        )
+        self._certificate_path_ctrl = wx.TextCtrl(panel)
+        cert_path_row.Add(self._certificate_path_ctrl, 1, wx.ALL | wx.EXPAND, 6)
+        self._browse_certificate_button = wx.Button(panel, label="瀏覽…", style=wx.BU_EXACTFIT)
+        self._browse_certificate_button.Bind(wx.EVT_BUTTON, self._on_browse_certificate)
+        cert_path_row.Add(self._browse_certificate_button, 0, wx.ALL, 6)
+        sizer.Add(cert_path_row, 0, wx.EXPAND)
+
+        cert_pass_row = wx.BoxSizer(wx.HORIZONTAL)
+        cert_pass_row.Add(
+            wx.StaticText(panel, label="憑證密碼："), 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 6
+        )
+        self._certificate_password_ctrl = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
+        cert_pass_row.Add(self._certificate_password_ctrl, 1, wx.ALL | wx.EXPAND, 6)
+        self._import_certificate_button = wx.Button(panel, label="匯入憑證")
+        self._import_certificate_button.Bind(wx.EVT_BUTTON, self._on_import_certificate)
+        cert_pass_row.Add(self._import_certificate_button, 0, wx.ALL, 6)
+        sizer.Add(cert_pass_row, 0, wx.EXPAND)
+
+        sizer.Add(wx.StaticLine(panel), 0, wx.EXPAND | wx.ALL, 6)
+
+        self._status_label = wx.StaticText(panel, label="")
+        self._status_label.Wrap(360)
+        sizer.Add(self._status_label, 0, wx.ALL | wx.EXPAND, 8)
+
+        button_row = wx.BoxSizer(wx.HORIZONTAL)
+        self._clear_stored_button = wx.Button(panel, label="清除已儲存密碼")
+        self._clear_stored_button.Bind(wx.EVT_BUTTON, self._on_clear_stored_password)
+        button_row.Add(self._clear_stored_button, 0, wx.ALL, 6)
+        button_row.AddStretchSpacer()
+        self._cancel_button = wx.Button(panel, id=wx.ID_CANCEL, label="取消")
+        self._cancel_button.Bind(wx.EVT_BUTTON, self._on_cancel)
+        button_row.Add(self._cancel_button, 0, wx.ALL, 6)
+        self._submit_button = wx.Button(panel, label="登入")
+        self._submit_button.Bind(wx.EVT_BUTTON, self._on_submit)
+        button_row.Add(self._submit_button, 0, wx.ALL, 6)
+        sizer.Add(button_row, 0, wx.EXPAND)
+
+        panel.SetSizer(sizer)
+        outer = wx.BoxSizer(wx.VERTICAL)
+        outer.Add(panel, 1, wx.EXPAND)
+        self.SetSizerAndFit(outer)
+
+        self._unsubscribers = [
+            services.event_coordinator.subscribe(BrokerLoginSucceeded, self._on_login_succeeded),
+            services.event_coordinator.subscribe(BrokerLoginFailed, self._on_login_failed),
+            services.event_coordinator.subscribe(BrokerLoginTimedOut, self._on_login_timed_out),
+        ]
+        self.Bind(wx.EVT_CLOSE, self._on_close)
+
+    # -- Password visibility toggle -------------------------------------------------
+
+    def _make_password_ctrl(self, *, masked: bool) -> wx.TextCtrl:
+        style = wx.TE_PASSWORD if masked else 0
+        return wx.TextCtrl(self._panel, style=style)
+
+    def _on_toggle_password_visibility(self, _event: wx.CommandEvent) -> None:
+        # `wx.TE_PASSWORD` cannot be toggled on a live control on every platform —
+        # the portable approach is to recreate the control with the new style,
+        # carrying the current value across.
+        value = self._password_ctrl.GetValue()
+        self._password_masked = not self._password_masked
+        old_ctrl = self._password_ctrl
+        new_ctrl = self._make_password_ctrl(masked=self._password_masked)
+        new_ctrl.SetValue(value)
+        new_ctrl.Enable(old_ctrl.IsEnabled())
+        self._password_row_sizer.Replace(old_ctrl, new_ctrl)
+        old_ctrl.Destroy()
+        self._password_ctrl = new_ctrl
+        self._toggle_password_button.SetLabel("隱藏" if not self._password_masked else "顯示")
+        self._panel.Layout()
+
+    # -- Certificate import -----------------------------------------------------
+
+    def _on_browse_certificate(self, _event: wx.CommandEvent) -> None:
+        with wx.FileDialog(
+            self,
+            "選擇憑證檔案 (.pfx)",
+            wildcard="PFX 憑證 (*.pfx)|*.pfx|所有檔案 (*.*)|*.*",
+            style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST,
+        ) as dialog:
+            if dialog.ShowModal() == wx.ID_OK:
+                self._certificate_path_ctrl.SetValue(dialog.GetPath())
+
+    def _on_import_certificate(self, _event: wx.CommandEvent) -> None:
+        path = self._certificate_path_ctrl.GetValue().strip()
+        password = self._certificate_password_ctrl.GetValue()
+        if not path:
+            self._status_label.SetLabel("請先選擇憑證檔案")
+            return
+        if not credentials.certificate_path_exists(path):
+            self._status_label.SetLabel(f"找不到憑證檔案：{path}")
+            return
+        try:
+            credentials.ensure_certificate_imported(path, SecretStr(password))
+        except CertificateImportError as exc:
+            self._status_label.SetLabel(f"憑證匯入失敗：{exc}")
+            return
+        self._status_label.SetLabel("憑證已匯入本機憑證存放區。")
+
+    # -- Form state -------------------------------------------------------------
+
+    def _read_form(self) -> _FormValues:
+        return _FormValues(
+            environment=_ENVIRONMENT_CHOICES[self._environment_radio.GetSelection()],
+            user_id=self._user_id_ctrl.GetValue(),
+            password=self._password_ctrl.GetValue(),
+            remember_id=self._remember_id_checkbox.GetValue(),
+            secure_store=self._secure_store_checkbox.GetValue(),
+        )
+
+    def _set_form_enabled(self, enabled: bool) -> None:
+        for ctrl in (
+            self._environment_radio,
+            self._user_id_ctrl,
+            self._password_ctrl,
+            self._toggle_password_button,
+            self._remember_id_checkbox,
+            self._secure_store_checkbox,
+            self._clear_stored_button,
+            self._submit_button,
+        ):
+            ctrl.Enable(enabled)
+
+    # -- Submit -------------------------------------------------------------------
+
+    def _on_submit(self, _event: wx.CommandEvent) -> None:
+        if self._connecting:
+            return  # 禁止重複送出
+
+        values = self._read_form()
+        stripped_id = values.user_id.strip()
+        stored_password = credentials.load_stored_password(stripped_id) if stripped_id else None
+        try:
+            request = build_login_request(
+                environment=values.environment,
+                user_id=values.user_id,
+                password=values.password,
+                stored_password=stored_password,
+            )
+        except LoginFormError as exc:
+            self._status_label.SetLabel(str(exc))
+            return
+
+        if values.environment is Environment.PRODUCTION:
+            confirmed = (
+                wx.MessageBox(
+                    _PRODUCTION_CONFIRM_MESSAGE, "正式環境確認", wx.YES_NO | wx.ICON_WARNING, self
+                )
+                == wx.YES
+            )
+            if not confirmed:
+                return
+
+        login_preferences.save_remembered_user_id(request.user_id if values.remember_id else None)
+
+        self._pending_secure_store = values.secure_store
+        self._connecting = True
+        self._set_form_enabled(False)
+        self._status_label.SetLabel("登入中…")
+        self._services.broker_session.start(request)
+
+    # -- Broker events (arrive on EventCoordinator's own thread) --------------------
+
+    def _on_login_succeeded(self, event: BrokerLoginSucceeded) -> None:
+        wx.CallAfter(self._handle_login_succeeded, event)
+
+    def _handle_login_succeeded(self, event: BrokerLoginSucceeded) -> None:
+        if not self._connecting:
+            return
+        if self._pending_secure_store:
+            values = self._read_form()
+            user_id = values.user_id.strip()
+            if user_id and values.password:
+                credentials.store_password(user_id, values.password)
+        self._connecting = False
+        if self.IsModal():
+            self.EndModal(wx.ID_OK)
+
+    def _on_login_failed(self, event: BrokerLoginFailed) -> None:
+        wx.CallAfter(self._handle_terminal_failure, f"登入失敗：{event.reason}")
+
+    def _on_login_timed_out(self, _event: BrokerLoginTimedOut) -> None:
+        if not self._connecting:
+            return
+        wx.CallAfter(self._status_label.SetLabel, "登入逾時，處理中…")
+
+    def _handle_terminal_failure(self, message: str) -> None:
+        if not self._connecting:
+            return
+        self._connecting = False
+        self._set_form_enabled(True)
+        self._status_label.SetLabel(message)
+
+    # -- Clear stored password ----------------------------------------------------
+
+    def _on_clear_stored_password(self, _event: wx.CommandEvent) -> None:
+        user_id = self._user_id_ctrl.GetValue().strip()
+        if not user_id:
+            self._status_label.SetLabel("請先輸入帳號再清除已儲存密碼")
+            return
+        credentials.clear_stored_password(user_id)
+        self._status_label.SetLabel(f"已清除 {user_id} 的已儲存密碼")
+
+    # -- Cancel / close -------------------------------------------------------------
+
+    def _on_cancel(self, _event: wx.CommandEvent) -> None:
+        self._close(wx.ID_CANCEL)
+
+    def _on_close(self, _event: wx.CloseEvent) -> None:
+        self._close(wx.ID_CANCEL)
+
+    def _close(self, return_code: int) -> None:
+        if self._connecting:
+            self._services.broker_session.cancel_start()
+            self._connecting = False
+        for unsubscribe in self._unsubscribers:
+            unsubscribe()
+        if self.IsModal():
+            self.EndModal(return_code)
+        else:
+            self.Destroy()

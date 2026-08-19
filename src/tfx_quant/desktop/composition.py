@@ -32,13 +32,10 @@ from tfx_quant.infrastructure.identity import UuidIdGenerator
 from tfx_quant.infrastructure.market_data.trading_calendar_repository import (
     JsonTradingCalendarRepository,
 )
+from tfx_quant.infrastructure.yuanta import login_preferences
 from tfx_quant.infrastructure.yuanta.broker_session_gateway_views import (
     BrokerSessionQuoteGatewayView,
     BrokerSessionTradeGatewayView,
-)
-from tfx_quant.infrastructure.yuanta.credentials import (
-    ACCOUNT_NO_ENV_VAR,
-    EnvironmentAndKeyringCredentialSource,
 )
 from tfx_quant.infrastructure.yuanta.instrument_master_repository import (
     JsonInstrumentMasterRepository,
@@ -141,27 +138,24 @@ def build_services(settings: TradingSettings) -> ServiceContainer:
         quote_gateway = MockQuoteGateway()
         broker_session = MockBrokerSession(event_publisher=event_coordinator)
     else:
-        credential_source = EnvironmentAndKeyringCredentialSource()
-        raise_if_any_failed(run_preflight_checks(credential_source))
+        raise_if_any_failed(run_preflight_checks())
 
-        # Imported lazily: these modules pull in comtypes/wx OCX-hosting code that
-        # only needs to exist for the real (non-mock) branch — see
+        # Imported lazily: this module pulls in pythonnet/CLR-hosting code that only
+        # needs to exist for the real (non-mock) branch — see
         # docs/adr/0004-broker-session-architecture.md for why this glue is kept as
         # thin and isolated as possible.
-        from tfx_quant.infrastructure.yuanta.quote_ocx_adapter import YuantaQuoteOcxAdapter
-        from tfx_quant.infrastructure.yuanta.trade_ocx_adapter import YuantaTradeOcxAdapter
+        from tfx_quant.infrastructure.yuanta.spark_api_adapter import SparkApiSessionAdapter
 
-        trade_adapter = YuantaTradeOcxAdapter(environment=settings.environment)
-        quote_adapter = YuantaQuoteOcxAdapter(environment=settings.environment)
+        adapter = SparkApiSessionAdapter()
         orchestrator = BrokerSessionOrchestrator(
-            trade_adapter=trade_adapter,
-            quote_adapter=quote_adapter,
-            credential_source=credential_source,
+            adapter=adapter,
             event_coordinator=event_coordinator,
-            account_no_hint=os.environ.get(ACCOUNT_NO_ENV_VAR),
+            # Environment is chosen per login attempt by the operator (see
+            # `desktop/login_dialog.py`), not fixed at composition time — see
+            # `application/ports/broker_session.LoginRequest`.
+            account_no_hint=login_preferences.load().remembered_account_no,
         )
-        trade_adapter.bind_orchestrator(orchestrator)
-        quote_adapter.bind_orchestrator(orchestrator)
+        adapter.bind_orchestrator(orchestrator)
         trade_gateway = BrokerSessionTradeGatewayView(orchestrator)
         quote_gateway = BrokerSessionQuoteGatewayView(orchestrator, instrument_master)
         broker_session = orchestrator

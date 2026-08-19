@@ -2,11 +2,11 @@
 
 Feature 01 only defines the readiness/query surface needed by the
 `StartupSafetyGate` checklist (login state, order/position sync). Order submission
-(`SendOrderF` and friends) is deliberately out of scope until Feature 06 — no code
+(`SendFutureOrder` and friends) is deliberately out of scope until Feature 06 — no code
 path to send an order exists anywhere in this codebase yet.
 
-Only `infrastructure.yuanta` may ever import the vendor COM/OCX types; everything
-else, including the desktop composition root, depends on these Protocols.
+Only `infrastructure.yuanta` may ever import vendor (`pythonnet`/`YuantaOneAPI`) types;
+everything else, including the desktop composition root, depends on these Protocols.
 """
 
 from __future__ import annotations

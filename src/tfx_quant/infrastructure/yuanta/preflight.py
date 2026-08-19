@@ -1,33 +1,23 @@
-"""Startup preflight checks for the real Yuanta gateways.
+"""Startup preflight checks for the real Yuanta SPARK API session.
 
-Per the implementation prompt: "啟動前檢查 API 安裝、DLL/COM 註冊、位元數、版本、憑證
-與必要權限，回報可操作的中文錯誤" (before starting, check API installation, DLL/COM
-registration, bitness, version, credentials, and required permissions — report
-actionable Chinese errors). Every check here is independently verifiable and none of
-it is guessed: ProgIDs and install paths come from
-`src/tfx_quant/infrastructure/yuanta/README.md` (extracted directly from the vendor
-`.ocx` binaries and install scripts).
+Per the implementation prompt: "啟動前檢查 API 安裝...版本、憑證與必要權限，回報可操作
+的中文錯誤" (before starting, check API installation, version, credentials, and
+required permissions — report actionable Chinese errors). Every check here is
+independently verifiable and none of it is guessed — see
+`docs/adr/0001-python-version-and-runtime.md`/`0004-broker-session-architecture.md`.
+
+The legacy OCX API's bitness/COM-registration checks are gone — SPARK API has no such
+constraint (see ADR 0001's addendum): it's a `pythonnet`-hosted .NET 8 component, not a
+bitness-locked ActiveX control needing per-user registry registration.
 """
 
 from __future__ import annotations
 
-import contextlib
-import struct
+import shutil
+import subprocess
 from dataclasses import dataclass
 
-from tfx_quant.infrastructure.yuanta import com_registration
-from tfx_quant.infrastructure.yuanta.credentials import CredentialSource
-from tfx_quant.infrastructure.yuanta.errors import (
-    CredentialsUnavailableError,
-    PreflightCheckFailed,
-    YuantaSessionError,
-)
-
-TRADE_PROGID_32BIT = com_registration.TRADE_PROGID_32BIT
-TRADE_PROGID_64BIT = "Yuanta.YuantaOrdCtrl.64"
-QUOTE_PROGID = com_registration.QUOTE_PROGID
-"""No 64-bit build is shipped for the quote OCX — see the bitness check below, which
-is what actually forces this whole process to run as x32 in production."""
+from tfx_quant.infrastructure.yuanta.spark_client import default_dll_directory
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,160 +29,107 @@ class PreflightCheck:
     verified), so `compute_readiness()`-style UIs can show it directly."""
 
 
-def _is_64bit_process() -> bool:
-    return struct.calcsize("P") == 8
-
-
-def _check_bitness() -> PreflightCheck:
-    if _is_64bit_process():
-        return PreflightCheck(
-            name="處理程序位元數",
-            passed=False,
-            message=(
-                "目前以 64 位元 Python 執行，但元大行情 API 僅提供 32 位元元件"
-                f"（{QUOTE_PROGID}），無 64 位元版本。請改用 32 位元（x32）Python "
-                "直譯器執行本程式（見 docs/adr/0001-python-version-and-runtime.md）。"
-            ),
-        )
-    return PreflightCheck(
-        name="處理程序位元數",
-        passed=True,
-        message="以 32 位元（x32）Python 執行，符合行情 API 需求。",
-    )
-
-
-def _check_comtypes_importable() -> PreflightCheck:
+def _check_pythonnet_importable() -> PreflightCheck:
     try:
-        import comtypes  # noqa: F401
+        import pythonnet  # noqa: F401
     except ImportError as exc:
         return PreflightCheck(
-            name="comtypes 套件",
+            name="pythonnet 套件",
             passed=False,
-            message=f"缺少 comtypes 套件，無法呼叫元大 COM/ActiveX 元件：{exc}。"
-            "請執行 `pip install comtypes` 後重新啟動程式。",
+            message=f"缺少 pythonnet 套件，無法呼叫元大 SPARK API 元件：{exc}。"
+            "請執行 `pip install pythonnet` 後重新啟動程式。",
         )
-    return PreflightCheck(name="comtypes 套件", passed=True, message="comtypes 套件可正常匯入。")
+    return PreflightCheck(name="pythonnet 套件", passed=True, message="pythonnet 套件可正常匯入。")
 
 
-def progid_to_clsid(progid: str) -> str | None:
-    try:
-        import winreg
-    except ImportError:
-        return None
-    try:
-        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, f"{progid}\\CLSID") as key:
-            clsid, _ = winreg.QueryValueEx(key, "")
-            return str(clsid)
-    except OSError:
-        return None
-
-
-def clsid_inproc_server_path(clsid: str) -> str | None:
-    import winreg
-
-    try:
-        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, f"CLSID\\{clsid}\\InprocServer32") as key:
-            path, _ = winreg.QueryValueEx(key, "")
-            return str(path)
-    except OSError:
-        return None
-
-
-def resolve_registered_ocx_path(progid: str) -> str | None:
-    """The installed `.ocx` file path for a registered ProgID, or `None` if the
-    ProgID isn't registered or the resolved path doesn't exist on disk. Used both by
-    the preflight check below and by the real adapters (`trade_ocx_adapter.py`/
-    `quote_ocx_adapter.py`) to locate the file `comtypes.client.GetModule()` should
-    read its type library from — reusing the registry lookup instead of assuming a
-    fixed install path."""
-    import os
-
-    clsid = progid_to_clsid(progid)
-    if clsid is None:
-        return None
-    path = clsid_inproc_server_path(clsid)
-    if path is None or not os.path.exists(path):
-        return None
-    return path
-
-
-def _check_com_registration(progid: str, display_name: str) -> PreflightCheck:
-    import os
-
-    try:
-        import winreg  # noqa: F401
-    except ImportError:
+def _check_dotnet_sdk_available() -> PreflightCheck:
+    """SPARK API's docs require the .NET 8 SDK be installed system-wide (not a pip
+    package — see `docs/adr/0001-*.md`'s addendum): "電腦環境請用戶自行安裝 .NET8的
+    SDK". `pythonnet`'s `coreclr` loader needs a working .NET runtime to host the CLR
+    at all, so this check runs `dotnet --list-runtimes` rather than trying to import
+    `clr` here (that import has real side effects — loading the CLR into the process —
+    which this preflight check shouldn't trigger just to check availability)."""
+    dotnet_path = shutil.which("dotnet")
+    if dotnet_path is None:
         return PreflightCheck(
-            name=f"{display_name} COM 註冊",
+            name=".NET SDK",
             passed=False,
-            message="非 Windows 環境，無法檢查 COM 註冊（winreg 模組不存在）。",
+            message="找不到 dotnet 命令列工具，元大 SPARK API 元件需要 .NET 8 SDK 才能"
+            "運作。請至 https://dotnet.microsoft.com/download/dotnet/8.0 安裝後重新啟動"
+            "程式。",
         )
-
-    clsid = progid_to_clsid(progid)
-    if clsid is None:
-        return PreflightCheck(
-            name=f"{display_name} COM 註冊",
-            passed=False,
-            message=(
-                f"找不到已註冊的 ProgID {progid!r}。本程式會在啟動時自動於目前使用者"
-                "（HKEY_CURRENT_USER）下註冊元件，不需要系統管理員權限；若仍失敗，請確認"
-                "元件檔案已依供應商安裝說明複製到慣用路徑"
-                "（見 infrastructure/yuanta/com_registration.py 的路徑常數）。"
-            ),
-        )
-
-    dll_path = clsid_inproc_server_path(clsid)
-    if dll_path is None or not os.path.exists(dll_path):
-        return PreflightCheck(
-            name=f"{display_name} COM 註冊",
-            passed=False,
-            message=(
-                f"ProgID {progid!r} 已註冊（CLSID {clsid}），但找不到對應的元件檔案"
-                f"（{dll_path!r}）。元件可能已被移動或移除，請依供應商安裝說明重新複製元件。"
-            ),
-        )
-
-    return PreflightCheck(
-        name=f"{display_name} COM 註冊",
-        passed=True,
-        message=f"ProgID {progid!r} 已註冊，元件位於 {dll_path}。",
-    )
-
-
-def _check_credentials(credential_source: CredentialSource) -> PreflightCheck:
     try:
-        credential_source.load()
-    except CredentialsUnavailableError as exc:
-        return PreflightCheck(name="登入憑證", passed=False, message=str(exc))
-    return PreflightCheck(
-        name="登入憑證", passed=True, message="已成功讀取登入 ID 與密碼設定來源。"
-    )
+        result = subprocess.run(  # noqa: S603
+            [dotnet_path, "--list-runtimes"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return PreflightCheck(
+            name=".NET SDK", passed=False, message=f"執行 `dotnet --list-runtimes` 失敗：{exc}"
+        )
+    if "Microsoft.NETCore.App 8." not in result.stdout:
+        return PreflightCheck(
+            name=".NET SDK",
+            passed=False,
+            message="已安裝 dotnet 命令列工具，但找不到 .NET 8 執行環境（Microsoft."
+            "NETCore.App 8.x）。請安裝 .NET 8 SDK 後重新啟動程式。",
+        )
+    return PreflightCheck(name=".NET SDK", passed=True, message="已偵測到 .NET 8 執行環境。")
 
 
-def run_preflight_checks(credential_source: CredentialSource) -> list[PreflightCheck]:
+def _check_dll_directory_present() -> PreflightCheck:
+    """Checks the conventional local install folder (see `spark_client.
+    default_dll_directory`) for `YuantaSparkAPI.dll` — a cheap file-existence check,
+    distinct from actually loading it (which `_check_dotnet_sdk_available` and
+    constructing a real `SparkApiClient` would do, both real side effects this
+    preflight pass avoids)."""
+    directory = default_dll_directory()
+    dll_path = directory / "YuantaSparkAPI.dll"
+    if not dll_path.exists():
+        return PreflightCheck(
+            name="元大 SPARK API 元件",
+            passed=False,
+            message=f"找不到元大 SPARK API 元件（{dll_path}）。請依供應商說明下載並解壓縮"
+            f"至 {directory}，確保範例程式中所有 .dll 檔案皆已一併複製。",
+        )
+    return PreflightCheck(name="元大 SPARK API 元件", passed=True, message=f"元件位於 {dll_path}。")
+
+
+def _check_keyring_importable() -> PreflightCheck:
+    """Not a credential check — no credentials exist yet at startup (the operator
+    types them into the login screen). This verifies the "安全儲存密碼" checkbox's
+    dependency (`keyring`, a declared hard dependency on Windows — see
+    `pyproject.toml`) is actually importable."""
+    try:
+        import keyring  # noqa: F401
+    except ImportError as exc:
+        return PreflightCheck(
+            name="keyring 套件",
+            passed=False,
+            message=f"缺少 keyring 套件，登入畫面的「安全儲存密碼」功能將無法使用：{exc}。"
+            "請執行 `pip install keyring` 後重新啟動程式（其餘登入功能不受影響）。",
+        )
+    return PreflightCheck(name="keyring 套件", passed=True, message="keyring 套件可正常匯入。")
+
+
+def run_preflight_checks() -> list[PreflightCheck]:
     """Run every startup check and return all results (not just the first failure) —
-    so `compute_readiness()`-style callers can show the operator everything to fix
-    at once, per the implementation prompt's "回報可操作的中文錯誤".
-
-    Attempts per-user COM self-registration first (best-effort — see
-    `com_registration.py`; requires no admin rights, verified working this session).
-    If it fails (e.g. the component files aren't present yet), the COM-registration
-    checks below simply report that as a normal failure rather than raising here.
-    """
-    with contextlib.suppress(YuantaSessionError):
-        com_registration.register_all_per_user()
-
-    trade_progid = TRADE_PROGID_64BIT if _is_64bit_process() else TRADE_PROGID_32BIT
+    so `compute_readiness()`-style callers can show the operator everything to fix at
+    once, per the implementation prompt's "回報可操作的中文錯誤"."""
     return [
-        _check_bitness(),
-        _check_comtypes_importable(),
-        _check_com_registration(trade_progid, "元大下單 API"),
-        _check_com_registration(QUOTE_PROGID, "元大行情 API"),
-        _check_credentials(credential_source),
+        _check_pythonnet_importable(),
+        _check_dotnet_sdk_available(),
+        _check_dll_directory_present(),
+        _check_keyring_importable(),
     ]
 
 
 def raise_if_any_failed(checks: list[PreflightCheck]) -> None:
+    from tfx_quant.infrastructure.yuanta.errors import PreflightCheckFailed
+
     failed = [c for c in checks if not c.passed]
     if not failed:
         return

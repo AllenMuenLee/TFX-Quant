@@ -6,18 +6,19 @@ other features query. For the mock branch, `MockBrokerSession` doesn't need this
 `MockTradeGateway`/`MockQuoteGateway` are used directly (see `composition.py`).
 
 `query_open_orders`/`query_positions` still raise rather than fabricating an "always
-empty" answer: the vendor's `ReportQuery`/`DealQuery`/`RA003` results aren't parsed
-into typed `Order`/`Position` objects yet (see `session_orchestrator.py`'s docstring on
-`handle_user_defined_func_result` — no worked example exists for `RA003`'s row
-layout). Returning `()` here instead of raising would silently look like "confirmed no
-open orders" to `StartupSafetyGate`'s "no unknown orders" check — a false safety
-signal — so these still raise.
+empty" answer: SPARK API's `GetRealReport`/`GetFutStoreSummary` results aren't parsed
+into typed `Order`/`Position` objects yet (see `session_orchestrator.py`'s docstrings
+on `handle_real_report_query_result`/`handle_position_query_result` — building typed
+objects needs an idempotency-key mapping that's Feature 06/08's job). Returning `()`
+here instead of raising would silently look like "confirmed no open orders" to
+`StartupSafetyGate`'s "no unknown orders" check — a false safety signal — so these
+still raise.
 
 `subscribe`/`unsubscribe` are Feature 03's job and are implemented for real here: the
 instrument/contract → vendor-symbol translation comes from the controlled
 `InstrumentMasterRepository` (see `instrument_master_repository.py`), and the actual
-`AddMktReg`/`DelMktReg` call goes through `IBrokerSession.subscribe_market_data`/
-`unsubscribe_market_data`.
+`SubscribeStockTick`/`UnSubscribeStockTick` call goes through
+`IBrokerSession.subscribe_market_data`/`unsubscribe_market_data`.
 """
 
 from __future__ import annotations

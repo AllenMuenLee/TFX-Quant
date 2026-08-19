@@ -32,8 +32,10 @@ from tfx_quant.application.events.events import (
 )
 from tfx_quant.desktop.composition import ServiceContainer, compute_readiness
 from tfx_quant.desktop.instrument_selection_panel import InstrumentSelectionPanel
+from tfx_quant.desktop.login_dialog import LoginDialog
 from tfx_quant.desktop.market_data_panel import MarketDataPanel
 from tfx_quant.domain.account import TradingAccount
+from tfx_quant.infrastructure.yuanta import login_preferences
 
 
 def _account_label(account: TradingAccount) -> str:
@@ -102,14 +104,12 @@ class ReadinessFrame(wx.Frame):
         self._unsubscribers = [
             services.event_coordinator.subscribe(BrokerLoginSucceeded, self._on_broker_event),
             services.event_coordinator.subscribe(BrokerCapabilitiesChanged, self._on_broker_event),
-            services.event_coordinator.subscribe(BrokerSessionReady, self._on_broker_event),
+            services.event_coordinator.subscribe(BrokerSessionReady, self._on_session_ready),
             services.event_coordinator.subscribe(BrokerLoggedOut, self._on_broker_event),
             services.event_coordinator.subscribe(InstrumentSwitchCompleted, self._on_broker_event),
             services.event_coordinator.subscribe(MarketDataTickReceived, self._on_broker_event),
             services.event_coordinator.subscribe(BarClosed, self._on_broker_event),
-            services.event_coordinator.subscribe(
-                MarketDataFreshnessChanged, self._on_broker_event
-            ),
+            services.event_coordinator.subscribe(MarketDataFreshnessChanged, self._on_broker_event),
             services.event_coordinator.subscribe(MarketDataGapDetected, self._on_broker_event),
             services.event_coordinator.subscribe(MarketDataGapCleared, self._on_broker_event),
         ]
@@ -118,8 +118,19 @@ class ReadinessFrame(wx.Frame):
     def _on_broker_event(self, _event: object) -> None:
         wx.CallAfter(self._refresh)
 
+    def _on_session_ready(self, event: BrokerSessionReady) -> None:
+        # Non-secret: only the account number is remembered, as a future
+        # `account_no_hint` — see `session_orchestrator._resolve_account`, which still
+        # validates it against whatever the broker's login response actually returns.
+        login_preferences.save_remembered_account_no(event.account.account_no)
+        wx.CallAfter(self._refresh)
+
     def _on_connect(self, _wx_event: wx.CommandEvent) -> None:
-        self._services.broker_session.start()
+        dialog = LoginDialog(self, self._services)
+        try:
+            dialog.ShowModal()
+        finally:
+            dialog.Destroy()
 
     def _on_disconnect(self, _wx_event: wx.CommandEvent) -> None:
         self._services.broker_session.stop()

@@ -4,7 +4,7 @@ Two policies worth stating explicitly (see `docs/adr/0006-market-data-and-bar-
 aggregation.md` for the full rationale):
 
 - **Duplicate/late/out-of-order ticks are dropped, never amend a bar retroactively.**
-  `Tick.cumulative_volume` (there is no documented per-trade sequence number — see
+  `Tick.serial_no` (SPARK API's real per-symbol trade sequence number — see
   `domain/tick.py`) must strictly increase within the forming bar; a tick that doesn't
   advance it is a duplicate or a late arrival and is ignored. A tick whose timestamp
   falls before the most recently *closed* bar's end is dropped outright — closed bars
@@ -39,7 +39,7 @@ class _FormingBar:
     end: Timestamp
     """The boundary this bar will close at once reached — see `Bar`'s module docstring
     for the label(=open)/close(=end) semantics this mirrors."""
-    last_cumulative_volume: int
+    last_serial_no: int
 
 
 class BarAggregator:
@@ -79,11 +79,11 @@ class BarAggregator:
                 volume=tick.size,
                 start=open_ts,
                 end=close_ts,
-                last_cumulative_volume=tick.cumulative_volume,
+                last_serial_no=tick.serial_no,
             )
             return closed
 
-        if tick.cumulative_volume <= self._forming.last_cumulative_volume:
+        if tick.serial_no <= self._forming.last_serial_no:
             return closed  # duplicate / late / out-of-order within the current bar
 
         if tick.price.amount > self._forming.high.amount:
@@ -92,7 +92,7 @@ class BarAggregator:
             self._forming.low = tick.price
         self._forming.close = tick.price
         self._forming.volume += tick.size
-        self._forming.last_cumulative_volume = tick.cumulative_volume
+        self._forming.last_serial_no = tick.serial_no
         return closed
 
     def on_clock(self, now: Timestamp) -> list[Bar]:

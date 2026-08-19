@@ -11,15 +11,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The whole project — domain/application included, not just
-      # infrastructure.yuanta/desktop — standardizes on a single x32 (32-bit)
-      # Python interpreter; see docs/adr/0001-python-version-and-runtime.md. There
-      # is no x64 build/test path.
-      - name: Setup Python 3.11 (x32)
+      # The x32 (32-bit) interpreter pin is retired — the legacy OCX API that forced
+      # it (specifically its 32-bit-only quote control) is gone; SPARK API's Python
+      # component ships an x64 build, matching windows-latest's default runner
+      # architecture. See docs/adr/0001-python-version-and-runtime.md's addendum.
+      - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          architecture: "x86"
+
+      # pythonnet's CLR hosting needs the .NET 8 SDK on the host, not a pip package —
+      # required to import YuantaSparkAPI.dll (see infrastructure/yuanta/README.md).
+      - name: Setup .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
 
       - name: Install package (with dev extras)
         run: pip install -e ".[dev]"
@@ -39,10 +45,10 @@ jobs:
       - name: Architecture/layering check (import-linter)
         run: lint-imports
 
-      # No Yuanta OCX is installed on this runner and none is required: the real
-      # comtypes/wx adapters (infrastructure/yuanta/trade_ocx_adapter.py,
-      # quote_ocx_adapter.py) only need an OCX at runtime, not at import/type-check
-      # time, and every test uses the mock/fake gateways. Feature 03+ must keep this
-      # property (see src/tfx_quant/infrastructure/yuanta/README.md).
+      # No YuantaSparkAPI.dll is installed on this runner and none is required: the
+      # real pythonnet-backed adapter only needs the DLL at runtime, not at
+      # import/type-check time, and every test uses the mock/fake gateways. Every
+      # feature must keep this property (see
+      # src/tfx_quant/infrastructure/yuanta/README.md).
       - name: Test (pytest)
         run: pytest

@@ -1,19 +1,20 @@
 """JsonInstrumentMasterRepository — the controlled 商品主檔 backing store.
 
 Loads a JSON file (see `instrument_master.example.json`) into `InstrumentMasterEntry`
-value objects. This is a plain file reader — no COM/OCX dependency — but it lives under
-`infrastructure.yuanta` rather than the generic `infrastructure` package because its
-content (vendor_symbol) is inherently Yuanta-specific data, not because it needs the
-bitness/COM isolation `docs/modules.md` reserves this package for.
+value objects. This is a plain file reader — no vendor SDK dependency — but it lives
+under `infrastructure.yuanta` rather than the generic `infrastructure` package because
+its content is inherently Yuanta-specific data.
 
-**Why a controlled file instead of a live vendor query**: neither extracted vendor PDF
-(`元大BToCAPI格式.pdf`, `元大行情API.pdf`) documents any "list tradable
-contracts"/"commodity master" call — every `Func`/`UserDefinsFunc` code found
-(FA001-FA009, RA003, RA004) is a position/open-interest/financial query, not a product
-catalog. The implementation prompt explicitly allows sourcing this from either the
-vendor API *or* a controlled master file ("元大 API 或受控商品主檔") — with no live API
-to call, this repository is the only honest option. See
-`docs/adr/0005-instrument-master-and-selection.md`.
+**Why a controlled file instead of a live vendor query**: the SPARK API docs
+(`http://www.yuanta.com.tw/file-repository/content/sparkapi_docs/`) document no "list
+tradable contracts"/"commodity master" call anywhere in 行情/交易/帳務 — every query
+found is a quote/order/position/report operation, not a product catalog. The
+implementation prompt explicitly allows sourcing this from either the vendor API *or* a
+controlled master file ("元大 API 或受控商品主檔") — with no live API to call, this
+repository is the only honest option. `vendor_symbol` itself, however, is no longer an
+undecipherable vendor code needing manual confirmation — see
+`docs/adr/0005-instrument-master-and-selection.md`'s addendum and
+`domain.instrument_master.futures_quote_symbol()`.
 """
 
 from __future__ import annotations
@@ -107,6 +108,7 @@ def _parse_entry(raw: dict[str, Any], *, index: int) -> InstrumentMasterEntry:
             night_session_end=_parse_time(raw["night_session_end"], label="night_session_end"),
             expiry_date=expiry_date,
             tradable=bool(raw["tradable"]),
+            order_commodity_code=str(raw.get("order_commodity_code", "")),
         )
     except DomainError as exc:
         raise InstrumentMasterFileError(f"第 {index} 筆商品主檔內容不合法：{exc}") from exc
@@ -142,9 +144,7 @@ class JsonInstrumentMasterRepository:
         for entry in entries:
             self._by_instrument.setdefault(entry.instrument, []).append(entry)
 
-    def get(
-        self, instrument: Instrument, contract: ContractMonth
-    ) -> InstrumentMasterEntry | None:
+    def get(self, instrument: Instrument, contract: ContractMonth) -> InstrumentMasterEntry | None:
         return self._by_key.get((instrument, contract))
 
     def list_for(self, instrument: Instrument) -> Sequence[InstrumentMasterEntry]:

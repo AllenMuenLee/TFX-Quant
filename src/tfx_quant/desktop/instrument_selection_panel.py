@@ -47,9 +47,7 @@ class InstrumentSelectionPanel(wx.Panel):
 
         pick_row = wx.BoxSizer(wx.HORIZONTAL)
         pick_row.Add(wx.StaticText(self, label="商品："), 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 6)
-        self._instrument_choice = wx.Choice(
-            self, choices=[i.display_name_zh for i in _INSTRUMENTS]
-        )
+        self._instrument_choice = wx.Choice(self, choices=[i.display_name_zh for i in _INSTRUMENTS])
         self._instrument_choice.SetSelection(0)
         self._instrument_choice.Bind(wx.EVT_CHOICE, self._on_instrument_or_mode_changed)
         pick_row.Add(self._instrument_choice, 0, wx.ALL, 6)

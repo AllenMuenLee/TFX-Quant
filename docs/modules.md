@@ -74,22 +74,22 @@ Real and mock implementations of `application.ports`. `infrastructure/clock.py`
 state is `application.market_data.MarketDataBarService`, Feature 04) are generic.
 `infrastructure/market_data/` (Feature 04) — `JsonTradingCalendarRepository`, backed by
 `trading_calendar.example.json` (a best-effort, web-search-seeded 2026 TAIFEX holiday
-list, explicitly flagged unconfirmed — same posture as the instrument master's
-`-UNCONFIRMED` vendor symbols); generic, not Yuanta-specific, since exchange holidays
-aren't vendor data. `infrastructure/yuanta/` is the Yuanta-specific adapter — the
-**only** package allowed to import vendor COM/OCX types (its
+list, explicitly flagged unconfirmed); generic, not Yuanta-specific, since exchange
+holidays aren't vendor data. `infrastructure/yuanta/` is the Yuanta-specific adapter —
+the **only** package allowed to import vendor (`pythonnet`/`YuantaOneAPI`) types (its
 `instrument_master_repository.py`, added by Feature 03, and `market_data_parsing.py`,
-added by Feature 04, are exceptions to the *COM* part only — plain parsing/JSON I/O, no
-COM dependency, but Yuanta-specific data/wire-format). Feature 01 shipped
+added by Feature 04, are exceptions to that part only — plain parsing/JSON I/O, no
+`pythonnet` dependency, but Yuanta-specific data/wire-format). Feature 01 shipped
 `MockTradeGateway`/`MockQuoteGateway` only; Feature 02 adds the real session
-(`session_orchestrator.py`, `trade_ocx_adapter.py`, `quote_ocx_adapter.py`,
-`ocx_host.py`, `credentials.py`, `preflight.py`, `backoff.py`) plus
-`MockBrokerSession`; Feature 03 adds `instrument_master_repository.py`
-(`JsonInstrumentMasterRepository`, backed by `instrument_master.example.json`) and
-implements `broker_session_gateway_views.py`'s previously-stubbed `subscribe`/
-`unsubscribe`; Feature 04 adds `market_data_parsing.py` (raw `OnGetMktAll` field
-parsing) and wires it through `quote_ocx_adapter.py`'s new `OnGetMktAll` handler and
-`session_orchestrator.py`'s new `handle_market_data_push`. See
+(`session_orchestrator.py`, `spark_client.py`, `spark_api_adapter.py`, `credentials.py`,
+`preflight.py`, `backoff.py`) plus `MockBrokerSession`; Feature 03 adds
+`instrument_master_repository.py` (`JsonInstrumentMasterRepository`, backed by
+`instrument_master.example.json`, whose `vendor_symbol` values are now
+`domain.instrument_master.futures_quote_symbol()`'s real, formula-computed output — see
+ADR 0005's addendum) and implements `broker_session_gateway_views.py`'s
+previously-stubbed `subscribe`/`unsubscribe`; Feature 04 adds `market_data_parsing.py`
+(`StockTickResult` field parsing) and wires it through `spark_api_adapter.py`'s
+`OnResponse` dispatch and `session_orchestrator.py`'s `handle_market_data_push`. See
 `infrastructure/yuanta/README.md` for the vendor API inventory,
 `docs/adr/0004-broker-session-architecture.md` for the session architecture,
 `docs/adr/0005-instrument-master-and-selection.md` for the instrument master/selection
@@ -117,11 +117,14 @@ session-lifecycle control, not order submission), `instrument_selection_panel.py
 (Feature 03 — instrument/contract pick, AUTO/MANUAL mode, resolved-contract preview and
 explicit confirm-and-switch button, embedded in `ReadinessFrame`; also
 session-lifecycle-adjacent, not order submission), `market_data_panel.py` (Feature 04 —
-forming-bar OHLCV, recent closed bars with red/black/doji marker, last-update time, and
+forming-bar OHLCV, closed-bar list with red/black/doji marker, last-update time, and
 stale/gap badges; a pure display surface, `ReadinessFrame` owns the event subscriptions
 and calls its `refresh()`; the two-month bar-history extension adds a recorded-range
-label, red/black/doji streak display, and a date-range history browser querying
-`MarketDataBarService.query_history()`), `__main__.py` (the `python -m tfx_quant.desktop`
+label and a red/black/doji streak display, and folds "recent" and "historical" closed
+bars into one list backed by `MarketDataBarService.query_history()` — a date-range
+picker + 查詢 button lets the operator jump to a different day, but every `refresh()`
+re-queries the currently-selected range so today's view keeps updating live without a
+separate "recent bars" data path), `__main__.py` (the `python -m tfx_quant.desktop`
 entrypoint — also starts/stops `MarketDataBarService`'s background timer and bar-record
 writer thread alongside the `EventCoordinator`'s). `composition.py` also resolves
 `TradingSettings.market_data_db_path` (defaulting to a per-user

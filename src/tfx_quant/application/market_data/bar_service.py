@@ -259,7 +259,7 @@ class MarketDataBarService:
                     at=resolved_at,
                     price=Price(event.price),
                     size=event.size,
-                    cumulative_volume=event.cumulative_volume,
+                    serial_no=event.serial_no,
                 )
             except DomainError:
                 return  # malformed push — reject rather than raise into the dispatch loop
@@ -465,9 +465,7 @@ class MarketDataBarService:
             active = self._matching_active(instrument, contract)
             return False if active is None else active.has_gap
 
-    def last_update_at(
-        self, instrument: Instrument, contract: ContractMonth
-    ) -> Timestamp | None:
+    def last_update_at(self, instrument: Instrument, contract: ContractMonth) -> Timestamp | None:
         with self._lock:
             active = self._matching_active(instrument, contract)
             return active.last_tick_at if active is not None else None

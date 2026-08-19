@@ -12,29 +12,43 @@ credential field at all**. It only holds non-secret operational config:
 number), `environment`, `selected_instrument`, `contract_selection_mode`,
 `timezone_id`, `eod_flatten_local_time`, `max_net_lots`, `use_mock`.
 `src/tfx_quant/desktop/settings.example.json` is safe to commit because of this — it
-never needs a `.local`/`.gitignore`d variant to hide a secret.
+never needs a `.local`/`.gitignore`d variant to hide a secret. Note that
+`TradingSettings.environment` is no longer what the real (non-mock) broker session
+actually connects with — that's chosen per login attempt on the login screen (default
+TEST); this field remains only as informational config shown elsewhere in the UI.
 
 ## Where credentials actually come from (Feature 02+)
 
-Feature 02 (Yuanta API session) is what actually logs in and needs a password.
-Implemented in `infrastructure/yuanta/credentials.py`:
+Feature 02's extension (`login-input-implementation-prompt.md`) replaced the original
+env-var-based flow with a login screen — no environment variable or manual Windows
+Credential Manager setup is required before first use:
 
-- 元大歸戶 ID: environment variable `TFX_QUANT_YUANTA_USER_ID`, read by name at
-  process startup — never stored anywhere.
-- Password: `keyring.get_password("tfx_quant.yuanta", user_id)` — Windows Credential
-  Manager, DPAPI-protected. Add it via Windows' own "Credential Manager" control panel
-  (a generic credential, network address `tfx_quant.yuanta`, username = the 元大歸戶
-  ID) or the `keyring` CLI (`keyring set tfx_quant.yuanta <user_id>`).
-- Optional account disambiguation: `TFX_QUANT_YUANTA_ACCOUNT_NO` — same OS-level
-  pattern, **not** a `TradingSettings` field (see the rule above), used only to
-  auto-select among multiple futures accounts returned by login; see
-  `docs/adr/0004-broker-session-architecture.md`.
+- 元大歸戶 ID and password are typed into `desktop/login_dialog.py`'s `LoginDialog`
+  each session, and handed to `IBrokerSession.start()` as a `LoginRequest`
+  (`application/ports/broker_session.py`) — never persisted anywhere by default.
+- Checking "記住歸戶 ID" persists only the ID (non-secret) to a local per-user JSON
+  file (`infrastructure/yuanta/login_preferences.py`,
+  `%LOCALAPPDATA%/tfx_quant/login_prefs.json`) — never the password.
+- Checking "安全儲存密碼" persists the password to Windows Credential Manager via
+  `keyring.set_password("tfx_quant.yuanta", user_id, password)`
+  (`infrastructure/yuanta/credentials.py`'s `store_password`) only after a successful
+  login. Left unchecked, the password lives only in memory for the current session
+  and is cleared on logout (`BrokerSessionOrchestrator.stop()`). The login screen's
+  "清除已儲存密碼" button removes it again
+  (`credentials.clear_stored_password`/`keyring.delete_password`).
+- The previously-selected futures account number is remembered the same non-secret
+  way (`login_preferences.save_remembered_account_no`), read back as
+  `BrokerSessionOrchestrator`'s `account_no_hint` on the next run — the orchestrator
+  still requires the hint to match an account the broker's login response actually
+  returned before auto-selecting it (`session_orchestrator._resolve_account`).
 
-`BrokerCredentials.password` is a `pydantic.SecretStr` so `repr()`/`str()`/logging
-never print the raw value (`SecretStr("**********")`). Never call the vendor trading
-OCX's `SetLog(True)` — it logs raw request/response packets to a file, which plausibly
-includes the ID/password (see `infrastructure/yuanta/README.md`); this codebase never
-calls it.
+`BrokerCredentials.password` and `LoginRequest.password` are both
+`pydantic.SecretStr` so `repr()`/`str()`/logging never print the raw value
+(`SecretStr("**********")`). The SPARK API certificate password
+(`credentials.ensure_certificate_imported`) is piped to `certutil` via stdin, never
+passed as a CLI argument — a CLI arg would appear in that process's argument list,
+visible to other processes/audit tools on the machine (see
+`infrastructure/yuanta/README.md`).
 
 ## Rules enforced going forward
 

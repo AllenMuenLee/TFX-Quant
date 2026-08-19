@@ -132,8 +132,7 @@ class InstrumentSelectionService:
             open_orders = self._trade_gateway.query_open_orders()
         except NotImplementedError:
             return (
-                "尚無法查詢帳戶持倉／委託狀態（結構化查詢尚未實作），"
-                "為安全起見禁止切換商品／契約"
+                "尚無法查詢帳戶持倉／委託狀態（結構化查詢尚未實作），為安全起見禁止切換商品／契約"
             )
         if any(not position.net.is_flat for position in positions):
             return "尚有持倉，禁止切換商品／契約"

@@ -8,7 +8,7 @@ import pytest
 from tfx_quant.domain.contract import ContractMonth
 from tfx_quant.domain.errors import InvalidInstrumentMasterEntryError
 from tfx_quant.domain.instrument import Instrument
-from tfx_quant.domain.instrument_master import InstrumentMasterEntry
+from tfx_quant.domain.instrument_master import InstrumentMasterEntry, futures_quote_symbol
 
 
 def _entry(**overrides: object) -> InstrumentMasterEntry:
@@ -74,3 +74,29 @@ def test_rejects_partial_night_session() -> None:
 def test_allows_no_night_session() -> None:
     entry = _entry(night_session_start=None, night_session_end=None)
     assert entry.night_session_start is None
+
+
+def test_default_order_commodity_code_is_unresolved() -> None:
+    assert _entry().order_commodity_code == ""
+
+
+def test_futures_quote_symbol_matches_docs_worked_example() -> None:
+    # 期貨報價代碼7xxx變更規則 docs page's own worked example: "2021年台指期6月:TXFF1".
+    assert futures_quote_symbol(Instrument.TXF, ContractMonth(year=2021, month=6)) == "TXFF1"
+
+
+@pytest.mark.parametrize(
+    ("month", "year", "expected_code"),
+    [
+        (1, 2026, "A6"),
+        (8, 2026, "H6"),
+        (9, 2026, "I6"),
+        (12, 2026, "L6"),
+        (3, 2027, "C7"),
+    ],
+)
+def test_futures_quote_symbol_month_year_codes(month: int, year: int, expected_code: str) -> None:
+    assert (
+        futures_quote_symbol(Instrument.MXF, ContractMonth(year=year, month=month))
+        == f"MXF{expected_code}"
+    )
