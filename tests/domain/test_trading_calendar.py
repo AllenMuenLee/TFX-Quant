@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, time
 from decimal import Decimal
 
+from tfx_quant.domain.bar_record import MarketSession
 from tfx_quant.domain.contract import ContractMonth
 from tfx_quant.domain.instrument import Instrument
 from tfx_quant.domain.instrument_master import InstrumentMasterEntry
@@ -167,3 +168,35 @@ def test_resolve_tick_timestamp_none_outside_any_session() -> None:
     entry = _entry()
     received_at = _ts(_WEDNESDAY, 7, 0)
     assert calendar.resolve_tick_timestamp(time(7, 0), received_at, entry) is None
+
+
+def test_session_context_for_day_session_boundary() -> None:
+    calendar = TradingCalendar()
+    entry = _entry()
+    open_ts = _ts(_WEDNESDAY, 8, 45)
+    context = calendar.session_context_for(open_ts, entry)
+    assert context == (_WEDNESDAY, MarketSession.DAY)
+
+
+def test_session_context_for_night_session_boundary_before_midnight() -> None:
+    calendar = TradingCalendar()
+    entry = _entry()
+    open_ts = _ts(_WEDNESDAY, 15, 0)
+    context = calendar.session_context_for(open_ts, entry)
+    assert context == (_WEDNESDAY, MarketSession.NIGHT)
+
+
+def test_session_context_for_night_session_after_midnight_belongs_to_prior_trading_day() -> None:
+    calendar = TradingCalendar()
+    entry = _entry()
+    # 00:00 on 9/17 is still part of the night session that opened on 9/16 (_WEDNESDAY).
+    open_ts = _ts(date(2026, 9, 17), 0, 0)
+    context = calendar.session_context_for(open_ts, entry)
+    assert context == (_WEDNESDAY, MarketSession.NIGHT)
+
+
+def test_session_context_for_none_when_not_a_boundary() -> None:
+    calendar = TradingCalendar()
+    entry = _entry()
+    not_a_boundary = _ts(_WEDNESDAY, 9, 10)  # mid-bar, not an open-label boundary
+    assert calendar.session_context_for(not_a_boundary, entry) is None

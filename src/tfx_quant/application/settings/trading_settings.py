@@ -66,6 +66,12 @@ class TradingSettings(BaseModel):
     holiday dates are a best-effort web-search seed, not yet confirmed against TAIFEX's
     official calendar (see `infrastructure/market_data/trading_calendar.example.json`'s
     own warning)."""
+    market_data_db_path: str | None = None
+    """Path to the SQLite database file this software persists its own self-aggregated
+    two-month 60-minute bar history to (see `application.ports.bar_record_repository`
+    and `persistence.sqlite_bar_record_repository`). `None` falls back to a per-user
+    data directory (`%LOCALAPPDATA%/tfx_quant/market_data.sqlite3` on Windows) —
+    see `desktop.composition._resolve_market_data_db_path`."""
 
     @field_validator("account_alias")
     @classmethod

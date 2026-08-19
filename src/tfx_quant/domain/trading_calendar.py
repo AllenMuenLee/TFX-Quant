@@ -25,6 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 
+from tfx_quant.domain.bar_record import MarketSession
 from tfx_quant.domain.instrument_master import InstrumentMasterEntry
 from tfx_quant.domain.timestamp import TAIPEI_TZ, Timestamp
 
@@ -114,6 +115,30 @@ class TradingCalendar:
         if best is None:
             return None
         return Timestamp(best[1])
+
+    def session_context_for(
+        self, open_ts: Timestamp, entry: InstrumentMasterEntry
+    ) -> tuple[date, MarketSession] | None:
+        """The (trading_day, session) a bar's open-label `Timestamp` belongs to.
+
+        `open_ts` is expected to already be exactly one of `bar_boundaries()`'s own
+        open-label outputs (true for every `Bar` this codebase ever produces — see
+        `domain/bar_aggregator.py`), so this searches the same trading days
+        `boundary_containing` does and matches on exact equality rather than
+        re-deriving session membership from a bare clock time. `None` means `open_ts`
+        does not correspond to any session boundary this calendar/entry combination
+        would produce (a malformed caller, not a normal runtime outcome)."""
+        d = open_ts.value.date()
+        for offset in _TRADING_DAY_SEARCH_OFFSETS:
+            trading_day = d + timedelta(days=offset)
+            if not self.is_trading_day(trading_day):
+                continue
+            for session_index, (start, end) in enumerate(_sessions_of(entry)):
+                for candidate_open, _close in self.bar_boundaries(trading_day, start, end):
+                    if candidate_open.value == open_ts.value:
+                        session = MarketSession.DAY if session_index == 0 else MarketSession.NIGHT
+                        return trading_day, session
+        return None
 
     def _effective_session_window(
         self, trading_day: date, start: time, end: time

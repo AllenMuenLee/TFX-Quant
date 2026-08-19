@@ -57,3 +57,8 @@ class InvalidTickError(DomainError):
     """Raised when a market-data tick's fields are internally inconsistent (negative
     size/cumulative volume) — construction-time validation, separate from the
     aggregator's own duplicate/out-of-order dedup policy."""
+
+
+class InvalidBarRecordError(DomainError):
+    """Raised when a `BarRecord` (persisted-history wrapper around a closed `Bar`) or a
+    `ContinuitySegment` is constructed with internally inconsistent fields."""

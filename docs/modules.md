@@ -9,9 +9,14 @@ enforced (`import-linter`).
 Immutable value types and pure business rules. Stdlib only — no third-party
 dependency, no I/O. `Instrument`, `ContractMonth`, `InstrumentMasterEntry` (Feature 03
 — 商品主檔), `TradingAccount`, `Side`, `Quantity`/`NetPosition`, `Price`/`Money`,
-`Timestamp`, `Bar` (+ `CandleColor` — Feature 04), `Tick`, `TradingCalendar`,
-`BarAggregator`/`CandleStreakCounter` (Feature 04 — 60-minute bar aggregation and
-red/black/doji streak counting; see `docs/adr/0006-market-data-and-bar-aggregation.md`),
+`Timestamp`, `Bar` (+ `CandleColor` — Feature 04), `Tick`, `TradingCalendar` (+
+`session_context_for` — the two-month-history extension's trading-day/session
+resolver), `BarAggregator`/`CandleStreakCounter` (Feature 04 — 60-minute bar aggregation
+and red/black/doji streak counting; see `docs/adr/0006-market-data-and-bar-
+aggregation.md`), `BarRecord`/`BarPeriod`/`MarketSession`/`BarDataSource`/
+`rolling_two_month_start`/`ContinuitySegment`/`continuous_segments` (`bar_record.py` —
+the two-month bar-history extension's persisted-record shape, rolling-window math, and
+gap-detection; see `docs/adr/0007-two-month-bar-history-persistence.md`),
 `StrategySignal`, `Position`, `Order`/`ClientOrderId`, `Fill`, `Pnl`, `StrategyState` +
 `StrategyStateMachine`. All illegal-state construction raises a `DomainError` subclass
 from `domain/errors.py`.
@@ -20,18 +25,22 @@ from `domain/errors.py`.
 
 - `application/ports/` — `Protocol` interfaces (`Clock`, `IdGenerator`,
   `TradeGatewayPort`, `QuoteGatewayPort`, `IBrokerSession`, `InstrumentMasterRepository`,
-  `BarSignalStateStore`, `TradingCalendarRepository`) that infrastructure
-  implementations satisfy. `IBrokerSession` (Feature 02) is the Yuanta login/session-
-  lifecycle port — richer than, and additive to, `TradeGatewayPort`/`QuoteGatewayPort`;
-  see `docs/adr/0004-broker-session-architecture.md`. `InstrumentMasterRepository`/
-  `BarSignalStateStore` (Feature 03) are the 商品主檔 lookup and K棒/訊號 reset seams —
-  see `docs/adr/0005-instrument-master-and-selection.md`. `TradingCalendarRepository`
-  (Feature 04) is the controlled 交易日曆（休市／提早收盤）lookup seam — see
-  `docs/adr/0006-market-data-and-bar-aggregation.md`.
+  `BarSignalStateStore`, `TradingCalendarRepository`, `BarRecordRepository`) that
+  infrastructure/persistence implementations satisfy. `IBrokerSession` (Feature 02) is
+  the Yuanta login/session-lifecycle port — richer than, and additive to,
+  `TradeGatewayPort`/`QuoteGatewayPort`; see `docs/adr/0004-broker-session-
+  architecture.md`. `InstrumentMasterRepository`/`BarSignalStateStore` (Feature 03) are
+  the 商品主檔 lookup and K棒/訊號 reset seams — see `docs/adr/0005-instrument-master-
+  and-selection.md`. `TradingCalendarRepository` (Feature 04) is the controlled 交易日曆
+  （休市／提早收盤）lookup seam — see `docs/adr/0006-market-data-and-bar-
+  aggregation.md`. `BarRecordRepository` (the two-month bar-history extension) is the
+  closed-bar persistence seam `SqliteBarRecordRepository` implements — see
+  `docs/adr/0007-two-month-bar-history-persistence.md`.
 - `application/events/` — `Event` shapes and `EventCoordinator`, the single
   serialized event-processing queue. Feature 04 adds `MarketDataTickReceived`,
   `BarClosed`, `MarketDataFreshnessChanged`, `MarketDataGapDetected`/
-  `MarketDataGapCleared`.
+  `MarketDataGapCleared`; the two-month bar-history extension adds
+  `BarPersistenceHealthChanged`/`BarRetentionCleanupCompleted`.
 - `application/safety/` — `SafetyChecklist` + `StartupSafetyGate`, the only path into
   `StrategyState.RUNNING`. Nine independent checklist items as of Feature 03.
 - `application/settings/` — `TradingSettings` (pydantic) + `validate_startup()`.
@@ -45,7 +54,14 @@ from `domain/errors.py`.
   `MarketDataTickReceived`/`BrokerSessionReady`, drives a `domain.BarAggregator` per
   active contract, republishes `BarClosed`/staleness/gap events, and exposes the
   forming-bar/recent-bars/stale/gap query surface the desktop UI reads. See
-  `docs/adr/0006-market-data-and-bar-aggregation.md`.
+  `docs/adr/0006-market-data-and-bar-aggregation.md`. The two-month bar-history
+  extension adds: a bounded-queue/background-writer path that persists every closed bar
+  via `BarRecordRepository` without blocking tick processing; `_load_warm_up()` (called
+  from both `clear()` and `_on_session_ready()`) that restores the streak counter and
+  recent-bars view from persisted history on startup/reconnect/switch; startup + daily
+  retention cleanup; and the `continuous_warm_up_bars`/`recorded_range`/`query_history`/
+  `is_persistence_degraded`/`candle_streak` query methods. See `docs/adr/0007-two-month-
+  bar-history-persistence.md`.
 
 Depends only on `domain`.
 
@@ -82,8 +98,14 @@ design.
 
 ## `persistence`
 
-SQLite storage. Feature 01 only wires `sqlite_connection.create_connection()` —
-schema, migrations, and repositories are Feature 14's job.
+SQLite storage. Feature 01 only wired `sqlite_connection.create_connection()` (now with
+an optional `check_same_thread` param). The two-month bar-history extension adds the
+first real schema/repository: `sqlite_bar_record_repository.py`
+(`SqliteBarRecordRepository`, implementing `application.ports.bar_record_repository.
+BarRecordRepository` — `bar_records` + `bar_record_revisions` tables, prices/timestamps
+stored as exact-round-trip `TEXT`, a `threading.Lock` serializing access from the
+writer thread/UI thread/event thread). Broader migrations/other repositories remain
+Feature 14's job — see `docs/adr/0007-two-month-bar-history-persistence.md`.
 
 ## `desktop`
 
@@ -97,12 +119,17 @@ explicit confirm-and-switch button, embedded in `ReadinessFrame`; also
 session-lifecycle-adjacent, not order submission), `market_data_panel.py` (Feature 04 —
 forming-bar OHLCV, recent closed bars with red/black/doji marker, last-update time, and
 stale/gap badges; a pure display surface, `ReadinessFrame` owns the event subscriptions
-and calls its `refresh()`), `__main__.py` (the `python -m tfx_quant.desktop` entrypoint
-— also starts/stops `MarketDataBarService`'s background timer alongside the
-`EventCoordinator`'s). The only package allowed to depend on everything else; nothing
-depends on it.
+and calls its `refresh()`; the two-month bar-history extension adds a recorded-range
+label, red/black/doji streak display, and a date-range history browser querying
+`MarketDataBarService.query_history()`), `__main__.py` (the `python -m tfx_quant.desktop`
+entrypoint — also starts/stops `MarketDataBarService`'s background timer and bar-record
+writer thread alongside the `EventCoordinator`'s). `composition.py` also resolves
+`TradingSettings.market_data_db_path` (defaulting to a per-user
+`%LOCALAPPDATA%/tfx_quant/market_data.sqlite3`) and wires `SqliteBarRecordRepository`
+into `MarketDataBarService`. The only package allowed to depend on everything else;
+nothing depends on it.
 
 ## `tests`
 
 Mirrors the `src/tfx_quant/` package structure (`tests/domain/`,
-`tests/application/`, `tests/infrastructure/`, `tests/desktop/`).
+`tests/application/`, `tests/infrastructure/`, `tests/persistence/`, `tests/desktop/`).

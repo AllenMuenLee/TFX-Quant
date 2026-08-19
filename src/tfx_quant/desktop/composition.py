@@ -48,6 +48,8 @@ from tfx_quant.infrastructure.yuanta.mock_quote_gateway import MockQuoteGateway
 from tfx_quant.infrastructure.yuanta.mock_trade_gateway import MockTradeGateway
 from tfx_quant.infrastructure.yuanta.preflight import raise_if_any_failed, run_preflight_checks
 from tfx_quant.infrastructure.yuanta.session_orchestrator import BrokerSessionOrchestrator
+from tfx_quant.persistence.sqlite_bar_record_repository import SqliteBarRecordRepository
+from tfx_quant.persistence.sqlite_connection import create_connection
 
 _DEFAULT_INSTRUMENT_MASTER_PATH = (
     Path(__file__).resolve().parents[1]
@@ -95,6 +97,18 @@ def _resolve_trading_calendar_path(settings: TradingSettings) -> Path:
     return Path(settings.trading_calendar_path)
 
 
+def _resolve_market_data_db_path(settings: TradingSettings) -> Path:
+    """Unlike the instrument master/trading calendar paths, there is no bundled example
+    to fall back to — this is a per-user, per-machine data file that starts empty (see
+    `TradingSettings.market_data_db_path`'s docstring) and accumulates only from bars
+    this software has actually recorded itself."""
+    if settings.market_data_db_path is not None:
+        return Path(settings.market_data_db_path)
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    base = Path(local_app_data) if local_app_data else Path.home()
+    return base / "tfx_quant" / "market_data.sqlite3"
+
+
 def build_services(settings: TradingSettings) -> ServiceContainer:
     clock: Clock = SystemClock()
     id_generator: IdGenerator = UuidIdGenerator()
@@ -106,11 +120,16 @@ def build_services(settings: TradingSettings) -> ServiceContainer:
     trading_calendar: TradingCalendarRepository = JsonTradingCalendarRepository(
         _resolve_trading_calendar_path(settings)
     )
+    market_data_connection = create_connection(
+        _resolve_market_data_db_path(settings), check_same_thread=False
+    )
+    bar_record_repository = SqliteBarRecordRepository(market_data_connection)
     market_data_bar_service = MarketDataBarService(
         event_bus=event_coordinator,
         clock=clock,
         trading_calendar_repository=trading_calendar,
         instrument_master=instrument_master,
+        bar_record_repository=bar_record_repository,
     )
     bar_signal_state_store: BarSignalStateStore = market_data_bar_service
 
@@ -189,4 +208,8 @@ def compute_readiness(services: ServiceContainer) -> list[tuple[str, bool]]:
         ("Broker session: trading", capabilities.trading),
         ("Broker session: order reports", capabilities.order_reports),
         ("Broker session: queries", capabilities.queries),
+        (
+            "Market data: bar history persistence",
+            not services.market_data_bar_service.is_persistence_degraded(),
+        ),
     ]

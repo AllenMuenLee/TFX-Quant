@@ -9,7 +9,7 @@ vendor callback.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import time
+from datetime import date, time
 from decimal import Decimal
 
 from tfx_quant.application.ports.broker_session import LogoutReason, SessionCapabilities
@@ -186,6 +186,27 @@ class MarketDataGapCleared(Event):
 
     instrument: Instrument
     contract: ContractMonth
+
+
+@dataclass(frozen=True, slots=True)
+class BarPersistenceHealthChanged(Event):
+    """The two-month bar-history write path (see `application.market_data.
+    bar_service.MarketDataBarService`'s bounded write queue/retry) became degraded
+    (a write could not be guaranteed after bounded retry, or the queue was full) or
+    recovered. `desktop.composition.compute_readiness` surfaces `is_degraded` on the
+    startup diagnostics screen — this event does not itself block anything."""
+
+    is_degraded: bool
+
+
+@dataclass(frozen=True, slots=True)
+class BarRetentionCleanupCompleted(Event):
+    """One two-month bar-history retention sweep finished — the "audit 摘要" the
+    implementation prompt requires. Fired on `MarketDataBarService.start()` and again
+    whenever a daily trading-day rollover is detected."""
+
+    cutoff_trading_day: date
+    deleted_count: int
 
 
 @dataclass(frozen=True, slots=True)
