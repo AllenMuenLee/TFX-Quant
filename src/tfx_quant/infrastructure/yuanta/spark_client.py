@@ -13,11 +13,11 @@ logic. `session_orchestrator.py` owns sequencing; `market_data_parsing.py` owns 
 
 Only what Features 01–05 need is wired up here: session lifecycle (`Open`/`Login`/
 `LogOut`/`Close`/`Dispose`), the two pre-ready safety queries (`GetRealReport`,
-`GetFutStoreSummary`), and futures tick subscription (`SubscribeStockTick`/
-`UnSubscribeStockTick`). `SendFutureOrder` (order placement) is Feature 06's job and
-deliberately has no method here yet — adding it without a real order/fill state machine
-to drive it would be exactly the kind of forward-scope creep the project's conventions
-warn against.
+`GetFutStoreSummary`), futures tick subscription (`SubscribeStockTick`/
+`UnSubscribeStockTick`), and the two-month bar-history extension's `GetKLine` history
+query. `SendFutureOrder` (order placement) is Feature 06's job and deliberately has no
+method here yet — adding it without a real order/fill state machine to drive it would be
+exactly the kind of forward-scope creep the project's conventions warn against.
 """
 
 from __future__ import annotations
@@ -159,4 +159,21 @@ class SparkApiClient:
             tick.StockCode = symbol
             lst.Add(tick)
         result: bool = self._trader.UnSubscribeStockTick(account, lst)
+        return result
+
+    def get_kline(self, account: str, symbol: str, start_date: str, end_date: str) -> bool:
+        """K線查詢 (GetKLine) — `KLineType` hardcoded to 六十分線 (60分k, value 4) and
+        `MarketType` hardcoded to `TAIFEX`, matching `subscribe_stock_tick`'s existing
+        "this codebase only ever trades domestic futures" convention. The docs' own
+        `MarketType` parameter note ("僅提供台股上市櫃商品查詢") is a documented
+        restriction this call knowingly goes against — see `application.ports.
+        historical_price_query`'s module docstring for why. `start_date`/`end_date` are
+        `yyyy/MM/dd` strings (the vendor's own required format). Result arrives via
+        `OnResponse` with `strIndex == 'GetKLine'`."""
+        from YuantaOneAPI import KLineType, enumMarketType
+
+        sixty_minute = KLineType(4)
+        result: bool = self._trader.GetKLine(
+            account, sixty_minute, enumMarketType.TAIFEX, symbol, start_date, end_date
+        )
         return result

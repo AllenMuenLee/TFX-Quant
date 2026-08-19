@@ -200,3 +200,60 @@ def test_session_context_for_none_when_not_a_boundary() -> None:
     entry = _entry()
     not_a_boundary = _ts(_WEDNESDAY, 9, 10)  # mid-bar, not an open-label boundary
     assert calendar.session_context_for(not_a_boundary, entry) is None
+
+
+def test_trading_days_between_excludes_weekends() -> None:
+    calendar = TradingCalendar()
+    days = calendar.trading_days_between(_WEDNESDAY, _SATURDAY)
+    assert days == [_WEDNESDAY, date(2026, 9, 17), date(2026, 9, 18)]  # Wed, Thu, Fri
+
+
+def test_trading_days_between_excludes_holidays() -> None:
+    calendar = TradingCalendar(holidays=frozenset({_HOLIDAY}))
+    days = calendar.trading_days_between(_HOLIDAY, _HOLIDAY)
+    assert days == []
+
+
+def test_trading_days_between_inclusive_single_day() -> None:
+    calendar = TradingCalendar()
+    assert calendar.trading_days_between(_WEDNESDAY, _WEDNESDAY) == [_WEDNESDAY]
+
+
+def test_trading_days_between_empty_when_end_before_start() -> None:
+    calendar = TradingCalendar()
+    assert calendar.trading_days_between(_SATURDAY, _WEDNESDAY) == []
+
+
+def test_boundary_for_open_finds_day_session_bar() -> None:
+    calendar = TradingCalendar()
+    entry = _entry()
+    open_ts = _ts(_WEDNESDAY, 8, 45)
+    boundary = calendar.boundary_for_open(open_ts, entry)
+    assert boundary is not None
+    found_open, found_close = boundary
+    assert found_open == open_ts
+    assert found_close.value.time() == time(9, 45)
+
+
+def test_boundary_for_open_finds_night_session_bar_after_midnight() -> None:
+    calendar = TradingCalendar()
+    entry = _entry()
+    open_ts = _ts(date(2026, 9, 17), 0, 0)
+    boundary = calendar.boundary_for_open(open_ts, entry)
+    assert boundary is not None
+    found_open, _found_close = boundary
+    assert found_open == open_ts
+
+
+def test_boundary_for_open_none_for_mid_bar_timestamp() -> None:
+    calendar = TradingCalendar()
+    entry = _entry()
+    mid_bar = _ts(_WEDNESDAY, 9, 10)  # not an open-label boundary
+    assert calendar.boundary_for_open(mid_bar, entry) is None
+
+
+def test_boundary_for_open_none_outside_any_session() -> None:
+    calendar = TradingCalendar()
+    entry = _entry()
+    at = _ts(_WEDNESDAY, 7, 0)
+    assert calendar.boundary_for_open(at, entry) is None

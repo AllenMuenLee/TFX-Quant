@@ -212,6 +212,22 @@ class BarRetentionCleanupCompleted(Event):
 
 
 @dataclass(frozen=True, slots=True)
+class BarBackfillCompleted(Event):
+    """One `BarHistoryBackfillService` run finished for `(instrument, contract)` — the
+    "audit 摘要" for the vendor `GetKLine` backfill, symmetric with
+    `BarRetentionCleanupCompleted`. `requested_day_count` is how many trading days in
+    the rolling two-month window had no locally-recorded bar when this run started;
+    `filled_day_count` is how many of those actually got at least one bar written this
+    run (the rest remain gaps — a vendor rejection, timeout, or off-grid timestamp is
+    never retried synchronously, only on the next trigger)."""
+
+    instrument: Instrument
+    contract: ContractMonth
+    requested_day_count: int
+    filled_day_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class UnhandledHandlerError(Event):
     """Published by the EventCoordinator itself when a subscriber handler raises.
 

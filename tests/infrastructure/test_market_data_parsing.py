@@ -1,12 +1,16 @@
 from __future__ import annotations
 
-from datetime import time
+from datetime import datetime, time
 from decimal import Decimal
 
 import pytest
 
+from tfx_quant.domain.timestamp import TAIPEI_TZ
 from tfx_quant.infrastructure.yuanta.errors import MarketDataParseError
-from tfx_quant.infrastructure.yuanta.market_data_parsing import parse_stock_tick_push
+from tfx_quant.infrastructure.yuanta.market_data_parsing import (
+    parse_kline_bar,
+    parse_stock_tick_push,
+)
 
 
 def _push(**overrides: object) -> dict[str, object]:
@@ -77,3 +81,51 @@ def test_rejects_negative_size() -> None:
 def test_rejects_non_numeric_serial_no() -> None:
     with pytest.raises(MarketDataParseError):
         parse_stock_tick_push(**_push(serial_no="abc"))
+
+
+def _kline(**overrides: object) -> dict[str, object]:
+    defaults: dict[str, object] = {
+        "year": 2026,
+        "month": 8,
+        "day": 3,
+        "hour": 9,
+        "minute": 45,
+        "second": 0,
+        "open_price": "17500",
+        "high_price": "17550",
+        "low_price": "17480",
+        "close_price": "17520",
+        "deal_vol": 120,
+    }
+    defaults.update(overrides)
+    return defaults
+
+
+def test_parses_valid_kline_bar() -> None:
+    result = parse_kline_bar(**_kline())
+    assert result.at == datetime(2026, 8, 3, 9, 45, 0, tzinfo=TAIPEI_TZ)
+    assert result.open == Decimal("17500")
+    assert result.high == Decimal("17550")
+    assert result.low == Decimal("17480")
+    assert result.close == Decimal("17520")
+    assert result.volume == 120
+
+
+def test_kline_rejects_out_of_range_date() -> None:
+    with pytest.raises(MarketDataParseError):
+        parse_kline_bar(**_kline(month=13))
+
+
+def test_kline_rejects_high_below_low() -> None:
+    with pytest.raises(MarketDataParseError):
+        parse_kline_bar(**_kline(high_price="17000", low_price="17500"))
+
+
+def test_kline_rejects_negative_volume() -> None:
+    with pytest.raises(MarketDataParseError):
+        parse_kline_bar(**_kline(deal_vol=-1))
+
+
+def test_kline_rejects_non_numeric_price() -> None:
+    with pytest.raises(MarketDataParseError):
+        parse_kline_bar(**_kline(open_price="abc"))

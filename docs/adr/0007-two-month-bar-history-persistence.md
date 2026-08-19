@@ -152,6 +152,88 @@ the window's start date at query time) computes `covers_full_window` as
 `earliest_at.date() <= window_start` — false for essentially all of the first two months
 of real use, which is the documented normal state, not an error condition.
 
+## Extension (2026-08-19): vendor `GetKLine` backfill for local gaps
+
+A second, later revision of the same implementation prompt added one more requirement:
+if the rolling two-month window isn't fully covered by what this process has recorded
+itself, query the vendor's own official historical-price API and write the result into
+the local database. The prompt named a specific docs URL for this
+(`行情/行情報價表訂閱/index.html`).
+
+**That URL turned out not to be a historical query at all.** Reading it directly (per
+this project's own "official docs override the prompt" rule) showed it documents
+`SubscribeWatchlistAll` — a real-time push subscription with no date-range parameters.
+The only genuine historical query in the whole 行情 section is `GetKLine`, and its own
+docs attach "註1：僅提供台股上市櫃商品查詢" (TWSE/OTC-listed securities only) to its
+`MarketType` parameter — on its face, futures are excluded, matching this codebase's
+pre-existing, already-verified conclusion (`[[yuanta-spark-api-pivot]]`, ADR 0006
+decision 7) that no vendor historical/K-bar query exists for futures. This was surfaced
+to the user rather than silently implemented or silently dropped; the user's explicit
+decision was to call `GetKLine` for futures anyway (`MarketType=TAIFEX`, which the docs'
+own `enumMarketType` reference does define as a valid member, alongside TWSE/TWOTC/many
+foreign exchanges). This is a **stated product decision to go against the endpoint's own
+documented restriction**, not a claim that the restriction note was found to be wrong —
+every write this path produces is tagged with a distinct source
+(`BarDataSource.BACKFILLED_FROM_YUANTA_KLINE`, never conflated with
+`AGGREGATED_FROM_YUANTA_REALTIME`) specifically so this remains honestly traceable if the
+vendor's restriction turns out to be real and every call silently returns nothing.
+
+### 11. `BarHistoryBackfillService` is a second, independent writer — never touches a day that already has a local bar
+
+A new application service (`application/market_data/bar_history_backfill_service.py`),
+not a growth of `MarketDataBarService`, triggers on `BrokerSessionReady` (learns the
+account) and `InstrumentSwitchCompleted` (learns the active instrument/contract); once
+both are known, it runs entirely on its own background thread — never the
+`EventCoordinator` dispatch thread, since a full run makes several sequential blocking
+`GetKLine` calls. It computes the rolling window's trading days
+(`TradingCalendar.trading_days_between`), diffs against `BarRecordRepository.list_recent`
+to find days with *zero* local bars (day-level, not bar-level — cheaper and sufficient
+since `GetKLine` is queried per calendar-date range anyway), and only ever queries/writes
+for those days. A day with any local bar — live-aggregated or previously backfilled — is
+never re-queried, and `upsert_closed_bar`'s existing dedup/conflict semantics are a second
+line of defense on top of that first, coarser check.
+
+### 12. Vendor timestamp resolution assumes open-time labeling, exact match only, never snapped
+
+The `GetKLine` docs never state whether `KLine.TimeStamp` is an open or close label for
+intraday periods. This codebase's own `Bar.start` is always an open-time label (see
+`domain/bar.py`), so `TradingCalendar.boundary_for_open()` (new) requires a vendor bar's
+timestamp to *exactly* equal one of `bar_boundaries()`'s own open outputs before it's
+accepted; anything else — off-grid, or the close-label interpretation being correct after
+all — is dropped, not snapped to the nearest boundary and not guessed at. This is a
+stated assumption, not a verified fact (no real vendor login has ever exercised this
+path); a future session that gets real API access should verify it before relying on
+backfilled data for anything signal-relevant.
+
+### 13. Query chunking respects the vendor's own per-call limits; each call paced at ≤1/sec
+
+`domain/bar_history_backfill.py`'s `chunk_consecutive_days()` (pure, exhaustively tested)
+groups missing trading days into the minimum number of ≤5-calendar-day spans — the docs'
+own K線種類查詢限制 table for 60分k. `BarHistoryBackfillService` sleeps between chunks at
+the vendor's separately-documented `GetKLine` rate cap (≤1/sec, distinct from the general
+3/sec quote/account cap). A vendor call that raises `HistoricalPriceQueryError` (rejected
+call, timeout, vendor error) or returns bars that all fail boundary resolution simply
+leaves that chunk's days as gaps — retried, if at all, on the next trigger (a fresh
+reconnect or contract switch), never looped synchronously here.
+
+### 14. `HistoricalPriceQueryPort` blocks its caller thread; `SparkHistoricalPriceQueryAdapter` bridges the vendor's async `OnResponse` with a single-slot queue
+
+Unlike every other query on `TradeGatewayPort`/`QuoteGatewayPort` (which read already-
+synced local state), this port's `query_60m_kline()` genuinely blocks until the vendor's
+`OnResponse` fires or a timeout elapses — a deliberate, documented exception to this
+codebase's usual "ports are boring sync interfaces over already-current state" shape,
+justified by `BarHistoryBackfillService` already running its own dedicated background
+thread. `spark_api_adapter.py`'s `SparkApiSessionAdapter` stays the *only* subscriber
+registered on the vendor's one `OnResponse` .NET event (new `bind_kline_handler()`/
+`request_kline()` methods, dispatched by `strIndex == 'GetKLine'` alongside the existing
+session-bring-up dispatch) — `SparkHistoricalPriceQueryAdapter` wraps it rather than
+subscribing a second handler directly, and serializes calls behind one lock (matching the
+≤1/sec cap) using a single-slot `queue.Queue`, draining any stale leftover before each new
+call to reduce (not fully eliminate) a late-response-mismatch race. Mock mode
+(`use_mock: true`) wires `MockHistoricalPriceQuery`, which always returns an empty
+result — mock mode has no vendor session to query, so every range simply stays a gap
+rather than inventing fake historical bars.
+
 ## Consequences
 
 - Production deployment needs a real, writable per-user data directory for
@@ -173,3 +255,11 @@ of real use, which is the documented normal state, not an error condition.
   "fix" it into a trading-day-boundary-precise trigger without a concrete reason, since
   the prompt's own tolerance here is coarse (bars, not deletion timing, are what must be
   boundary-exact).
+- The `GetKLine` backfill path (decisions 11–14) has never been exercised against a real
+  vendor login (no .NET 8 SDK/DLL available in this environment — same honest status the
+  rest of the SPARK API rewrite carries, see `[[yuanta-spark-api-pivot]]`). Whether the
+  vendor actually returns futures data for `MarketType=TAIFEX`, an empty result, or an
+  outright rejection is unverified; whether `KLine.TimeStamp` is really an open-time label
+  is likewise unverified (decision 12). Treat this as a solid, docs-faithful first draft
+  that degrades safely to "nothing filled, gaps stay gaps" if either assumption is wrong —
+  not as a confirmed working integration — until someone with real credentials runs it.

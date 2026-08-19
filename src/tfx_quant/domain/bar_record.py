@@ -7,10 +7,18 @@ implementation prompt requires storing — 週期 (period), 交易日 (trading_d
 資料來源 (source), and the created/updated audit timestamps — without forcing every
 existing `Bar` construction site to know about them.
 
-`source` is always `BarDataSource.AGGREGATED_FROM_YUANTA_REALTIME` — this software has no
-vendor historical-bar API to call (see `docs/adr/0006-market-data-and-bar-aggregation.md`
-decision 7) and must never present its own self-aggregated bars as if they were an
-official Yuanta historical product.
+`source` is `BarDataSource.AGGREGATED_FROM_YUANTA_REALTIME` for the vast majority of rows
+— bars this software aggregated itself from real-time pushes it actually received (see
+`docs/adr/0006-market-data-and-bar-aggregation.md` decision 7). A second value,
+`BACKFILLED_FROM_YUANTA_KLINE`, exists for rows filled from the vendor's own official
+`GetKLine` (K線查詢) history query when the rolling two-month window has a day this
+process never observed live — see `docs/adr/0007-two-month-bar-history-persistence.md`'s
+extension decision for the honesty caveat around that endpoint (its own docs attach
+"僅提供台股上市櫃商品查詢" to `MarketType`, yet `enumMarketType` does define `TAIFEX`;
+this is an explicit, flagged product decision to call it for futures anyway, not a
+verified vendor guarantee). Neither source is ever a third-party feed, a manual import, a
+carried-forward previous close, or a synthesized value — only these two vendor-sourced
+paths exist, and a row's `source` must always say honestly which one produced it.
 """
 
 from __future__ import annotations
@@ -47,10 +55,16 @@ class MarketSession(StrEnum):
 
 class BarDataSource(StrEnum):
     AGGREGATED_FROM_YUANTA_REALTIME = "AGGREGATED_FROM_YUANTA_REALTIME"
-    """The only source this system ever writes: a bar this software aggregated itself
-    from real-time Yuanta quote pushes it actually received while running. Never a
-    vendor-supplied historical bar, third-party data, or synthesized/backfilled value —
+    """A bar this software aggregated itself from real-time Yuanta quote pushes it
+    actually received while running. Never third-party data or a synthesized value —
     see the module docstring."""
+    BACKFILLED_FROM_YUANTA_KLINE = "BACKFILLED_FROM_YUANTA_KLINE"
+    """A bar filled from the vendor's own official `GetKLine` history query
+    (application.ports.historical_price_query.HistoricalPriceQueryPort), used only to
+    cover a day within the rolling two-month window this process never observed live.
+    Still a genuine Yuanta-sourced bar, not a synthesized/carried-forward value — but
+    distinct from `AGGREGATED_FROM_YUANTA_REALTIME` so the UI and any future signal
+    logic can tell the two apart. See the module docstring's honesty caveat."""
 
 
 @dataclass(frozen=True, slots=True)

@@ -20,9 +20,10 @@ not a parse error), mirroring the old `TolMatchQty == -1` pre-market sentinel ha
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import time
+from datetime import datetime, time
 from decimal import Decimal, InvalidOperation
 
+from tfx_quant.domain.timestamp import TAIPEI_TZ
 from tfx_quant.infrastructure.yuanta.errors import MarketDataParseError
 
 _SETTLEMENT_SENTINEL = -1
@@ -109,3 +110,64 @@ def parse_stock_tick_push(
         serial_no=serial_no_parsed,
         exchange_time=exchange_time,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedKLineBar:
+    """One `GetKLine` result row, parsed into typed primitives — see
+    `application.ports.historical_price_query.VendorKLineBar`, which this maps onto
+    directly (`spark_historical_price_adapter.py` does that final, trivial conversion)."""
+
+    at: datetime
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: int
+
+
+def parse_kline_bar(
+    *,
+    year: object,
+    month: object,
+    day: object,
+    hour: object,
+    minute: object,
+    second: object,
+    open_price: object,
+    high_price: object,
+    low_price: object,
+    close_price: object,
+    deal_vol: object,
+) -> ParsedKLineBar:
+    """Parses one `KLine` result row. Callers pass `TimeStamp`'s individual date/time
+    components (not the raw `.NET System.DateTime` object) so this module stays
+    pure-Python — same split as `parse_stock_tick_push`. Raises `MarketDataParseError`
+    for anything malformed; callers must treat that as an unresolvable single row
+    (skip it, don't abort the rest of the batch), matching this codebase's "never
+    fabricate, only ever drop into an unresolved gap" policy for vendor data it can't
+    trust."""
+    try:
+        at = datetime(
+            _parse_int(year, label="TimeStamp.Year"),
+            _parse_int(month, label="TimeStamp.Month"),
+            _parse_int(day, label="TimeStamp.Day"),
+            _parse_int(hour, label="TimeStamp.Hour"),
+            _parse_int(minute, label="TimeStamp.Minute"),
+            _parse_int(second, label="TimeStamp.Second"),
+            tzinfo=TAIPEI_TZ,
+        )
+    except ValueError as exc:
+        raise MarketDataParseError(f"KLine.TimeStamp 數值超出範圍：{exc}") from exc
+
+    open_ = _parse_decimal(open_price, label="OpenPrice")
+    high = _parse_decimal(high_price, label="HighPrice")
+    low = _parse_decimal(low_price, label="LowPrice")
+    close = _parse_decimal(close_price, label="ClosePrice")
+    if high < low:
+        raise MarketDataParseError(f"HighPrice ({high}) 小於 LowPrice ({low})")
+    volume = _parse_int(deal_vol, label="DealVol")
+    if volume < 0:
+        raise MarketDataParseError(f"DealVol 必須 >= 0，得到 {volume}")
+
+    return ParsedKLineBar(at=at, open=open_, high=high, low=low, close=close, volume=volume)

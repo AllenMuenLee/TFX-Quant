@@ -17,10 +17,14 @@ from tfx_quant.application.events.event_coordinator import EventCoordinator
 from tfx_quant.application.instrument_selection.instrument_selection_service import (
     InstrumentSelectionService,
 )
+from tfx_quant.application.market_data.bar_history_backfill_service import (
+    BarHistoryBackfillService,
+)
 from tfx_quant.application.market_data.bar_service import MarketDataBarService
 from tfx_quant.application.ports.bar_signal_state import BarSignalStateStore
 from tfx_quant.application.ports.broker_session import IBrokerSession
 from tfx_quant.application.ports.clock import Clock
+from tfx_quant.application.ports.historical_price_query import HistoricalPriceQueryPort
 from tfx_quant.application.ports.identity import IdGenerator
 from tfx_quant.application.ports.instrument_master import InstrumentMasterRepository
 from tfx_quant.application.ports.trading_calendar import TradingCalendarRepository
@@ -41,6 +45,7 @@ from tfx_quant.infrastructure.yuanta.instrument_master_repository import (
     JsonInstrumentMasterRepository,
 )
 from tfx_quant.infrastructure.yuanta.mock_broker_session import MockBrokerSession
+from tfx_quant.infrastructure.yuanta.mock_historical_price_query import MockHistoricalPriceQuery
 from tfx_quant.infrastructure.yuanta.mock_quote_gateway import MockQuoteGateway
 from tfx_quant.infrastructure.yuanta.mock_trade_gateway import MockTradeGateway
 from tfx_quant.infrastructure.yuanta.preflight import raise_if_any_failed, run_preflight_checks
@@ -75,6 +80,7 @@ class ServiceContainer:
     instrument_master: InstrumentMasterRepository
     instrument_selection: InstrumentSelectionService
     market_data_bar_service: MarketDataBarService
+    bar_history_backfill_service: BarHistoryBackfillService
 
 
 def load_settings(path: Path) -> TradingSettings:
@@ -133,10 +139,12 @@ def build_services(settings: TradingSettings) -> ServiceContainer:
     trade_gateway: TradeGatewayPort
     quote_gateway: QuoteGatewayPort
     broker_session: IBrokerSession
+    historical_price_query: HistoricalPriceQueryPort
     if settings.use_mock:
         trade_gateway = MockTradeGateway()
         quote_gateway = MockQuoteGateway()
         broker_session = MockBrokerSession(event_publisher=event_coordinator)
+        historical_price_query = MockHistoricalPriceQuery()
     else:
         raise_if_any_failed(run_preflight_checks())
 
@@ -145,6 +153,9 @@ def build_services(settings: TradingSettings) -> ServiceContainer:
         # docs/adr/0004-broker-session-architecture.md for why this glue is kept as
         # thin and isolated as possible.
         from tfx_quant.infrastructure.yuanta.spark_api_adapter import SparkApiSessionAdapter
+        from tfx_quant.infrastructure.yuanta.spark_historical_price_adapter import (
+            SparkHistoricalPriceQueryAdapter,
+        )
 
         adapter = SparkApiSessionAdapter()
         orchestrator = BrokerSessionOrchestrator(
@@ -159,6 +170,7 @@ def build_services(settings: TradingSettings) -> ServiceContainer:
         trade_gateway = BrokerSessionTradeGatewayView(orchestrator)
         quote_gateway = BrokerSessionQuoteGatewayView(orchestrator, instrument_master)
         broker_session = orchestrator
+        historical_price_query = SparkHistoricalPriceQueryAdapter(adapter)
 
     instrument_selection = InstrumentSelectionService(
         strategy_state_machine=strategy_state_machine,
@@ -168,6 +180,15 @@ def build_services(settings: TradingSettings) -> ServiceContainer:
         bar_signal_state_store=bar_signal_state_store,
         clock=clock,
         event_publisher=event_coordinator,
+    )
+
+    bar_history_backfill_service = BarHistoryBackfillService(
+        event_bus=event_coordinator,
+        clock=clock,
+        trading_calendar_repository=trading_calendar,
+        instrument_master=instrument_master,
+        bar_record_repository=bar_record_repository,
+        historical_price_query=historical_price_query,
     )
 
     return ServiceContainer(
@@ -182,6 +203,7 @@ def build_services(settings: TradingSettings) -> ServiceContainer:
         instrument_master=instrument_master,
         instrument_selection=instrument_selection,
         market_data_bar_service=market_data_bar_service,
+        bar_history_backfill_service=bar_history_backfill_service,
     )
 
 

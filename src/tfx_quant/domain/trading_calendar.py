@@ -46,6 +46,18 @@ class TradingCalendar:
     def is_trading_day(self, d: date) -> bool:
         return d.weekday() < 5 and d not in self.holidays
 
+    def trading_days_between(self, start: date, end: date) -> list[date]:
+        """Every trading day in `[start, end]` (inclusive on both ends), ascending.
+        Empty if `end < start`. Pure calendar-date enumeration — no session times or
+        `InstrumentMasterEntry` involved, unlike `bar_boundaries`/`boundary_for_open`."""
+        days: list[date] = []
+        cursor = start
+        while cursor <= end:
+            if self.is_trading_day(cursor):
+                days.append(cursor)
+            cursor += timedelta(days=1)
+        return days
+
     def session_end_for(self, d: date, base_end: time) -> time:
         """`base_end` with any early-close override for `d` applied (only ever earlier,
         never later, than the base end)."""
@@ -115,6 +127,32 @@ class TradingCalendar:
         if best is None:
             return None
         return Timestamp(best[1])
+
+    def boundary_for_open(
+        self, open_ts: Timestamp, entry: InstrumentMasterEntry
+    ) -> tuple[Timestamp, Timestamp] | None:
+        """The (open, close) boundary whose open-label timestamp exactly equals
+        `open_ts` — used to resolve a vendor-supplied historical bar timestamp
+        (`application.ports.historical_price_query.VendorKLineBar.at`) under this
+        codebase's own open-time bar-labeling convention (see `domain.bar.Bar`'s
+        docstring). The vendor's `GetKLine` docs never state whether `TimeStamp` is an
+        open or close label for intraday periods, so this is a stated assumption, not a
+        verified fact — see `docs/adr/0007-two-month-bar-history-persistence.md`'s
+        extension decision. Returns `None` when `open_ts` isn't exactly one of this
+        calendar/entry's own boundary opens (off-grid vendor timestamp, the close-label
+        interpretation being the correct one after all, or a non-trading period) —
+        callers must never snap or coerce it to the nearest boundary, only accept an
+        exact match; anything else is left as an unresolved gap."""
+        d = open_ts.value.date()
+        for offset in _TRADING_DAY_SEARCH_OFFSETS:
+            trading_day = d + timedelta(days=offset)
+            if not self.is_trading_day(trading_day):
+                continue
+            for start, end in _sessions_of(entry):
+                for candidate_open, candidate_close in self.bar_boundaries(trading_day, start, end):
+                    if candidate_open.value == open_ts.value:
+                        return candidate_open, candidate_close
+        return None
 
     def session_context_for(
         self, open_ts: Timestamp, entry: InstrumentMasterEntry
