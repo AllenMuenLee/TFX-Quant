@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from collections.abc import Sequence
 from datetime import date
 from typing import Any
@@ -24,6 +25,9 @@ from tfx_quant.domain.account import TradingAccount
 from tfx_quant.infrastructure.yuanta.errors import MarketDataParseError
 from tfx_quant.infrastructure.yuanta.market_data_parsing import parse_kline_bar
 from tfx_quant.infrastructure.yuanta.spark_api_adapter import SparkApiSessionAdapter
+from tfx_quant.telemetry import get_logger, log_error, log_info, log_warning
+
+_logger = get_logger(__name__)
 
 _DEFAULT_RESPONSE_TIMEOUT_SECONDS = 10.0
 
@@ -62,20 +66,53 @@ class SparkHistoricalPriceQueryAdapter:
         start_date: date,
         end_date: date,
     ) -> Sequence[VendorKLineBar]:
+        start = time.monotonic()
+        log_info(
+            _logger,
+            "historical_kline_query_requested",
+            vendor_symbol=vendor_symbol,
+            start_date=start_date.isoformat(),
+            end_date=end_date.isoformat(),
+        )
         with self._call_lock:
             self._drain_pending()
             ok = self._session_adapter.request_kline(account, vendor_symbol, start_date, end_date)
             if not ok:
+                log_error(
+                    _logger,
+                    "historical_kline_query_call_rejected",
+                    vendor_symbol=vendor_symbol,
+                    start_date=start_date.isoformat(),
+                    end_date=end_date.isoformat(),
+                )
                 raise HistoricalPriceQueryError(
                     f"GetKLine 呼叫失敗（{vendor_symbol} {start_date}~{end_date}）"
                 )
             try:
                 obj_value = self._pending.get(timeout=self._timeout)
             except queue.Empty as exc:
+                log_warning(
+                    _logger,
+                    "historical_kline_query_timed_out",
+                    vendor_symbol=vendor_symbol,
+                    start_date=start_date.isoformat(),
+                    end_date=end_date.isoformat(),
+                    timeout_seconds=self._timeout,
+                )
                 raise HistoricalPriceQueryError(
                     f"GetKLine 查詢逾時，未收到回應（{vendor_symbol} {start_date}~{end_date}）"
                 ) from exc
-        return _parse_kline_result(obj_value)
+        bars = _parse_kline_result(obj_value)
+        log_info(
+            _logger,
+            "historical_kline_query_result",
+            vendor_symbol=vendor_symbol,
+            start_date=start_date.isoformat(),
+            end_date=end_date.isoformat(),
+            record_count=len(bars),
+            duration_ms=(time.monotonic() - start) * 1000,
+        )
+        return bars
 
     def _drain_pending(self) -> None:
         try:

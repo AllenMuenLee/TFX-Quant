@@ -34,8 +34,13 @@ from tfx_quant.application.events.events import (
 from tfx_quant.application.ports.broker_session import LoginRequest
 from tfx_quant.application.settings.trading_settings import Environment
 from tfx_quant.desktop.composition import ServiceContainer
+from tfx_quant.domain.timestamp import Timestamp
 from tfx_quant.infrastructure.yuanta import credentials, login_preferences
 from tfx_quant.infrastructure.yuanta.errors import CertificateImportError
+from tfx_quant.telemetry import get_logger, log_info, log_warning
+from tfx_quant.telemetry.masking import field_present, mask_account
+
+_logger = get_logger(__name__)
 
 _ENVIRONMENT_CHOICES: tuple[Environment, ...] = (Environment.TEST, Environment.PRODUCTION)
 _ENVIRONMENT_LABELS = ("測試 UAT (TEST)", "正式 PROD (PRODUCTION)")
@@ -206,6 +211,12 @@ class LoginDialog(wx.Dialog):
         ]
         self.Bind(wx.EVT_CLOSE, self._on_close)
 
+        log_info(
+            _logger,
+            "login_form_opened",
+            remembered_user_id_present=field_present(prefs.remembered_user_id),
+        )
+
     # -- Password visibility toggle -------------------------------------------------
 
     def _make_password_ctrl(self, *, masked: bool) -> wx.TextCtrl:
@@ -284,9 +295,15 @@ class LoginDialog(wx.Dialog):
 
     def _on_submit(self, _event: wx.CommandEvent) -> None:
         if self._connecting:
+            log_info(_logger, "login_submit_blocked", reason="duplicate submit while connecting")
             return  # 禁止重複送出
 
         values = self._read_form()
+        log_info(
+            _logger,
+            "login_environment_selected",
+            environment=values.environment.value,
+        )
         stripped_id = values.user_id.strip()
         stored_password = credentials.load_stored_password(stripped_id) if stripped_id else None
         try:
@@ -297,15 +314,34 @@ class LoginDialog(wx.Dialog):
                 stored_password=stored_password,
             )
         except LoginFormError as exc:
+            log_info(
+                _logger,
+                "login_field_validation_failed",
+                failure_phase=str(exc),
+                user_id_provided=field_present(values.user_id),
+                password_provided=field_present(values.password) or stored_password is not None,
+            )
             self._status_label.SetLabel(str(exc))
             return
+        log_info(
+            _logger,
+            "login_field_validation_succeeded",
+            user_id_masked=mask_account(request.user_id),
+        )
 
         if values.environment is Environment.PRODUCTION:
+            confirmed_at = Timestamp.now()
             confirmed = (
                 wx.MessageBox(
                     _PRODUCTION_CONFIRM_MESSAGE, "正式環境確認", wx.YES_NO | wx.ICON_WARNING, self
                 )
                 == wx.YES
+            )
+            log_info(
+                _logger,
+                "production_environment_confirmation",
+                confirmed_at=confirmed_at.value.isoformat(),
+                confirmed=confirmed,
             )
             if not confirmed:
                 return
@@ -316,6 +352,7 @@ class LoginDialog(wx.Dialog):
         self._connecting = True
         self._set_form_enabled(False)
         self._status_label.SetLabel("登入中…")
+        log_info(_logger, "login_submitted", user_id_masked=mask_account(request.user_id))
         self._services.broker_session.start(request)
 
     # -- Broker events (arrive on EventCoordinator's own thread) --------------------
@@ -326,6 +363,7 @@ class LoginDialog(wx.Dialog):
     def _handle_login_succeeded(self, event: BrokerLoginSucceeded) -> None:
         if not self._connecting:
             return
+        log_info(_logger, "login_result", succeeded=True, account_list_count=len(event.accounts))
         if self._pending_secure_store:
             values = self._read_form()
             user_id = values.user_id.strip()
@@ -336,6 +374,7 @@ class LoginDialog(wx.Dialog):
             self.EndModal(wx.ID_OK)
 
     def _on_login_failed(self, event: BrokerLoginFailed) -> None:
+        log_warning(_logger, "login_result", succeeded=False, retriable=event.retriable)
         wx.CallAfter(self._handle_terminal_failure, f"登入失敗：{event.reason}")
 
     def _on_login_timed_out(self, _event: BrokerLoginTimedOut) -> None:
@@ -355,8 +394,15 @@ class LoginDialog(wx.Dialog):
     def _on_clear_stored_password(self, _event: wx.CommandEvent) -> None:
         user_id = self._user_id_ctrl.GetValue().strip()
         if not user_id:
+            log_info(_logger, "clear_stored_password_requested", user_id_provided=False)
             self._status_label.SetLabel("請先輸入帳號再清除已儲存密碼")
             return
+        log_info(
+            _logger,
+            "clear_stored_password_requested",
+            user_id_provided=True,
+            user_id_masked=mask_account(user_id),
+        )
         credentials.clear_stored_password(user_id)
         self._status_label.SetLabel(f"已清除 {user_id} 的已儲存密碼")
 

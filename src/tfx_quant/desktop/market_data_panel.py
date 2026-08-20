@@ -28,6 +28,9 @@ import wx.adv
 from tfx_quant.desktop.composition import ServiceContainer
 from tfx_quant.domain.bar import Bar, CandleColor
 from tfx_quant.domain.bar_record import BarRecord
+from tfx_quant.telemetry import get_logger, log_info
+
+_logger = get_logger(__name__)
 
 _CANDLE_LABEL_ZH = {
     CandleColor.RED: "紅",
@@ -127,6 +130,13 @@ class MarketDataPanel(wx.Panel):
         self._refresh()
 
     def _on_query(self, _event: wx.CommandEvent) -> None:
+        start_date, end_date = self._selected_date_range()
+        log_info(
+            _logger,
+            "bar_history_browse_query_requested",
+            start_date=start_date.isoformat(),
+            end_date=end_date.isoformat(),
+        )
         self._refresh()
 
     def _selected_date_range(self) -> tuple[date, date]:

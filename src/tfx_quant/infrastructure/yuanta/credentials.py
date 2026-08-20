@@ -19,6 +19,10 @@ from pathlib import Path
 from pydantic import SecretStr
 
 from tfx_quant.infrastructure.yuanta.errors import CertificateImportError
+from tfx_quant.telemetry import get_logger, log_error, log_info
+from tfx_quant.telemetry.masking import mask_account
+
+_logger = get_logger(__name__)
 
 KEYRING_SERVICE_NAME = "tfx_quant.yuanta"
 
@@ -41,8 +45,21 @@ def load_stored_password(user_id: str) -> str | None:
     try:
         import keyring
     except ImportError:
+        log_info(
+            _logger,
+            "stored_password_load_result",
+            user_id_masked=mask_account(user_id),
+            found=False,
+        )
         return None
-    return keyring.get_password(KEYRING_SERVICE_NAME, user_id)
+    password = keyring.get_password(KEYRING_SERVICE_NAME, user_id)
+    log_info(
+        _logger,
+        "stored_password_load_result",
+        user_id_masked=mask_account(user_id),
+        found=password is not None,
+    )
+    return password
 
 
 def store_password(user_id: str, password: str) -> None:
@@ -52,6 +69,7 @@ def store_password(user_id: str, password: str) -> None:
     import keyring
 
     keyring.set_password(KEYRING_SERVICE_NAME, user_id, password)
+    log_info(_logger, "stored_password_saved", user_id_masked=mask_account(user_id))
 
 
 def clear_stored_password(user_id: str) -> None:
@@ -64,6 +82,7 @@ def clear_stored_password(user_id: str) -> None:
 
     with contextlib.suppress(keyring.errors.PasswordDeleteError):
         keyring.delete_password(KEYRING_SERVICE_NAME, user_id)
+    log_info(_logger, "stored_password_cleared", user_id_masked=mask_account(user_id))
 
 
 def ensure_certificate_imported(certificate_path: str, certificate_password: SecretStr) -> None:
@@ -94,12 +113,20 @@ def ensure_certificate_imported(certificate_path: str, certificate_password: Sec
             check=False,
         )
     except FileNotFoundError as exc:
+        log_error(_logger, "certificate_import_failed", reason="certutil not found")
         raise CertificateImportError("找不到 certutil 工具，僅支援 Windows 環境") from exc
     if completed.returncode != 0:
+        log_error(
+            _logger,
+            "certificate_import_failed",
+            reason="certutil non-zero exit",
+            certutil_exit_code=completed.returncode,
+        )
         raise CertificateImportError(
             f"憑證匯入失敗（certutil 結束碼 {completed.returncode}）；"
             "請確認憑證檔案路徑與憑證密碼是否正確。"
         )
+    log_info(_logger, "certificate_imported")
 
 
 def certificate_path_exists(certificate_path: str) -> bool:

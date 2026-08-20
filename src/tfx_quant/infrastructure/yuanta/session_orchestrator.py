@@ -29,6 +29,7 @@ and out-of-order callbacks safe to ignore rather than corrupt state.
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum, auto
@@ -62,6 +63,15 @@ from tfx_quant.infrastructure.yuanta.errors import (
     MarketDataSubscriptionError,
 )
 from tfx_quant.infrastructure.yuanta.market_data_parsing import parse_stock_tick_push
+from tfx_quant.telemetry import (
+    get_logger,
+    log_debug,
+    log_error,
+    log_info,
+    log_warning,
+    new_correlation_id,
+)
+from tfx_quant.telemetry.masking import mask_account
 
 _RETRIABLE_LOGIN_MSG_CODES = frozenset({"0000"})
 """登入 docs page's `MsgCode` table: `0000`=執行失敗 (generic execution failure — the
@@ -76,6 +86,8 @@ _LOGIN_SUCCESS_MSG_CODES = frozenset({"0001", "00001"})
 """Both spellings appear across different docs pages' worked Python examples (`if
 strMsgCode == '0001' or strMsgCode == '00001'`) — kept as a set rather than picking one,
 matching the docs' own defensive handling."""
+
+_logger = get_logger(__name__)
 
 
 class SparkAdapterPort(Protocol):
@@ -201,6 +213,13 @@ class BrokerSessionOrchestrator:
         self._pending_timer: _Cancellable | None = None
         self._last_capabilities = SessionCapabilities()
         self._ready_published = False
+        self._correlation_id: str | None = None
+        """One ID per session bring-up (set in `start()`, carried through every retry
+        attempt until READY/LOGGED_OUT/a terminal FAILED) — lets a support bundle trace
+        one login attempt end-to-end across the callback thread the adapter calls
+        `handle_*` on and the UI thread `start()`/`stop()` are called from, since
+        `contextvars`-based `correlation_scope` doesn't cross threads on its own."""
+        self._login_started_monotonic: float | None = None
 
     # -- IBrokerSession -----------------------------------------------------------
 
@@ -227,6 +246,15 @@ class BrokerSessionOrchestrator:
                 _Phase.LOGGED_OUT,
             ):
                 return  # already starting/started — not a no-op only when terminal
+            self._correlation_id = new_correlation_id()
+            self._login_started_monotonic = time.monotonic()
+            log_info(
+                _logger,
+                "session_initialize",
+                correlation_id=self._correlation_id,
+                environment=request.environment.value,
+                user_id_masked=mask_account(request.user_id.strip()),
+            )
             self._credentials = BrokerCredentials(
                 user_id=request.user_id.strip(), password=request.password
             )
@@ -254,7 +282,7 @@ class BrokerSessionOrchestrator:
             self._cancel_pending_timer()
             if self._phase not in (_Phase.READY, _Phase.LOGGED_OUT, _Phase.IDLE):
                 self._adapter.disconnect()
-                self._phase = _Phase.FAILED
+                self._set_phase(_Phase.FAILED)
                 self._collapse_and_publish_capabilities()
 
     def subscribe_market_data(self, symbol: str) -> None:
@@ -303,20 +331,34 @@ class BrokerSessionOrchestrator:
 
             self._adapter.disconnect()
 
-            self._phase = _Phase.LOGGED_OUT
+            self._set_phase(_Phase.LOGGED_OUT)
             self._state = _SessionState()
             # Per the login-input implementation prompt: credentials only live in
             # memory for as long as the current login needs them, cleared on logout.
             self._credentials = None
             self._collapse_and_publish_capabilities()
+            log_info(
+                _logger,
+                "logout_result",
+                correlation_id=self._correlation_id,
+                reason=LogoutReason.USER_REQUESTED.value,
+            )
             self._publish(BrokerLoggedOut(at=Timestamp.now(), reason=LogoutReason.USER_REQUESTED))
+            self._correlation_id = None
 
     # -- Login ----------------------------------------------------------------------
 
     def _begin_connect(self) -> None:
-        self._phase = _Phase.CONNECTING
+        self._set_phase(_Phase.CONNECTING)
         assert self._credentials is not None
         assert self._environment is not None
+        log_info(
+            _logger,
+            "login_requested",
+            correlation_id=self._correlation_id,
+            environment=self._environment.value,
+            attempt=self._backoff.attempt_count + 1,
+        )
         self._adapter.open_and_login(
             self._credentials, generation=self._generation, environment=self._environment
         )
@@ -334,12 +376,28 @@ class BrokerSessionOrchestrator:
         from the `.NET` objects so this method (and its tests) stay pure Python."""
         with self._lock:
             if generation != self._generation or self._phase != _Phase.CONNECTING:
+                self._log_stale_callback("handle_login_result", generation)
                 return  # stale/duplicate/out-of-order — ignore
 
             self._cancel_pending_timer()
+            duration_ms = self._login_duration_ms()
+            log_info(
+                _logger,
+                "login_result",
+                correlation_id=self._correlation_id,
+                msg_code=msg_code,
+                succeeded=msg_code in _LOGIN_SUCCESS_MSG_CODES,
+                duration_ms=duration_ms,
+            )
 
             if msg_code in _LOGIN_SUCCESS_MSG_CODES:
                 accounts = _parse_login_accounts(login_entries)
+                log_info(
+                    _logger,
+                    "account_list_received",
+                    correlation_id=self._correlation_id,
+                    account_count=len(accounts),
+                )
                 if not accounts:
                     self._handle_startup_failure(
                         "登入成功，但回傳帳號清單無法解析為有效期貨帳號", retriable=False
@@ -356,7 +414,7 @@ class BrokerSessionOrchestrator:
                     self._state.selected_account = resolved
                     self._begin_report_query()
                 else:
-                    self._phase = _Phase.AWAITING_ACCOUNT_SELECTION
+                    self._set_phase(_Phase.AWAITING_ACCOUNT_SELECTION)
                 return
 
             reason = msg_content or f"登入失敗（代碼 {msg_code}）"
@@ -372,14 +430,28 @@ class BrokerSessionOrchestrator:
         wired in without changing the orchestrator. See `docs/adr/0004-*.md`."""
         with self._lock:
             if generation != self._generation or self._phase != _Phase.READY:
+                self._log_stale_callback("handle_session_invalidated", generation)
                 return
+            log_warning(
+                _logger,
+                "passive_disconnect_detected",
+                correlation_id=self._correlation_id,
+                reason=reason,
+            )
             self._invalidate_session(reason)
 
     # -- Safety queries ---------------------------------------------------------
 
     def _begin_report_query(self) -> None:
-        self._phase = _Phase.QUERYING_REPORTS
+        self._set_phase(_Phase.QUERYING_REPORTS)
         assert self._state.selected_account is not None
+        log_info(
+            _logger,
+            "query_step_started",
+            correlation_id=self._correlation_id,
+            step="real_report",
+            account_masked=mask_account(self._state.selected_account.account_no),
+        )
         self._adapter.query_real_report(self._state.selected_account)
 
     def handle_real_report_query_result(self, generation: int) -> None:
@@ -390,14 +462,28 @@ class BrokerSessionOrchestrator:
         tracked here, for sequencing/capability purposes."""
         with self._lock:
             if generation != self._generation or self._phase != _Phase.QUERYING_REPORTS:
+                self._log_stale_callback("handle_real_report_query_result", generation)
                 return
+            log_info(
+                _logger,
+                "query_step_completed",
+                correlation_id=self._correlation_id,
+                step="real_report",
+            )
             self._state.reports_query_done = True
             self._publish_capabilities_if_changed()
             self._begin_position_query()
 
     def _begin_position_query(self) -> None:
-        self._phase = _Phase.QUERYING_POSITIONS
+        self._set_phase(_Phase.QUERYING_POSITIONS)
         assert self._state.selected_account is not None
+        log_info(
+            _logger,
+            "query_step_started",
+            correlation_id=self._correlation_id,
+            step="positions",
+            account_masked=mask_account(self._state.selected_account.account_no),
+        )
         self._adapter.query_positions(self._state.selected_account)
 
     def handle_position_query_result(self, generation: int) -> None:
@@ -407,7 +493,14 @@ class BrokerSessionOrchestrator:
         this."""
         with self._lock:
             if generation != self._generation or self._phase != _Phase.QUERYING_POSITIONS:
+                self._log_stale_callback("handle_position_query_result", generation)
                 return
+            log_info(
+                _logger,
+                "query_step_completed",
+                correlation_id=self._correlation_id,
+                step="positions",
+            )
             self._state.positions_query_done = True
             self._publish_capabilities_if_changed()
             self._begin_market_data_subscription()
@@ -415,7 +508,14 @@ class BrokerSessionOrchestrator:
     # -- Market data subscription + push --------------------------------------------
 
     def _begin_market_data_subscription(self) -> None:
-        self._phase = _Phase.SUBSCRIBING_MARKET_DATA
+        self._set_phase(_Phase.SUBSCRIBING_MARKET_DATA)
+        log_info(
+            _logger,
+            "query_step_started",
+            correlation_id=self._correlation_id,
+            step="market_data_subscription",
+            symbol_count=len(self._market_data_symbols),
+        )
         if not self._market_data_symbols:
             self._state.market_data_subscription_attempted = True
             self._complete_session()
@@ -453,6 +553,10 @@ class BrokerSessionOrchestrator:
         selection) does that translation."""
         with self._lock:
             if generation != self._generation or self._phase != _Phase.READY:
+                # DEBUG only — this guard also sees every stale tick during a
+                # reconnect window, not just genuinely rare duplicate/out-of-order
+                # session callbacks.
+                self._log_stale_callback("handle_market_data_push", generation)
                 return
         try:
             parsed = parse_stock_tick_push(
@@ -482,27 +586,69 @@ class BrokerSessionOrchestrator:
 
     def _complete_session(self) -> None:
         assert self._state.selected_account is not None
-        self._phase = _Phase.READY
+        self._set_phase(_Phase.READY)
         self._ready_published = True
         self._publish_capabilities_if_changed()
+        log_info(
+            _logger,
+            "session_ready",
+            correlation_id=self._correlation_id,
+            duration_ms=self._login_duration_ms(),
+        )
         self._publish(BrokerSessionReady(at=Timestamp.now(), account=self._state.selected_account))
 
     # -- Failure / retry / invalidation --------------------------------------------
 
     def _handle_startup_failure(self, reason: str, retriable: bool) -> None:
         self._cancel_pending_timer()
+        capabilities = self._current_capabilities()
+        log_error(
+            _logger,
+            "session_ready_failed",
+            correlation_id=self._correlation_id,
+            reason=reason,
+            retriable=retriable,
+            login_ready=capabilities.login,
+            market_data_ready=capabilities.market_data,
+            trading_ready=capabilities.trading,
+            order_reports_ready=capabilities.order_reports,
+            queries_ready=capabilities.queries,
+        )
         self._publish(BrokerLoginFailed(at=Timestamp.now(), reason=reason, retriable=retriable))
         self._collapse_and_publish_capabilities()
-        self._phase = _Phase.FAILED
+        self._set_phase(_Phase.FAILED)
 
         if not retriable or self._backoff.is_cancelled:
+            log_info(
+                _logger,
+                "retry_stopped",
+                correlation_id=self._correlation_id,
+                attempt=self._backoff.attempt_count,
+                stop_reason="not retriable" if not retriable else "cancelled",
+            )
             return
 
         self._backoff.record_failure()
         if self._backoff.is_exhausted:
+            log_info(
+                _logger,
+                "retry_stopped",
+                correlation_id=self._correlation_id,
+                attempt=self._backoff.attempt_count,
+                stop_reason="backoff exhausted",
+            )
             return
 
         delay = self._backoff.next_delay_seconds()
+        log_info(
+            _logger,
+            "retry_scheduled",
+            correlation_id=self._correlation_id,
+            attempt=self._backoff.attempt_count,
+            delay_seconds=delay,
+            jitter_seconds=0.0,  # BackoffPolicy is purely deterministic — no jitter applied
+            trigger_reason=reason,
+        )
         self._pending_timer = self._scheduler.schedule(delay, self._retry)
 
     def _retry(self) -> None:
@@ -516,7 +662,7 @@ class BrokerSessionOrchestrator:
     def _invalidate_session(self, reason: str) -> None:
         self._publish(BrokerSessionInvalidated(at=Timestamp.now(), reason=reason))
         self._collapse_and_publish_capabilities()
-        self._phase = _Phase.FAILED
+        self._set_phase(_Phase.FAILED)
         self._ready_published = False
 
     def _on_login_timeout(self, generation: int) -> None:
@@ -576,6 +722,37 @@ class BrokerSessionOrchestrator:
 
     def _publish(self, event: Event) -> None:
         self._event_coordinator.publish(event)
+
+    def _login_duration_ms(self) -> float | None:
+        if self._login_started_monotonic is None:
+            return None
+        return (time.monotonic() - self._login_started_monotonic) * 1000
+
+    def _set_phase(self, new_phase: _Phase) -> None:
+        old_phase = self._phase
+        self._phase = new_phase
+        log_info(
+            _logger,
+            "session_phase_transitioned",
+            correlation_id=self._correlation_id,
+            from_phase=old_phase.value,
+            to_phase=new_phase.value,
+        )
+
+    def _log_stale_callback(self, callback_name: str, generation: int) -> None:
+        """Every `handle_*` callback drops a stale-generation or wrong-phase call
+        silently (by design — see the module docstring) rather than raising; this is
+        the "重複／亂序判定" trail the implementation prompt asks be observable
+        instead."""
+        log_debug(
+            _logger,
+            "callback_dropped_stale_or_out_of_order",
+            correlation_id=self._correlation_id,
+            callback_name=callback_name,
+            callback_generation=generation,
+            current_generation=self._generation,
+            current_phase=self._phase.value,
+        )
 
 
 def _parse_login_accounts(

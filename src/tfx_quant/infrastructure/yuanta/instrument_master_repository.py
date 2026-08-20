@@ -31,6 +31,9 @@ from tfx_quant.domain.errors import DomainError
 from tfx_quant.domain.instrument import Instrument
 from tfx_quant.domain.instrument_master import InstrumentMasterEntry
 from tfx_quant.infrastructure.yuanta.errors import InstrumentMasterFileError
+from tfx_quant.telemetry import get_logger, log_error, log_info
+
+_logger = get_logger(__name__)
 
 _REQUIRED_FIELDS = (
     "instrument",
@@ -118,6 +121,18 @@ class JsonInstrumentMasterRepository:
     """Implements `application.ports.instrument_master.InstrumentMasterRepository`."""
 
     def __init__(self, path: Path) -> None:
+        try:
+            self._load(path)
+        except InstrumentMasterFileError as exc:
+            log_error(
+                _logger,
+                "instrument_master_load_failed",
+                source=str(path),
+                error=str(exc),
+            )
+            raise
+
+    def _load(self, path: Path) -> None:
         raw_text = path.read_text(encoding="utf-8")
         try:
             raw = json.loads(raw_text)
@@ -143,6 +158,19 @@ class JsonInstrumentMasterRepository:
         self._by_instrument: dict[Instrument, list[InstrumentMasterEntry]] = {}
         for entry in entries:
             self._by_instrument.setdefault(entry.instrument, []).append(entry)
+
+        # No explicit version field in the file format (see the file's own `_comment`
+        # seed data) — the source file's own mtime is the only honest "which revision
+        # of the master data is this" proxy available, rather than inventing a schema
+        # field that doesn't exist.
+        log_info(
+            _logger,
+            "instrument_master_loaded",
+            source=str(path),
+            master_data_version=str(path.stat().st_mtime),
+            entry_count=len(entries),
+            instruments=sorted({entry.instrument.value for entry in entries}),
+        )
 
     def get(self, instrument: Instrument, contract: ContractMonth) -> InstrumentMasterEntry | None:
         return self._by_key.get((instrument, contract))

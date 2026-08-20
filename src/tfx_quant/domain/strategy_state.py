@@ -13,6 +13,9 @@ from __future__ import annotations
 from enum import StrEnum
 
 from tfx_quant.domain.errors import IllegalStateTransitionError
+from tfx_quant.telemetry import get_logger, log_info, log_warning
+
+_logger = get_logger(__name__)
 
 
 class StrategyState(StrEnum):
@@ -55,8 +58,22 @@ class StrategyStateMachine:
         return to_state in _LEGAL_TRANSITIONS.get(from_state, frozenset())
 
     def transition(self, to_state: StrategyState) -> None:
-        if not self.can_transition(self._state, to_state):
+        from_state = self._state
+        if not self.can_transition(from_state, to_state):
+            log_warning(
+                _logger,
+                "strategy_state_transition_rejected",
+                from_state=from_state.value,
+                to_state=to_state.value,
+                reason="not in legal transition table",
+            )
             raise IllegalStateTransitionError(
-                f"illegal strategy state transition: {self._state.value} -> {to_state.value}"
+                f"illegal strategy state transition: {from_state.value} -> {to_state.value}"
             )
         self._state = to_state
+        log_info(
+            _logger,
+            "strategy_state_transitioned",
+            from_state=from_state.value,
+            to_state=to_state.value,
+        )

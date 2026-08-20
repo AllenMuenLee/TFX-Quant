@@ -66,6 +66,9 @@ from tfx_quant.domain.money import Price
 from tfx_quant.domain.tick import Tick
 from tfx_quant.domain.timestamp import Timestamp
 from tfx_quant.domain.trading_calendar import TradingCalendar
+from tfx_quant.telemetry import get_logger, log_debug, log_error, log_info, log_warning
+
+_logger = get_logger(__name__)
 
 _DEFAULT_STALE_AFTER_SECONDS = 10.0
 _DEFAULT_CLOCK_INTERVAL_SECONDS = 1.0
@@ -171,8 +174,21 @@ class MarketDataBarService:
             if entry is None:
                 # Nothing to track without controlled session-time data — leave
                 # inactive rather than guessing session boundaries.
+                log_warning(
+                    _logger,
+                    "bar_signal_state_clear_no_master_entry",
+                    instrument=instrument.value,
+                    contract=contract.code,
+                )
                 self._active = None
                 return
+            log_info(
+                _logger,
+                "bar_signal_state_cleared",
+                instrument=instrument.value,
+                contract=contract.code,
+                vendor_symbol=entry.vendor_symbol,
+            )
             active = _ActiveContract(
                 instrument=instrument,
                 contract=contract,
@@ -261,8 +277,23 @@ class MarketDataBarService:
                     size=event.size,
                     serial_no=event.serial_no,
                 )
-            except DomainError:
+            except DomainError as exc:
+                log_debug(
+                    _logger,
+                    "tick_dropped_malformed_push",
+                    vendor_symbol=event.vendor_symbol,
+                    error=str(exc),
+                )
                 return  # malformed push — reject rather than raise into the dispatch loop
+            if active.last_tick_at is None:
+                log_info(
+                    _logger,
+                    "market_data_first_tick_received",
+                    instrument=active.instrument.value,
+                    contract=active.contract.code,
+                    vendor_symbol=active.vendor_symbol,
+                    serial_no=tick.serial_no,
+                )
             closed_bars = active.aggregator.on_tick(tick)
             active.last_tick_at = now
             self._update_staleness(active, now)
@@ -280,6 +311,13 @@ class MarketDataBarService:
             self._load_warm_up(active, self._clock.now())
             if not active.has_gap:
                 active.has_gap = True
+                log_warning(
+                    _logger,
+                    "market_data_gap_detected",
+                    instrument=active.instrument.value,
+                    contract=active.contract.code,
+                    reason="reconnect: no confirmed historical/tick-replay mechanism",
+                )
                 self._publish(
                     MarketDataGapDetected(
                         at=Timestamp.now(),
@@ -314,6 +352,15 @@ class MarketDataBarService:
         active.streak = streak
         tail = records[-_RECENT_BARS_LIMIT:]
         active.recent_closed = deque((r.bar for r in tail), maxlen=_RECENT_BARS_LIMIT)
+        log_info(
+            _logger,
+            "bar_history_warm_up_loaded",
+            instrument=active.instrument.value,
+            contract=active.contract.code,
+            source="local_repository",
+            window_start=window_start.isoformat(),
+            record_count=len(records),
+        )
 
     def _handle_closed_bars(
         self, active: _ActiveContract, closed_bars: list[Bar], now: Timestamp
@@ -322,11 +369,28 @@ class MarketDataBarService:
             active.recent_closed.append(bar)
             active.streak.on_bar_closed(bar)
             is_gap_recovery = active.has_gap
+            # `log_info` stamps its own monotonic `seq` on this record — that's the
+            # "BarClosed 發送序號" the implementation prompt asks for, not a separate
+            # counter threaded through this method.
+            log_info(
+                _logger,
+                "bar_closed_dispatched",
+                instrument=active.instrument.value,
+                contract=active.contract.code,
+                bar_start=bar.start.value.isoformat(),
+                is_gap_recovery=is_gap_recovery,
+            )
             self._publish(
                 BarClosed(at=now, instrument=active.instrument, contract=active.contract, bar=bar)
             )
             if active.has_gap:
                 active.has_gap = False
+                log_info(
+                    _logger,
+                    "market_data_gap_cleared",
+                    instrument=active.instrument.value,
+                    contract=active.contract.code,
+                )
                 self._publish(
                     MarketDataGapCleared(
                         at=now, instrument=active.instrument, contract=active.contract
@@ -342,6 +406,13 @@ class MarketDataBarService:
             # Never expected — bar.start is always one of the calendar's own boundary
             # outputs — but a persistence-layer surprise must never crash tick
             # processing; flag degraded and drop this one write.
+            log_error(
+                _logger,
+                "bar_persist_requested_no_session_context",
+                instrument=active.instrument.value,
+                contract=active.contract.code,
+                bar_start=bar.start.value.isoformat(),
+            )
             self._set_degraded(True)
             return
         trading_day, session = context
@@ -355,9 +426,32 @@ class MarketDataBarService:
             created_at=now,
             updated_at=now,
         )
+        # DEBUG only: called on the tick/clock-processing thread, never the
+        # EventCoordinator dispatch thread's own callback — but still kept to a
+        # compact identity, not the full bar payload, per "不得在行情 callback 內
+        # 同步輸出大量 payload".
+        log_debug(
+            _logger,
+            "bar_persist_requested",
+            instrument=active.instrument.value,
+            contract=active.contract.code,
+            bar_start=bar.start.value.isoformat(),
+            trading_day=trading_day.isoformat(),
+            session=session.value,
+            is_gap_recovery=is_gap_recovery,
+            queue_depth=self._write_queue.qsize(),
+        )
         try:
             self._write_queue.put_nowait(record)
         except queue.Full:
+            log_error(
+                _logger,
+                "bar_persist_requested_queue_full",
+                instrument=active.instrument.value,
+                contract=active.contract.code,
+                bar_start=bar.start.value.isoformat(),
+                queue_maxsize=self._write_queue.maxsize,
+            )
             self._set_degraded(True)
 
     def _run_writer(self) -> None:
@@ -371,15 +465,49 @@ class MarketDataBarService:
             self._write_with_bounded_retry(item)
 
     def _write_with_bounded_retry(self, record: BarRecord) -> None:
+        instrument = record.bar.instrument
+        contract = record.bar.contract
         attempt = 0
         while True:
+            start = _time.monotonic()
             try:
-                self._bar_record_repository.upsert_closed_bar(record)
+                outcome = self._bar_record_repository.upsert_closed_bar(record)
+                duration_ms = (_time.monotonic() - start) * 1000
+                log_info(
+                    _logger,
+                    "bar_persist_result",
+                    instrument=instrument.value,
+                    contract=contract.code,
+                    bar_start=record.bar.start.value.isoformat(),
+                    outcome=outcome.value,
+                    attempt=attempt + 1,
+                    duration_ms=duration_ms,
+                )
                 self._set_degraded(False)
                 return
-            except BarUpsertRepositoryError:
+            except BarUpsertRepositoryError as exc:
+                duration_ms = (_time.monotonic() - start) * 1000
                 attempt += 1
+                log_warning(
+                    _logger,
+                    "bar_persist_attempt_failed",
+                    instrument=instrument.value,
+                    contract=contract.code,
+                    bar_start=record.bar.start.value.isoformat(),
+                    attempt=attempt,
+                    max_attempts=self._max_write_retries,
+                    duration_ms=duration_ms,
+                    error=str(exc),
+                )
                 if attempt >= self._max_write_retries:
+                    log_error(
+                        _logger,
+                        "bar_persist_failed_after_retries",
+                        instrument=instrument.value,
+                        contract=contract.code,
+                        bar_start=record.bar.start.value.isoformat(),
+                        attempts=attempt,
+                    )
                     self._set_degraded(True)
                     return
                 delay = min(
@@ -393,17 +521,35 @@ class MarketDataBarService:
             changed = degraded != self._is_degraded
             self._is_degraded = degraded
         if changed:
+            if degraded:
+                log_error(_logger, "bar_persistence_degraded")
+            else:
+                log_info(_logger, "bar_persistence_recovered")
             self._publish(BarPersistenceHealthChanged(at=Timestamp.now(), is_degraded=degraded))
 
     def _run_retention_cleanup(self, now: Timestamp) -> None:
         cutoff = rolling_two_month_start(now.value.date())
+        log_debug(_logger, "bar_retention_cleanup_started", cutoff_trading_day=cutoff.isoformat())
         try:
             summary = self._bar_record_repository.delete_before(cutoff, ran_at=now)
-        except BarUpsertRepositoryError:
+        except BarUpsertRepositoryError as exc:
+            log_error(
+                _logger,
+                "bar_retention_cleanup_failed",
+                cutoff_trading_day=cutoff.isoformat(),
+                error=str(exc),
+            )
             return  # best-effort — a failed sweep is not itself a data-loss risk
         with self._lock:
             self._last_retention_summary = summary
             self._last_retention_check_date = now.value.date()
+        log_info(
+            _logger,
+            "bar_retention_cleanup_completed",
+            cutoff_trading_day=summary.cutoff_trading_day.isoformat(),
+            deleted_count=summary.deleted_count,
+            ran_at=summary.ran_at.value.isoformat(),
+        )
         self._publish(
             BarRetentionCleanupCompleted(
                 at=now,
@@ -427,6 +573,18 @@ class MarketDataBarService:
             is_stale_now = age > self._stale_after_seconds
         if is_stale_now != active.is_stale:
             active.is_stale = is_stale_now
+            log_debug(
+                _logger,
+                "market_data_staleness_changed",
+                instrument=active.instrument.value,
+                contract=active.contract.code,
+                is_stale=is_stale_now,
+                last_tick_at=(
+                    active.last_tick_at.value.isoformat()
+                    if active.last_tick_at is not None
+                    else None
+                ),
+            )
             self._publish(
                 MarketDataFreshnessChanged(
                     at=now,

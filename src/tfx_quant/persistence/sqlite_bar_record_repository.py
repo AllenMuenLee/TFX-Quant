@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import time
 from collections.abc import Sequence
 from datetime import date, datetime
 from decimal import Decimal
@@ -35,6 +36,9 @@ from tfx_quant.domain.contract import ContractMonth
 from tfx_quant.domain.instrument import Instrument
 from tfx_quant.domain.money import Price
 from tfx_quant.domain.timestamp import Timestamp
+from tfx_quant.telemetry import get_logger, log_debug, log_error, log_info
+
+_logger = get_logger(__name__)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS bar_records (
@@ -105,24 +109,57 @@ class SqliteBarRecordRepository:
     # -- Writes -----------------------------------------------------------------
 
     def upsert_closed_bar(self, record: BarRecord) -> BarUpsertOutcome:
+        start = time.monotonic()
+        identity = (
+            record.bar.instrument.value,
+            record.bar.contract.code,
+            record.bar.start.value.isoformat(),
+        )
         try:
             with self._lock:
                 existing = self._select_one(record)
                 if existing is None:
                     self._insert(record)
                     self._conn.commit()
-                    return BarUpsertOutcome.INSERTED
-                if _ohlcv_matches(existing.bar, record.bar):
-                    return BarUpsertOutcome.DUPLICATE_IGNORED
-                return BarUpsertOutcome.CONFLICT_REJECTED
+                    outcome = BarUpsertOutcome.INSERTED
+                elif _ohlcv_matches(existing.bar, record.bar):
+                    outcome = BarUpsertOutcome.DUPLICATE_IGNORED
+                else:
+                    outcome = BarUpsertOutcome.CONFLICT_REJECTED
         except sqlite3.Error as exc:
+            log_error(
+                _logger,
+                "bar_record_upsert_failed",
+                instrument=identity[0],
+                contract=identity[1],
+                bar_start=identity[2],
+                duration_ms=(time.monotonic() - start) * 1000,
+                error=str(exc),
+            )
             raise BarUpsertRepositoryError(f"bar record write failed: {exc}") from exc
+        log_debug(
+            _logger,
+            "bar_record_upsert_completed",
+            instrument=identity[0],
+            contract=identity[1],
+            bar_start=identity[2],
+            outcome=outcome.value,
+            duration_ms=(time.monotonic() - start) * 1000,
+        )
+        return outcome
 
     def apply_correction(self, record: BarRecord, *, reason: str) -> None:
         try:
             with self._lock:
                 existing = self._select_one(record)
                 if existing is None:
+                    log_error(
+                        _logger,
+                        "bar_record_correction_no_existing_row",
+                        instrument=record.bar.instrument.value,
+                        contract=record.bar.contract.code,
+                        bar_start=record.bar.start.value.isoformat(),
+                    )
                     raise BarRecordNotFoundError(
                         f"no existing bar record for identity {record.identity!r} to correct"
                     )
@@ -159,6 +196,15 @@ class SqliteBarRecordRepository:
                 self._conn.commit()
         except sqlite3.Error as exc:
             raise BarUpsertRepositoryError(f"bar record correction failed: {exc}") from exc
+        log_info(
+            _logger,
+            "bar_record_correction_applied",
+            instrument=record.bar.instrument.value,
+            contract=record.bar.contract.code,
+            bar_start=record.bar.start.value.isoformat(),
+            revision=existing.revision + 1,
+            reason=reason,
+        )
 
     def _select_one(self, record: BarRecord) -> BarRecord | None:
         row = self._conn.execute(
@@ -295,6 +341,7 @@ class SqliteBarRecordRepository:
     def delete_before(
         self, cutoff_trading_day: date, *, ran_at: Timestamp
     ) -> RetentionCleanupSummary:
+        start = time.monotonic()
         try:
             with self._lock:
                 cursor = self._conn.execute(
@@ -304,7 +351,22 @@ class SqliteBarRecordRepository:
                 self._conn.commit()
                 deleted_count = cursor.rowcount
         except sqlite3.Error as exc:
+            log_error(
+                _logger,
+                "bar_record_retention_delete_failed",
+                cutoff_trading_day=cutoff_trading_day.isoformat(),
+                duration_ms=(time.monotonic() - start) * 1000,
+                error=str(exc),
+            )
             raise BarUpsertRepositoryError(f"retention cleanup failed: {exc}") from exc
+        log_debug(
+            _logger,
+            "bar_record_retention_delete_completed",
+            cutoff_trading_day=cutoff_trading_day.isoformat(),
+            deleted_count=deleted_count,
+            duration_ms=(time.monotonic() - start) * 1000,
+            transaction_committed=True,
+        )
         return RetentionCleanupSummary(
             cutoff_trading_day=cutoff_trading_day, deleted_count=deleted_count, ran_at=ran_at
         )

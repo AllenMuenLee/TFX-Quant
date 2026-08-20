@@ -12,6 +12,10 @@ from __future__ import annotations
 
 import threading
 
+from tfx_quant.telemetry import get_logger, log_info
+
+_logger = get_logger(__name__)
+
 
 class BackoffPolicy:
     """Exponential backoff with a hard attempt cap and a cancellation token.
@@ -61,6 +65,7 @@ class BackoffPolicy:
     def record_failure(self) -> None:
         """Call once per failed attempt, before requesting the next delay."""
         self._attempt += 1
+        log_info(_logger, "backoff_attempt_recorded", attempt=self._attempt)
 
     def next_delay_seconds(self) -> float:
         """The delay to wait before the next attempt.
@@ -73,10 +78,16 @@ class BackoffPolicy:
                 f"(max_attempts={self._max_attempts})"
             )
         delay = self._base_delay_seconds * (self._multiplier ** (self._attempt - 1))
-        return min(delay, self._max_delay_seconds)
+        delay = min(delay, self._max_delay_seconds)
+        # No jitter: this policy is purely deterministic (see class docstring's exact
+        # formula) — a caller logging the implementation prompt's "jitter" field
+        # accurately reports 0.
+        log_info(_logger, "backoff_delay_computed", attempt=self._attempt, delay_seconds=delay)
+        return delay
 
     def cancel(self) -> None:
         self._cancel_event.set()
+        log_info(_logger, "backoff_cancelled", attempt=self._attempt)
 
     def reset(self) -> None:
         """Call after a successful attempt to reset attempt count for future use."""

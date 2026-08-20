@@ -60,6 +60,9 @@ from tfx_quant.domain.instrument_master import InstrumentMasterEntry
 from tfx_quant.domain.money import Price
 from tfx_quant.domain.timestamp import Timestamp
 from tfx_quant.domain.trading_calendar import TradingCalendar
+from tfx_quant.telemetry import get_logger, log_debug, log_error, log_info, log_warning
+
+_logger = get_logger(__name__)
 
 _MAX_QUERY_SPAN_DAYS = 5
 """60分k 単次查詢限制 per the GetKLine docs' own K線種類查詢限制 table."""
@@ -163,6 +166,12 @@ class BarHistoryBackfillService:
     def _backfill_once(self, account: TradingAccount, active: _Active) -> None:
         entry = self._instrument_master.get(active.instrument, active.contract)
         if entry is None:
+            log_warning(
+                _logger,
+                "bar_backfill_skipped_no_master_entry",
+                instrument=active.instrument.value,
+                contract=active.contract.code,
+            )
             return
 
         now = self._clock.now()
@@ -178,6 +187,17 @@ class BarHistoryBackfillService:
         covered_days = {record.trading_day for record in existing}
         trading_days = self._calendar.trading_days_between(window_start, window_end)
         missing_days = [d for d in trading_days if d not in covered_days]
+        log_info(
+            _logger,
+            "bar_backfill_started",
+            instrument=active.instrument.value,
+            contract=active.contract.code,
+            vendor_symbol=entry.vendor_symbol,
+            window_start=window_start.isoformat(),
+            window_end=window_end.isoformat(),
+            local_covered_day_count=len(covered_days),
+            missing_day_count=len(missing_days),
+        )
 
         filled_days: set[date] = set()
         chunks = chunk_consecutive_days(missing_days, self._max_query_span_days)
@@ -189,14 +209,45 @@ class BarHistoryBackfillService:
                     start_date=chunk_start,
                     end_date=chunk_end,
                 )
-            except HistoricalPriceQueryError:
+            except HistoricalPriceQueryError as exc:
                 # Leave this chunk as a gap — retried, if at all, on the next trigger
                 # (a fresh reconnect or contract switch), never looped synchronously.
+                log_warning(
+                    _logger,
+                    "bar_backfill_chunk_query_failed",
+                    instrument=active.instrument.value,
+                    contract=active.contract.code,
+                    chunk_start=chunk_start.isoformat(),
+                    chunk_end=chunk_end.isoformat(),
+                    error=str(exc),
+                    gap_left_unfilled=True,
+                )
                 _time.sleep(self._min_query_interval_seconds)
                 continue
-            filled_days |= self._write_vendor_bars(active, entry, vendor_bars)
+            written = self._write_vendor_bars(active, entry, vendor_bars)
+            log_info(
+                _logger,
+                "bar_backfill_chunk_completed",
+                instrument=active.instrument.value,
+                contract=active.contract.code,
+                chunk_start=chunk_start.isoformat(),
+                chunk_end=chunk_end.isoformat(),
+                source="vendor_kline",
+                fetched_count=len(vendor_bars),
+                written_day_count=len(written),
+            )
+            filled_days |= written
             _time.sleep(self._min_query_interval_seconds)
 
+        log_info(
+            _logger,
+            "bar_backfill_completed",
+            instrument=active.instrument.value,
+            contract=active.contract.code,
+            requested_day_count=len(missing_days),
+            filled_day_count=len(filled_days),
+            warm_up_allowed=len(filled_days) > 0 or len(missing_days) == 0,
+        )
         self._event_bus.publish(
             BarBackfillCompleted(
                 at=self._clock.now(),
@@ -225,16 +276,38 @@ class BarHistoryBackfillService:
     ) -> date | None:
         try:
             open_ts = Timestamp(vendor_bar.at)
-        except DomainError:
+        except DomainError as exc:
+            log_debug(
+                _logger,
+                "bar_backfill_row_dropped_malformed_timestamp",
+                instrument=active.instrument.value,
+                contract=active.contract.code,
+                vendor_at=str(vendor_bar.at),
+                error=str(exc),
+            )
             return None  # malformed vendor timestamp — never fabricated, left as a gap
         boundary = self._calendar.boundary_for_open(open_ts, entry)
         if boundary is None:
             # Off-grid vendor timestamp (or the open-label assumption is wrong for this
             # push) — never snapped or guessed at, left as an unresolved gap.
+            log_debug(
+                _logger,
+                "bar_backfill_row_dropped_off_grid",
+                instrument=active.instrument.value,
+                contract=active.contract.code,
+                vendor_open_at=open_ts.value.isoformat(),
+            )
             return None
         boundary_open, boundary_close = boundary
         context = self._calendar.session_context_for(boundary_open, entry)
         if context is None:
+            log_debug(
+                _logger,
+                "bar_backfill_row_dropped_no_session_context",
+                instrument=active.instrument.value,
+                contract=active.contract.code,
+                boundary_open=boundary_open.value.isoformat(),
+            )
             return None
         trading_day, session = context
 
@@ -250,7 +323,15 @@ class BarHistoryBackfillService:
                 start=boundary_open,
                 end=boundary_close,
             )
-        except DomainError:
+        except DomainError as exc:
+            log_debug(
+                _logger,
+                "bar_backfill_row_dropped_invalid_ohlcv",
+                instrument=active.instrument.value,
+                contract=active.contract.code,
+                boundary_open=boundary_open.value.isoformat(),
+                error=str(exc),
+            )
             return None
 
         now = self._clock.now()
@@ -265,7 +346,23 @@ class BarHistoryBackfillService:
             updated_at=now,
         )
         try:
-            self._bar_record_repository.upsert_closed_bar(record)
-        except BarUpsertRepositoryError:
+            outcome = self._bar_record_repository.upsert_closed_bar(record)
+        except BarUpsertRepositoryError as exc:
+            log_error(
+                _logger,
+                "bar_backfill_row_write_failed",
+                instrument=active.instrument.value,
+                contract=active.contract.code,
+                trading_day=trading_day.isoformat(),
+                error=str(exc),
+            )
             return None
+        log_debug(
+            _logger,
+            "bar_backfill_row_write_result",
+            instrument=active.instrument.value,
+            contract=active.contract.code,
+            trading_day=trading_day.isoformat(),
+            outcome=outcome.value,
+        )
         return trading_day

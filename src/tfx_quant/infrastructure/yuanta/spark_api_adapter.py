@@ -15,6 +15,7 @@ unit-test coverage via a fake `SparkAdapterPort`, independent of this file.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 from datetime import date
 from typing import Any
@@ -25,6 +26,9 @@ from tfx_quant.infrastructure.yuanta.credentials import BrokerCredentials
 from tfx_quant.infrastructure.yuanta.errors import MarketDataSubscriptionError, YuantaSessionError
 from tfx_quant.infrastructure.yuanta.session_orchestrator import BrokerSessionOrchestrator
 from tfx_quant.infrastructure.yuanta.spark_client import SparkApiClient
+from tfx_quant.telemetry import get_logger, log_debug, log_error, log_info
+
+_logger = get_logger(__name__)
 
 KLineResponseHandler = Callable[[Any], None]
 """Receives the raw `KLineResult` .NET object from `OnResponse` — narrowed to typed
@@ -74,9 +78,21 @@ class SparkApiSessionAdapter:
         self, credentials: BrokerCredentials, *, generation: int, environment: Environment
     ) -> None:
         self._generation = generation
+        log_info(
+            _logger,
+            "spark_client_open_started",
+            generation=generation,
+            environment=environment.value,
+        )
         try:
             self._client = SparkApiClient()
         except Exception as exc:  # pragma: no cover - needs real .NET 8 SDK/DLL
+            log_error(
+                _logger,
+                "spark_client_open_failed",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
             raise YuantaSessionError(
                 f"無法初始化元大 SPARK API 元件：{exc}。"
                 "請確認已安裝 .NET 8 SDK 且 YuantaSparkAPI 元件檔案存在。"
@@ -88,12 +104,14 @@ class SparkApiSessionAdapter:
     def disconnect(self) -> None:
         if self._client is None:
             return
+        log_info(_logger, "spark_client_disconnect_started")
         try:
             self._client.logout()
             self._client.close()
         finally:
             self._client.dispose()
             self._client = None
+            log_info(_logger, "spark_client_disconnect_completed")
 
     def query_real_report(self, account: TradingAccount) -> None:
         assert self._client is not None
@@ -140,6 +158,14 @@ class SparkApiSessionAdapter:
         內部 DTO"."""
         assert self._orchestrator is not None
         generation = self._generation
+        log_debug(
+            _logger,
+            "callback_received",
+            callback_type=str_index,
+            int_mark=int_mark,
+            source_thread=threading.current_thread().name,
+            generation=generation,
+        )
 
         if int_mark == 1:  # 查詢回應資訊 (query response)
             if str_index == "Login":
@@ -163,27 +189,46 @@ class SparkApiSessionAdapter:
             return
 
     def _handle_login_response(self, generation: int, login_result: Any) -> None:
-        status = login_result.LoginStatus
-        msg_code = str(status.MsgCode)
-        msg_content = str(status.MsgContent)
-        entries = tuple(
-            (str(item.Account), str(item.Name), str(item.InvestorID), str(item.SellerNo))
-            for item in login_result.LoginList
-        )
+        try:
+            status = login_result.LoginStatus
+            msg_code = str(status.MsgCode)
+            msg_content = str(status.MsgContent)
+            entries = tuple(
+                (str(item.Account), str(item.Name), str(item.InvestorID), str(item.SellerNo))
+                for item in login_result.LoginList
+            )
+        except AttributeError as exc:
+            log_error(
+                _logger,
+                "callback_dto_conversion_failed",
+                callback_type="Login",
+                error=str(exc),
+            )
+            raise
+        log_debug(_logger, "callback_dto_conversion_succeeded", callback_type="Login")
         assert self._orchestrator is not None
         self._orchestrator.handle_login_result(generation, msg_code, msg_content, entries)
 
     def _handle_stock_tick_push(self, generation: int, tick_result: Any) -> None:
-        time_obj = tick_result.Time
+        try:
+            time_obj = tick_result.Time
+            stk_code = str(tick_result.StkCode)
+            serial_no = int(tick_result.SerialNo)
+            deal_price = tick_result.DealPrice
+            deal_vol = tick_result.DealVol
+            hour = int(time_obj.bytHour)
+            minute = int(time_obj.bytMin)
+            second = int(time_obj.bytSec)
+            millisecond = int(time_obj.ushtMSec)
+        except AttributeError as exc:
+            log_error(
+                _logger,
+                "callback_dto_conversion_failed",
+                callback_type="SubscribeStockTick",
+                error=str(exc),
+            )
+            raise
         assert self._orchestrator is not None
         self._orchestrator.handle_market_data_push(
-            generation,
-            str(tick_result.StkCode),
-            int(tick_result.SerialNo),
-            tick_result.DealPrice,
-            tick_result.DealVol,
-            int(time_obj.bytHour),
-            int(time_obj.bytMin),
-            int(time_obj.bytSec),
-            int(time_obj.ushtMSec),
+            generation, stk_code, serial_no, deal_price, deal_vol, hour, minute, second, millisecond
         )

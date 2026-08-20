@@ -52,6 +52,9 @@ from tfx_quant.infrastructure.yuanta.preflight import raise_if_any_failed, run_p
 from tfx_quant.infrastructure.yuanta.session_orchestrator import BrokerSessionOrchestrator
 from tfx_quant.persistence.sqlite_bar_record_repository import SqliteBarRecordRepository
 from tfx_quant.persistence.sqlite_connection import create_connection
+from tfx_quant.telemetry import get_logger, log_error, log_info
+
+_logger = get_logger(__name__)
 
 _DEFAULT_INSTRUMENT_MASTER_PATH = (
     Path(__file__).resolve().parents[1]
@@ -84,8 +87,31 @@ class ServiceContainer:
 
 
 def load_settings(path: Path) -> TradingSettings:
+    log_info(_logger, "settings_load_requested", settings_path=str(path))
     raw = json.loads(path.read_text(encoding="utf-8"))
-    return validate_startup(raw)
+    try:
+        settings = validate_startup(raw)
+    except Exception as exc:
+        log_error(
+            _logger,
+            "settings_validation_failed",
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+        raise
+    log_info(
+        _logger,
+        "settings_validated",
+        environment=settings.environment.value,
+        selected_instrument=settings.selected_instrument.value,
+        contract_selection_mode=settings.contract_selection_mode.value,
+        use_mock=settings.use_mock,
+        max_net_lots=settings.max_net_lots,
+        instrument_master_path_configured=settings.instrument_master_path is not None,
+        trading_calendar_path_configured=settings.trading_calendar_path is not None,
+        market_data_db_path_configured=settings.market_data_db_path is not None,
+    )
+    return settings
 
 
 def _resolve_instrument_master_path(settings: TradingSettings) -> Path:
@@ -113,6 +139,7 @@ def _resolve_market_data_db_path(settings: TradingSettings) -> Path:
 
 
 def build_services(settings: TradingSettings) -> ServiceContainer:
+    log_info(_logger, "module_load_started", use_mock=settings.use_mock)
     clock: Clock = SystemClock()
     id_generator: IdGenerator = UuidIdGenerator()
     event_coordinator = EventCoordinator()
@@ -123,8 +150,14 @@ def build_services(settings: TradingSettings) -> ServiceContainer:
     trading_calendar: TradingCalendarRepository = JsonTradingCalendarRepository(
         _resolve_trading_calendar_path(settings)
     )
-    market_data_connection = create_connection(
-        _resolve_market_data_db_path(settings), check_same_thread=False
+    market_data_db_path = _resolve_market_data_db_path(settings)
+    market_data_connection = create_connection(market_data_db_path, check_same_thread=False)
+    log_info(
+        _logger,
+        "module_loaded",
+        module="market_data_db",
+        path_configured=settings.market_data_db_path is not None,
+        path_basename=market_data_db_path.name,
     )
     bar_record_repository = SqliteBarRecordRepository(market_data_connection)
     market_data_bar_service = MarketDataBarService(
@@ -141,12 +174,15 @@ def build_services(settings: TradingSettings) -> ServiceContainer:
     broker_session: IBrokerSession
     historical_price_query: HistoricalPriceQueryPort
     if settings.use_mock:
+        log_info(_logger, "module_loaded", module="broker_session", kind="mock")
         trade_gateway = MockTradeGateway()
         quote_gateway = MockQuoteGateway()
         broker_session = MockBrokerSession(event_publisher=event_coordinator)
         historical_price_query = MockHistoricalPriceQuery()
     else:
+        log_info(_logger, "preflight_checks_started")
         raise_if_any_failed(run_preflight_checks())
+        log_info(_logger, "preflight_checks_passed")
 
         # Imported lazily: this module pulls in pythonnet/CLR-hosting code that only
         # needs to exist for the real (non-mock) branch — see
@@ -171,6 +207,7 @@ def build_services(settings: TradingSettings) -> ServiceContainer:
         quote_gateway = BrokerSessionQuoteGatewayView(orchestrator, instrument_master)
         broker_session = orchestrator
         historical_price_query = SparkHistoricalPriceQueryAdapter(adapter)
+        log_info(_logger, "module_loaded", module="broker_session", kind="spark_api")
 
     instrument_selection = InstrumentSelectionService(
         strategy_state_machine=strategy_state_machine,
@@ -191,6 +228,7 @@ def build_services(settings: TradingSettings) -> ServiceContainer:
         historical_price_query=historical_price_query,
     )
 
+    log_info(_logger, "module_load_completed")
     return ServiceContainer(
         settings=settings,
         clock=clock,
@@ -229,3 +267,12 @@ def compute_readiness(services: ServiceContainer) -> list[tuple[str, bool]]:
             not services.market_data_bar_service.is_persistence_degraded(),
         ),
     ]
+
+
+def log_startup_readiness(services: ServiceContainer) -> None:
+    """Logs one `readiness_check_completed` event per row of `compute_readiness()`.
+    Called once at startup (see `desktop/__main__.py`) rather than from inside
+    `compute_readiness()` itself, which the UI also polls on every broker/market-data
+    event — logging there would be a per-tick firehose, not a startup snapshot."""
+    for label, ready in compute_readiness(services):
+        log_info(_logger, "readiness_check_completed", check_name=label, passed=ready)

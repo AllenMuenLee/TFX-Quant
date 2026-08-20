@@ -20,6 +20,11 @@ import os
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from tfx_quant.telemetry import get_logger, log_info
+from tfx_quant.telemetry.masking import mask_account
+
+_logger = get_logger(__name__)
+
 _PREFS_FILENAME = "login_prefs.json"
 
 
@@ -66,6 +71,14 @@ def save_remembered_user_id(user_id: str | None) -> None:
     """`None` clears the remembered ID — the login screen calls this when the operator
     unchecks "記住歸戶 ID"."""
     _save(replace(load(), remembered_user_id=user_id))
+    log_info(
+        _logger,
+        "login_preferences_saved",
+        field="remembered_user_id",
+        # Non-secret per this module's docstring, but masked anyway for consistency
+        # with every other ID/account field's logging policy.
+        value_masked=mask_account(user_id) if user_id is not None else None,
+    )
 
 
 def save_remembered_account_no(account_no: str | None) -> None:
@@ -73,3 +86,9 @@ def save_remembered_account_no(account_no: str | None) -> None:
     `desktop/readiness_frame.py`. Read back as `account_no_hint` on the next run's
     `BrokerSessionOrchestrator` construction (`desktop/composition.py`)."""
     _save(replace(load(), remembered_account_no=account_no))
+    log_info(
+        _logger,
+        "login_preferences_saved",
+        field="remembered_account_no",
+        value_masked=mask_account(account_no) if account_no is not None else None,
+    )

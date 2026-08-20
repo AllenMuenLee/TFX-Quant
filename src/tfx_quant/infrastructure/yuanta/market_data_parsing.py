@@ -25,6 +25,9 @@ from decimal import Decimal, InvalidOperation
 
 from tfx_quant.domain.timestamp import TAIPEI_TZ
 from tfx_quant.infrastructure.yuanta.errors import MarketDataParseError
+from tfx_quant.telemetry import get_logger, log_debug
+
+_logger = get_logger(__name__)
 
 _SETTLEMENT_SENTINEL = -1
 
@@ -80,28 +83,34 @@ def parse_stock_tick_push(
     so this module stays pure-Python and independently testable, matching this
     codebase's existing split between vendor-callback glue and parsing logic.
     """
-    if not stk_code.strip():
-        raise MarketDataParseError("StockTickResult 的 StkCode 為空白")
+    try:
+        if not stk_code.strip():
+            raise MarketDataParseError("StockTickResult 的 StkCode 為空白")
 
-    serial_no_parsed = _parse_int(serial_no, label="SerialNo")
-    if serial_no_parsed == _SETTLEMENT_SENTINEL:
-        return None
-    if serial_no_parsed < 1:
-        raise MarketDataParseError(f"SerialNo 必須 >= 1（或 -1 代表清盤），得到 {serial_no_parsed}")
+        serial_no_parsed = _parse_int(serial_no, label="SerialNo")
+        if serial_no_parsed == _SETTLEMENT_SENTINEL:
+            return None
+        if serial_no_parsed < 1:
+            raise MarketDataParseError(
+                f"SerialNo 必須 >= 1（或 -1 代表清盤），得到 {serial_no_parsed}"
+            )
 
-    price = _parse_decimal(deal_price, label="DealPrice")
-    if price <= 0:
-        raise MarketDataParseError(f"DealPrice 必須為正數，得到 {deal_price!r}")
-    size = _parse_int(deal_vol, label="DealVol")
-    if size < 0:
-        raise MarketDataParseError(f"DealVol 必須 >= 0，得到 {size}")
+        price = _parse_decimal(deal_price, label="DealPrice")
+        if price <= 0:
+            raise MarketDataParseError(f"DealPrice 必須為正數，得到 {deal_price!r}")
+        size = _parse_int(deal_vol, label="DealVol")
+        if size < 0:
+            raise MarketDataParseError(f"DealVol 必須 >= 0，得到 {size}")
 
-    exchange_time = _parse_yuanta_time(
-        hour=_parse_int(hour, label="Time.bytHour"),
-        minute=_parse_int(minute, label="Time.bytMin"),
-        second=_parse_int(second, label="Time.bytSec"),
-        millisecond=_parse_int(millisecond, label="Time.ushtMSec"),
-    )
+        exchange_time = _parse_yuanta_time(
+            hour=_parse_int(hour, label="Time.bytHour"),
+            minute=_parse_int(minute, label="Time.bytMin"),
+            second=_parse_int(second, label="Time.bytSec"),
+            millisecond=_parse_int(millisecond, label="Time.ushtMSec"),
+        )
+    except MarketDataParseError as exc:
+        log_debug(_logger, "stock_tick_push_parse_failed", stk_code=stk_code, error=str(exc))
+        raise
 
     return ParsedStockTickPush(
         vendor_symbol=stk_code.strip(),
@@ -148,26 +157,30 @@ def parse_kline_bar(
     fabricate, only ever drop into an unresolved gap" policy for vendor data it can't
     trust."""
     try:
-        at = datetime(
-            _parse_int(year, label="TimeStamp.Year"),
-            _parse_int(month, label="TimeStamp.Month"),
-            _parse_int(day, label="TimeStamp.Day"),
-            _parse_int(hour, label="TimeStamp.Hour"),
-            _parse_int(minute, label="TimeStamp.Minute"),
-            _parse_int(second, label="TimeStamp.Second"),
-            tzinfo=TAIPEI_TZ,
-        )
-    except ValueError as exc:
-        raise MarketDataParseError(f"KLine.TimeStamp 數值超出範圍：{exc}") from exc
+        try:
+            at = datetime(
+                _parse_int(year, label="TimeStamp.Year"),
+                _parse_int(month, label="TimeStamp.Month"),
+                _parse_int(day, label="TimeStamp.Day"),
+                _parse_int(hour, label="TimeStamp.Hour"),
+                _parse_int(minute, label="TimeStamp.Minute"),
+                _parse_int(second, label="TimeStamp.Second"),
+                tzinfo=TAIPEI_TZ,
+            )
+        except ValueError as exc:
+            raise MarketDataParseError(f"KLine.TimeStamp 數值超出範圍：{exc}") from exc
 
-    open_ = _parse_decimal(open_price, label="OpenPrice")
-    high = _parse_decimal(high_price, label="HighPrice")
-    low = _parse_decimal(low_price, label="LowPrice")
-    close = _parse_decimal(close_price, label="ClosePrice")
-    if high < low:
-        raise MarketDataParseError(f"HighPrice ({high}) 小於 LowPrice ({low})")
-    volume = _parse_int(deal_vol, label="DealVol")
-    if volume < 0:
-        raise MarketDataParseError(f"DealVol 必須 >= 0，得到 {volume}")
+        open_ = _parse_decimal(open_price, label="OpenPrice")
+        high = _parse_decimal(high_price, label="HighPrice")
+        low = _parse_decimal(low_price, label="LowPrice")
+        close = _parse_decimal(close_price, label="ClosePrice")
+        if high < low:
+            raise MarketDataParseError(f"HighPrice ({high}) 小於 LowPrice ({low})")
+        volume = _parse_int(deal_vol, label="DealVol")
+        if volume < 0:
+            raise MarketDataParseError(f"DealVol 必須 >= 0，得到 {volume}")
+    except MarketDataParseError as exc:
+        log_debug(_logger, "kline_bar_parse_failed", error=str(exc))
+        raise
 
     return ParsedKLineBar(at=at, open=open_, high=high, low=low, close=close, volume=volume)

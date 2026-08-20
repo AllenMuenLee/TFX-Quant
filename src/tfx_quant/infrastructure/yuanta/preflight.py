@@ -18,6 +18,9 @@ import subprocess
 from dataclasses import dataclass
 
 from tfx_quant.infrastructure.yuanta.spark_client import default_dll_directory
+from tfx_quant.telemetry import get_logger, log_error, log_info
+
+_logger = get_logger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,12 +122,21 @@ def run_preflight_checks() -> list[PreflightCheck]:
     """Run every startup check and return all results (not just the first failure) —
     so `compute_readiness()`-style callers can show the operator everything to fix at
     once, per the implementation prompt's "回報可操作的中文錯誤"."""
-    return [
+    checks = [
         _check_pythonnet_importable(),
         _check_dotnet_sdk_available(),
         _check_dll_directory_present(),
         _check_keyring_importable(),
     ]
+    for check in checks:
+        log_info(
+            _logger,
+            "readiness_check_completed",
+            check_name=check.name,
+            passed=check.passed,
+            message=check.message,
+        )
+    return checks
 
 
 def raise_if_any_failed(checks: list[PreflightCheck]) -> None:
@@ -134,4 +146,10 @@ def raise_if_any_failed(checks: list[PreflightCheck]) -> None:
     if not failed:
         return
     lines = "\n".join(f"- {c.name}：{c.message}" for c in failed)
+    log_error(
+        _logger,
+        "preflight_checks_failed",
+        failed_check_names=[c.name for c in failed],
+        failed_count=len(failed),
+    )
     raise PreflightCheckFailed(f"啟動前檢查未通過，共 {len(failed)} 項：\n{lines}")

@@ -26,6 +26,9 @@ from tfx_quant.domain.money import Price
 from tfx_quant.domain.tick import Tick
 from tfx_quant.domain.timestamp import Timestamp
 from tfx_quant.domain.trading_calendar import TradingCalendar
+from tfx_quant.telemetry import get_logger, log_debug, log_info
+
+_logger = get_logger(__name__)
 
 
 @dataclass
@@ -40,6 +43,9 @@ class _FormingBar:
     """The boundary this bar will close at once reached — see `Bar`'s module docstring
     for the label(=open)/close(=end) semantics this mirrors."""
     last_serial_no: int
+    tick_count: int = 1
+    """Accepted ticks only — duplicate/out-of-order drops never increment this. Logged
+    on close as the bar's "tick count" (除錯日誌需求)."""
 
 
 class BarAggregator:
@@ -62,6 +68,15 @@ class BarAggregator:
 
     def on_tick(self, tick: Tick) -> list[Bar]:
         if self._last_closed_end is not None and tick.at.value < self._last_closed_end.value:
+            log_debug(
+                _logger,
+                "tick_dropped_late_for_closed_bar",
+                instrument=self._instrument.value,
+                contract=self._contract.code,
+                tick_serial_no=tick.serial_no,
+                tick_at=tick.at.value.isoformat(),
+                last_closed_end=self._last_closed_end.value.isoformat(),
+            )
             return []  # late arrival for an already-closed, final bar — dropped
 
         closed = self._advance_to(tick.at)
@@ -84,6 +99,14 @@ class BarAggregator:
             return closed
 
         if tick.serial_no <= self._forming.last_serial_no:
+            log_debug(
+                _logger,
+                "tick_dropped_duplicate_or_out_of_order",
+                instrument=self._instrument.value,
+                contract=self._contract.code,
+                tick_serial_no=tick.serial_no,
+                forming_last_serial_no=self._forming.last_serial_no,
+            )
             return closed  # duplicate / late / out-of-order within the current bar
 
         if tick.price.amount > self._forming.high.amount:
@@ -93,6 +116,7 @@ class BarAggregator:
         self._forming.close = tick.price
         self._forming.volume += tick.size
         self._forming.last_serial_no = tick.serial_no
+        self._forming.tick_count += 1
         return closed
 
     def on_clock(self, now: Timestamp) -> list[Bar]:
@@ -138,6 +162,21 @@ class BarAggregator:
         )
         self._last_closed_end = f.end
         self._forming = None
+        log_info(
+            _logger,
+            "bar_closed",
+            instrument=self._instrument.value,
+            contract=self._contract.code,
+            start=bar.start.value.isoformat(),
+            end=bar.end.value.isoformat(),
+            open=str(bar.open.amount),
+            high=str(bar.high.amount),
+            low=str(bar.low.amount),
+            close=str(bar.close.amount),
+            volume=bar.volume,
+            tick_count=f.tick_count,
+            candle_color=bar.candle_color.value,
+        )
         return bar
 
 
