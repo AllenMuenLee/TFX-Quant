@@ -16,6 +16,12 @@
 - 必要欄位不可空白；去除 ID 首尾空白但不得改寫密碼；禁止重複送出；連線中鎖定會改變登入語意的欄位。
 - UI 建立登入 request/credentials DTO 並交給 session/application service；UI 不得直接呼叫 OCX，domain/application 層不得依賴 wx、COM、keyring 或 Windows API。保留可注入的 `CredentialSource`。
 
+## 除錯日誌需求
+
+- 記錄 `login_form_opened`、欄位驗證結果、環境選擇、提交／防重複提交、登入結果、`AccList` 筆數、帳號選擇與憑證保存／清除結果；只記錄欄位是否提供及帳號遮罩。
+- 正式環境確認須記錄 user-action audit、確認時間與結果；不得記錄歸戶 ID 明文、完整帳號、密碼、憑證內容、控制項文字快照或 request 的敏感 `repr`。
+- 登入參數映射失敗須記錄 adapter 欄位名稱、文件版本／查閱日期、失敗階段與錯誤碼，但任何值在輸出前都必須通過敏感欄位遮蔽測試。
+
 ## 驗收
 
 - 環境與時段選擇會產生正確且經文件確認的 endpoint；一般使用者無須填 IP、port、`ReqType` 或 `SetMap`。

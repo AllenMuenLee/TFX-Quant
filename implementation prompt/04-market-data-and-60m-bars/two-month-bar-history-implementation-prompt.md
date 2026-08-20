@@ -22,6 +22,12 @@
 - UI 可依商品、契約及日期區間瀏覽資料，並顯示來源、完整性、最早與最晚可用時間；不足兩個月時必須明確提示。
 - 如果兩個月內的資料並沒有全部存在local的資料庫，用 https://www.yuanta.com.tw/file-repository/content/sparkapi_docs/%E8%A1%8C%E6%83%85/%E8%A1%8C%E6%83%85%E5%A0%B1%E5%83%B9%E8%A1%A8%E8%A8%82%E9%96%B1/index.html 的api查詢歷史價格，並且寫入local資料庫
 
+## 除錯日誌需求
+
+- 記錄 `bar_persist_requested/result`、bar identity、insert／upsert／duplicate／revision 判定、queue depth、重試次數、資料庫耗時及完整性狀態；不得在行情 callback 內同步輸出大量 payload。
+- 載入與缺口處理須記錄商品契約、查詢區間、本機／官方來源、取得筆數、去重數、gap／重疊／OHLCV 衝突及是否允許策略 warm-up；遠端能力不可用時明確記錄依據與保留 gap 的結果。
+- retention cleanup 須記錄 cutoff、限定條件、掃描／刪除筆數、transaction 結果及 audit ID；寫入或清理失敗須記錄 readiness degraded 與是否阻擋訊號。
+
 ## 驗收
 
 - 固定 clock 測試月底、跨年、閏年及不同月份天數的兩個曆月邊界，並驗證夜盤跨午夜的交易日與 session。

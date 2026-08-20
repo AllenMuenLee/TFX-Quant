@@ -22,6 +22,12 @@
 
 預設啟動後不得自動送單。只有 API 已登入、帳號確定、行情有效、委託查詢完成、持倉同步成功、無未知委託且使用者明確按下啟動時才可進入 `Running`。任何未捕捉例外應轉入安全暫停，而非繼續交易。
 
+## 除錯日誌需求
+
+- 啟動時以結構化事件記錄 `application_start`、設定驗證結果、Python／應用版本、模組載入、migration 版本及各 readiness check；敏感設定只記錄「存在／缺少」，不得記錄值。
+- 每次事件入列、出列、處理完成或失敗須含 event type、單調序號、correlation ID、來源 thread、queue depth、耗時及策略狀態轉移；非法轉移須記錄原狀態、目標狀態與拒絕原因。
+- 未捕捉例外須記錄 exception type、stack trace、受影響模組及進入 `PausedSafe` 的結果；不得記錄帳密、憑證或完整帳號。
+
 ## 交付與驗收
 
 - 可編譯的 solution、模組說明、ADR、範例設定與秘密管理說明。

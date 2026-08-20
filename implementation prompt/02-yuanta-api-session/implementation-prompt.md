@@ -23,6 +23,12 @@
 
 登入或初始化失敗時不得重複狂試；採有上限退避並允許取消。交易中 session 異常立即通知安全暫停模組。關閉程式時先停止策略與完成必要查詢，再取消訂閱及登出，不得在未知委託仍可能有效時宣稱安全關閉。
 
+## 除錯日誌需求
+
+- 記錄 `session_initialize`、`login_requested/result`、`account_list_received`、各 capability readiness、查詢／訂閱步驟、被動斷線與 `logout_result`，並含 session correlation ID、環境、耗時、官方錯誤碼及狀態轉移。
+- callback 須記錄 callback type、接收序號、來源 thread、到達時間、DTO 轉換結果及重複／亂序判定；帳號只可遮罩，帳密、憑證與原始敏感 payload 不得出現。
+- 重試須記錄 attempt、退避時間、jitter、觸發原因與停止原因；session-ready 失敗須逐項列出尚未就緒的登入、行情、交易、回報或查詢能力。
+
 ## 介面與驗收
 
 定義 `IBrokerSession` 與事件 DTO，使其可由模擬 adapter 取代。加入針對成功、逾時、錯誤碼、重複 callback、callback 亂序及中途斷線的測試。以 staging/mock 提供登入 smoke test；真實帳號測試必須是明確 opt-in，且預設禁止送單。

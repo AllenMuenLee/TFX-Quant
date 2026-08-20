@@ -26,6 +26,12 @@
 6. 手機 App 改倉觸發暫停；確認同步後採元大實際持倉、重置訊號並保持待人工重新啟動。
 7. 重複 bar、重複 callback、晚到成交與 crash recovery 不造成重複委託。
 
+## 除錯日誌需求
+
+- 每次模擬／回放記錄 scenario ID、fixture/version、random seed、虛擬 clock、速度、注入故障、事件序號及 simulator 狀態，使失敗可用同一輸入完全重現。
+- 模擬 broker 記錄收到的 request、排程的 ack/fill/query response、延遲、重複／亂序設定及斷線點；只使用假資料，並在每筆事件清楚標示 `simulation=true`。
+- 測試失敗輸出最後相關事件、狀態機轉移、未滿足 invariant、pending orders／events 與 correlation chain；coverage 或大量成功案例不得輸出無界逐 tick log。
+
 ## 品質門檻
 
 Domain/application 測試不得需要元大 DLL；關鍵狀態機採 property/state-transition tests，加入「最大曝險 ≤2」及「非 flat 不可反手」不變量。提供一鍵測試指令、測試資料說明、coverage 報告與一份可供客戶簽核的 UAT checklist。真實 API smoke test 必須獨立標記、預設跳過且預設禁止送單。

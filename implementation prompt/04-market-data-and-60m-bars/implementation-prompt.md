@@ -18,6 +18,12 @@
 - 定義紅 K 為 `close > open`、黑 K 為 `close < open`；十字 K `close == open` 必須中斷連續紅／黑計數。
 - 08:45、09:45 的已收 K 可供畫面顯示與計數規則測試，但建倉閘門不得放行；最早 10:45 才可判斷建倉。將確切 bar label/close-time 語意記錄清楚。
 
+## 除錯日誌需求
+
+- 行情診斷須以可設定的採樣／彙總方式記錄訂閱、首筆／末筆 tick、序號 gap、重複、亂序、stale 狀態與延遲；避免逐 tick 的 INFO log 阻塞 callback，必要逐筆資料只在受控 DEBUG 模式輸出。
+- 每根 K 棒記錄 identity、交易日／session、start/end、OHLCV、tick count、完整性、收盤原因及 `BarClosed` 發送序號；晚到 tick 須記錄其歸屬與採取的處置。
+- gap／重連重建須記錄資料來源、查詢範圍、重疊／衝突、連續性檢查及訊號是否被阻擋，時間同時保留 UTC 與 `Asia/Taipei`。
+
 ## 驗收
 
 使用固定 tick fixture 驗證 OHLCV、邊界 tick、亂序／重複 tick、午夜、重連補洞及十字 K。畫面可看到目前 forming bar、最近 closed bars、紅黑判斷、行情最後更新時間與 stale 狀態。資料 stale 時不得送出新委託。

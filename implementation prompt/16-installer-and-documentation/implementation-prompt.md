@@ -24,6 +24,12 @@
 - 策略規格：60 分 K 切點、紅黑定義、加碼歧義的最終選項、禁止建倉時間、反手 gate、每日重置。
 - 維護文件：架構、資料庫、設定、log、備份還原、API 版本矩陣、建置測試與故障排查。
 
+## 除錯日誌需求
+
+- installer／updater 記錄 package/app version、OS/architecture、前置檢查結果、元大 API readiness、權限、磁碟空間、每一步驟、exit code 與 rollback 結果；帳密、授權資料及完整使用者路徑須遮蔽。
+- build/release 記錄 source revision、鎖定依賴、工具版本、artifact checksum、簽章驗證及產物對應關係，讓客戶現場版本可與原始碼及 symbols 精確比對。
+- 文件須列出 log 位置、事件／correlation ID 查找方式、診斷包內容、各常見故障應擷取的事件及安全匯出步驟；診斷包預設排除憑證、秘密與完整帳號。
+
 ## 驗收
 
 在乾淨且符合條件的 Windows VM 完成安裝、首次啟動、mock UAT、升級與解除安裝。核對安裝檔、原始碼 tag、symbols、文件與 checksum 版本一致。安排交付演練：使用者能依 runbook 處理斷線、未知委託、手機 App 持倉差異及緊急平倉，且文件不得暗示軟體可取代券商端人工確認。

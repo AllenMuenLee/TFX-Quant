@@ -19,6 +19,12 @@
 - UI 顯示目前錯誤與歷史紀錄，可依時間、severity、商品、order/workflow ID 篩選。
 - 記錄使用者的啟動、暫停、停止、同步、緊急平倉及確認內容，但不記錄密碼／憑證／完整帳號。
 
+## 除錯日誌需求
+
+- 定義並文件化 DEBUG／INFO／WARNING／ERROR／CRITICAL 的使用準則、事件 schema、必要欄位、event-name catalog、correlation 傳播規則與 payload 版本；schema 驗證失敗本身也須可觀測。
+- 記錄 logger 啟動、sink readiness、queue depth、批次寫入耗時、輪替、保留清理、drop／sampling 數及 file/database sink 失敗；關鍵 audit 寫入失敗須有獨立告警與安全暫停事件。
+- 提供受控診斷模式以提高特定 workflow／order ID 的詳細度，須有自動到期與容量上限；測試證明密碼、token、完整帳號及敏感 exception/payload 在所有 sink、匯出與 stack trace 中皆被遮蔽。
+
 ## 驗收
 
 測試高頻行情下不阻塞交易佇列、檔案輪替、磁碟滿、資料庫鎖定、敏感欄位遮蔽、跨 thread 事件排序及 correlation chain。從一個反手案例的匯出紀錄應能完整追到 K 棒、策略意圖、平倉、零持倉確認與反向建倉。

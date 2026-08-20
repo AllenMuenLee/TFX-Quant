@@ -18,6 +18,12 @@
 - 支援 UI 篩選與 CSV/Excel-friendly UTF-8 BOM 匯出；匯出包含產生時間、時區、查詢期間及資料完整性警示。
 - 若成交回補不完整、費用未知或與券商查詢不符，數字標記 provisional，不得靜默顯示為最終值。
 
+## 除錯日誌需求
+
+- 成交入帳須記錄 fill ID、order correlation、去重結果、商品契約、方向、數量、價格、交易日、費稅資料完整性及 ledger transaction 結果；帳號只能遮罩。
+- 每次配對與損益計算記錄 matching method/version、參與 fill IDs、乘數、毛損益、費稅、淨損益、decimal rounding 規則及 provisional 原因，使數字可重算。
+- 報表查詢／匯出記錄期間、filter、資料筆數、完整性警示、產生時間、檔案結果與 reconciliation 差異；不得將個資或完整帳號寫入檔名或一般 log。
+
 ## 驗收
 
 用已知答案 fixture 測試多／空、1／2 口、部分成交、跨午夜、跨月、費稅、反手與重複回報。以數份匿名券商對帳範例做 reconciliation，記錄容許差異與原因。報表能下鑽到構成每筆損益的成交。
