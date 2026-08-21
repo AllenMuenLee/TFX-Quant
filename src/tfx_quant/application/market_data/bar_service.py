@@ -650,11 +650,22 @@ class MarketDataBarService:
         history "通過交易日曆與連續性檢查" and therefore safe for a future strategy
         engine to warm up signal state from. Any single missing boundary anywhere in
         the persisted history breaks the chain; only the tail run reaching the most
-        recently stored bar is ever returned."""
+        recently stored bar is ever returned.
+
+        A trading day with an unresolved yfinance-vs-local `BarConflictAudit` (see
+        `application.ports.bar_record_repository.BarRecordRepository.
+        record_conflict`) is treated as if none of its bars exist for this purpose —
+        the "阻擋該區段驅動訊號" requirement — which naturally breaks continuity there
+        without `continuous_segments()` itself needing any conflict awareness."""
         window_start = rolling_two_month_start(self._clock.now().value.date())
         records = self._bar_record_repository.list_recent(
             instrument, contract, BarPeriod.SIXTY_MINUTE, since_trading_day=window_start
         )
+        conflicted_days = self._bar_record_repository.list_conflicted_trading_days(
+            instrument, contract, BarPeriod.SIXTY_MINUTE, since_trading_day=window_start
+        )
+        if conflicted_days:
+            records = [r for r in records if r.trading_day not in conflicted_days]
         segments = continuous_segments(records)
         return segments[-1].bars if segments else ()
 

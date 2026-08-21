@@ -1,13 +1,13 @@
 # Feature 01 — Solution Foundation
 
-> **API 文件唯一來源：實作前必須直接讀取[元大 SPARK API 官方入口](https://www.yuanta.com.tw/file-repository/content/API/page/index.html)及其下方連結的 API 說明文件、範例、元件下載與換版資訊。不得使用專案內既有資料夾、舊 SDK 文件、舊範例或既有程式碼反推 API 規格；若與本 prompt 其他描述衝突，以官方線上文件當下內容為準。**
+> **API 文件唯一來源：實作前必須直接讀取專案根目錄 [`交易API元件及說明文件/`](../../交易API元件及說明文件/) 內的元大期貨交易 API 說明、Python 範例、元件與版本資訊。禁止使用 SPARK API 網站、舊 SPARK SDK、舊範例或既有 SPARK 程式碼反推 API；若與本 prompt 其他描述衝突，以該資料夾內文件為準。資料夾缺少、文件未明載或內容矛盾時，須停止相關實作並列為 blocker。市場價格、行情與 OHLCV 不屬於此交易 API 規格，一律使用 `yfinance`。**
 > **不得臆測：API 名稱、參數、回傳值、事件、錯誤碼、登入方式、環境、平台、位元數與能力都必須有上述官方文件依據；文件未明載者須標成待確認並隔離於 adapter，不得自行補造。**
 
 > 強制使用 Python 開發。建立 `pyproject.toml`、固定 Python 版本、虛擬環境、型別檢查、lint 與 pytest；不得以其他語言取代核心系統。
 
 ## 任務
 
-建立一個可在 Windows 長時間執行的 Python 元大期貨自動交易桌面程式骨架。依元大 SPARK API 官方線上文件選用其正式支援的 Python/Windows 元件與位元數，並將券商整合封裝在 Python adapter，不能讓 UI 或策略直接依賴券商物件。將查閱日期、元件版本、下載來源、平台／位元數選擇與部署方式記錄成 ADR。
+建立一個可在 Windows 長時間執行的 Python 元大期貨自動交易桌面程式骨架。依專案根目錄 `交易API元件及說明文件/` 選用其明載支援的 Python/Windows 元件與位元數，並將券商交易整合封裝在 Python adapter，不能讓 UI 或策略直接依賴券商物件。市場價格另由 yfinance adapter 提供。將文件檔名、查閱日期、元件版本、來源、平台／位元數選擇與部署方式記錄成 ADR。
 
 ## 必須實作
 

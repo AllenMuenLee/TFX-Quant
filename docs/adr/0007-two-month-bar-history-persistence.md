@@ -152,7 +152,17 @@ the window's start date at query time) computes `covers_full_window` as
 `earliest_at.date() <= window_start` — false for essentially all of the first two months
 of real use, which is the documented normal state, not an error condition.
 
-## Extension (2026-08-19): vendor `GetKLine` backfill for local gaps
+## Extension (2026-08-19): vendor `GetKLine` backfill for local gaps — SUPERSEDED 2026-08-21
+
+**Superseded in full by the "Extension (2026-08-21)" section below.** The implementation
+prompt was rewritten to require `yfinance` (a third-party data source) instead of the
+vendor's `GetKLine` — see that section for why and for the current design. This section
+is kept as a historical record of the reasoning that led to the vendor path being tried
+first (and why it was a stated, flagged product decision even at the time, not a
+confident integration) — none of the classes/ports/decisions numbered 11-14 below exist
+in the codebase any more (`BarHistoryBackfillService`, `BarDataSource`, and
+`domain/bar_history_backfill.py` all still exist under the same names, but rebuilt
+against `yfinance` instead — see the new section's decisions for their current shape).
 
 A second, later revision of the same implementation prompt added one more requirement:
 if the rolling two-month window isn't fully covered by what this process has recorded
@@ -234,6 +244,112 @@ call to reduce (not fully eliminate) a late-response-mismatch race. Mock mode
 result — mock mode has no vendor session to query, so every range simply stays a gap
 rather than inventing fake historical bars.
 
+## Extension (2026-08-21): `yfinance` backfill replaces vendor `GetKLine`
+
+The implementation prompt was rewritten (`implementation prompt/04-market-data-and-60m-
+bars/two-month-bar-history-implementation-prompt.md`) to require the third-party
+`yfinance` Python package as the backfill source instead of the vendor's `GetKLine` —
+the previous extension's own honesty caveats (unverified futures coverage, an explicit
+against-the-docs product decision) motivated the switch to a source this codebase can at
+least isolate cleanly and test without a real vendor login. `BarHistoryBackfillService`
+keeps its name and its "second, independent writer" role but is substantially rebuilt.
+
+### 15. Gap detection is bar-level, not day-level
+
+Unlike the superseded `GetKLine` path (which treated a trading day with *any* local bar
+as fully covered — cheaper, since the vendor call was per-calendar-date-range anyway),
+this implementation prompt explicitly requires gaps be computed "依預期交易時段與
+canonical bar identity". `BarHistoryBackfillService._expected_closed_boundaries()`
+enumerates every canonical 60-minute open-boundary the rolling window expects (via
+`TradingCalendar.bar_boundaries()` per session, per trading day — the day session and,
+where configured, the night session), excludes anything not yet closed as of `now`, and
+diffs the result against `BarRecordRepository.list_recent()`'s existing `bar.start`
+values. A day this process was only *partially* connected for (some hours aggregated
+live, others missing) is now correctly detected and backfilled hour-by-hour, not skipped
+wholesale.
+
+### 16. Ticker mapping is a new controlled port, deliberately shipped empty
+
+`application.ports.yahoo_ticker_mapping.YahooTickerMappingRepository` (backed by
+`infrastructure.market_data.yahoo_ticker_mapping_repository.
+JsonYahooTickerMappingRepository`, reading `yahoo_ticker_mapping.example.json`) mirrors
+`InstrumentMasterRepository`/`TradingCalendarRepository`'s "controlled JSON, never
+guessed" pattern. Unlike `futures_quote_symbol()` (a documented Yuanta encoding), no
+public spec maps a TAIFEX futures contract month to a Yahoo Finance ticker — and this
+session found no way to verify one exists at all (no live network path to Yahoo Finance
+from this sandboxed environment). The bundled example file's `mappings` array is
+therefore deliberately empty, not populated with an unverified guess: `get()` returning
+`None` makes `BarHistoryBackfillService` leave every bar for that contract as a gap and
+report `is_degraded()` — an honest "not configured yet" state, not a silent failure.
+
+### 17. `interval="1h"`, `auto_adjust=False`, and every other price-affecting kwarg pinned explicitly
+
+`infrastructure.market_data.yfinance_history_adapter.YfinanceHistoryQueryAdapter` reads
+directly off this environment's actually-installed `yfinance` package source (its own
+module docstring records exactly which file/line was read) rather than assumed API
+shape, per this project's "no third-party API may be invented" rule. `auto_adjust`
+genuinely defaults to `True` in the installed version — the opposite of what "預設使用未
+自動調整的價格" requires — so every `Ticker.history()` kwarg that affects price/behavior
+(`interval`, `auto_adjust`, `actions`, `prepost`, `repair`, `keepna`) is pinned in one
+explicit `_HISTORY_KWARGS` dict, never left to a package default.
+
+### 18. Boundary alignment, forming-bar rejection, and OHLCV validation are unchanged in spirit from the vendor path
+
+`TradingCalendar.boundary_for_open()` (generic — never renamed for this extension, since
+it was never actually vendor-specific) still requires an incoming bar's open timestamp to
+*exactly* match a canonical boundary; still nothing is snapped or guessed. New this
+extension: an explicit `boundary_close.value > now.value` check rejects a bar whose
+canonical close is still in the future relative to the backfill run's own clock — the
+"尚未收盤的最後一根 bar" handling the rewritten prompt calls out by name (the vendor path
+never needed this, since `GetKLine`'s vendor-side "已收盤" semantics were assumed to
+already exclude forming bars — an assumption this codebase has no way to verify for
+`yfinance` either, so the check is enforced locally instead of trusted from the source).
+
+### 19. Local-vs-yfinance OHLCV conflicts get a dedicated audit table and block warm-up for that trading day
+
+The rewritten prompt adds a requirement the vendor extension never had: "相同 identity 的
+OHLCV 若在本機與 yfinance 間衝突，保存衝突 audit 與兩方摘要...並阻擋該區段驅動訊號".
+`domain.bar_record.BarConflictAudit` (existing + incoming `BarRecord`, detected-at) is
+written via a new `BarRecordRepository.record_conflict()` method whenever
+`upsert_closed_bar()` returns `CONFLICT_REJECTED` — `SqliteBarRecordRepository` gets a new
+`bar_backfill_conflicts` table for it (append-only, mirrors `bar_record_revisions`'
+shape). Rather than teach `continuous_segments()` (a pure function with no repository
+access) about conflicts, `MarketDataBarService.continuous_warm_up_bars()` now also calls
+a new `list_conflicted_trading_days()` query and filters those days out of the record set
+*before* computing continuity — a conflicted day is treated as if none of its bars exist
+for warm-up purposes, which naturally breaks the continuity chain there without changing
+`continuous_segments()`'s own contract at all. Because gap detection is bar-level
+(decision 15) but the backfill service still queries/writes with a small ±1-day pad
+around each missing-day chunk (the prompt's own "允許為了 API 邊界與連續性檢查在缺口兩側
+多取少量資料" allowance), a day that already has full local coverage can still be
+re-queried at a chunk boundary — which is precisely how a real conflict would ever be
+discovered in the first place, not a wasted query.
+
+### 20. Bounded retry/backoff lives in the adapter, not the service; unknown errors fail fast, never loop forever
+
+`YfinanceHistoryQueryAdapter._run_with_bounded_retry()` retries only a best-effort set of
+transient-failure types (`ConnectionError`/`TimeoutError`/`OSError`/
+`yfinance.exceptions.YFRateLimitError`/`requests.exceptions.RequestException` — imported
+defensively, since this exact exception hierarchy has never been exercised against a real
+Yahoo Finance endpoint from this environment either) with capped exponential backoff; any
+other exception is wrapped into `YahooHistoryQueryError` and raised immediately, no
+retry. `BarHistoryBackfillService` itself never retries a failed chunk synchronously —
+same "leave it as a gap, retried only on the next trigger" posture the superseded vendor
+path already established (decision 13 there).
+
+### 21. Trigger points: startup/reconnect (`BrokerSessionReady`), switch (`InstrumentSwitchCompleted`), and now also daily rollover
+
+The rewritten prompt lists a fourth trigger the vendor-path version didn't implement
+explicitly: "每日交易日切換". `BarHistoryBackfillService` gained its own `start()`/`stop()`
+lifecycle and a small internal timer (mirroring `MarketDataBarService`'s daily-retention-
+check shape) — `on_clock_tick()` re-triggers a run whenever the wall-clock *date* has
+changed since the last run, same wall-clock-date approximation of "trading-day rollover"
+ADR decision 7 already accepted for retention cleanup. `yfinance` needs no account/login
+at all (public data), so — unlike the vendor path, which used `BrokerSessionReady` to
+learn the `TradingAccount` a `GetKLine` call required — this trigger exists purely to
+re-check gaps after a Yuanta reconnect, not because the backfill itself needs anything
+from the broker session.
+
 ## Consequences
 
 - Production deployment needs a real, writable per-user data directory for
@@ -246,20 +362,37 @@ rather than inventing fake historical bars.
 - Feature 05 (strategy signal engine) is expected to call
   `MarketDataBarService.continuous_warm_up_bars()` for entry-gate warm-up, not
   `recent_closed_bars()`/`list_recent()` directly, so it only ever sees a bar sequence
-  already verified gap-free.
+  already verified gap-free (which now also excludes any trading day with an unresolved
+  yfinance conflict — see the 2026-08-21 extension's decision 19).
 - No repair/correction UI exists yet — `apply_correction()` is repository-layer-complete
   and tested, but nothing in this codebase calls it. A future repair feature should
-  reuse it rather than adding a second way to revise a stored bar.
+  reuse it rather than adding a second way to revise a stored bar. The same is true of
+  the new `bar_backfill_conflicts` audit table — it is written to and queried from, but
+  no UI surfaces its contents beyond the readiness screen's pass/fail row yet.
 - The retention sweep's "daily" trigger is wall-clock-date-based, not
   trading-calendar-aware; this is a deliberate simplification (see decision 7) — don't
   "fix" it into a trading-day-boundary-precise trigger without a concrete reason, since
   the prompt's own tolerance here is coarse (bars, not deletion timing, are what must be
-  boundary-exact).
-- The `GetKLine` backfill path (decisions 11–14) has never been exercised against a real
-  vendor login (no .NET 8 SDK/DLL available in this environment — same honest status the
-  rest of the SPARK API rewrite carries, see `[[yuanta-spark-api-pivot]]`). Whether the
-  vendor actually returns futures data for `MarketType=TAIFEX`, an empty result, or an
-  outright rejection is unverified; whether `KLine.TimeStamp` is really an open-time label
-  is likewise unverified (decision 12). Treat this as a solid, docs-faithful first draft
-  that degrades safely to "nothing filled, gaps stay gaps" if either assumption is wrong —
-  not as a confirmed working integration — until someone with real credentials runs it.
+  boundary-exact). `BarHistoryBackfillService`'s new daily-rollover trigger makes the
+  same simplification for the same reason.
+- **No confirmed Yahoo Finance ticker exists for any TAIFEX futures contract as of this
+  writing.** The bundled `yahoo_ticker_mapping.example.json` ships with an empty
+  `mappings` array, so a fresh install's backfill will find nothing to query and report
+  `is_degraded()` until an operator supplies a real, individually-confirmed mapping —
+  this is the expected, honest state, not a bug to silently work around by guessing a
+  ticker or substituting a continuous-contract alias.
+- The `yfinance` adapter (decisions 11–17 above) has never been exercised against a real
+  Yahoo Finance HTTP endpoint from this environment (no live network path to Yahoo
+  Finance available here), and this specific Python virtual environment cannot even
+  `import pandas`/`import yfinance` at all (a 32-bit interpreter with a `pandas`/`numpy`
+  binary-wheel ABI mismatch — see `infrastructure/market_data/
+  yfinance_history_adapter.py`'s own docstring). Every parameter/behavior claim in this
+  adapter was verified by reading the actually-installed `yfinance` package's source
+  directly (not assumed from memory), and its `pandas`-independent logic (row-level
+  parsing/validation, the retry/backoff loop) is unit-tested; the `pandas.DataFrame`-
+  shaped normalization path (`_normalize_dataframe`) is not exercised in this
+  environment and is explicitly marked skipped, not silently omitted, in
+  `tests/infrastructure/test_yfinance_history_adapter.py`. Treat this as a solid,
+  source-faithful first draft that degrades safely to "nothing filled, gaps stay gaps"
+  if any assumption about `yfinance`'s real HTTP behavior is wrong — not as a confirmed
+  working integration — until someone with real network access runs it end-to-end.

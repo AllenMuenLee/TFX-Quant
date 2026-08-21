@@ -27,7 +27,13 @@ from tfx_quant.application.ports.bar_record_repository import (
 )
 from tfx_quant.domain.account import TradingAccount
 from tfx_quant.domain.bar import Bar, CandleColor
-from tfx_quant.domain.bar_record import BarDataSource, BarPeriod, BarRecord, MarketSession
+from tfx_quant.domain.bar_record import (
+    BarConflictAudit,
+    BarDataSource,
+    BarPeriod,
+    BarRecord,
+    MarketSession,
+)
 from tfx_quant.domain.contract import ContractMonth
 from tfx_quant.domain.instrument import Instrument
 from tfx_quant.domain.instrument_master import InstrumentMasterEntry
@@ -142,6 +148,7 @@ class FakeBarRecordRepository:
         self._rows: dict[tuple[Instrument, ContractMonth, BarPeriod, Timestamp], BarRecord] = {}
         self.fail_writes_remaining = 0
         self.delete_before_calls: list[date] = []
+        self.conflicts: list[BarConflictAudit] = []
 
     def all_records(self) -> list[BarRecord]:
         return sorted(self._rows.values(), key=lambda r: r.bar.start.value)
@@ -174,6 +181,11 @@ class FakeBarRecordRepository:
             updated_at=record.updated_at,
             revision=existing.revision + 1,
         )
+
+    def get_one(
+        self, instrument: Instrument, contract: ContractMonth, period: BarPeriod, start: Timestamp
+    ) -> BarRecord | None:
+        return self._rows.get((instrument, contract, period, start))
 
     def list_recent(
         self,
@@ -232,6 +244,26 @@ class FakeBarRecordRepository:
             cutoff_trading_day=cutoff_trading_day,
             deleted_count=before - len(self._rows),
             ran_at=ran_at,
+        )
+
+    def record_conflict(self, audit: BarConflictAudit) -> None:
+        self.conflicts.append(audit)
+
+    def list_conflicted_trading_days(
+        self,
+        instrument: Instrument,
+        contract: ContractMonth,
+        period: BarPeriod,
+        *,
+        since_trading_day: date,
+    ) -> frozenset[date]:
+        return frozenset(
+            audit.incoming.trading_day
+            for audit in self.conflicts
+            if audit.incoming.bar.instrument == instrument
+            and audit.incoming.bar.contract == contract
+            and audit.incoming.period == period
+            and audit.incoming.trading_day >= since_trading_day
         )
 
 
@@ -587,6 +619,47 @@ def test_continuous_warm_up_bars_returns_only_the_tail_gap_free_segment() -> Non
 
     tail = service.continuous_warm_up_bars(_INSTRUMENT, _CONTRACT)
     assert list(tail) == [bar1, bar2]
+
+
+def test_continuous_warm_up_bars_excludes_a_conflicted_trading_day() -> None:
+    """A day with an unresolved yfinance-vs-local `BarConflictAudit` must be treated as
+    if none of its bars exist for warm-up purposes — the "阻擋該區段驅動訊號"
+    requirement (see docs/adr/0007's yfinance extension decision)."""
+    repo = FakeBarRecordRepository()
+    bar1 = _insert_record(repo, _ts(8, 45), _ts(9, 45), open_="17400", close="17450")
+    _insert_record(repo, _ts(9, 45), _ts(10, 45), open_="17450", close="17500")
+    service, _bus, _clock = _build(now=_ts(11, 0), bar_record_repository=repo)
+
+    existing_record = next(r for r in repo.all_records() if r.bar.start == bar1.start)
+    conflicting_bar = Bar(
+        instrument=_INSTRUMENT,
+        contract=_CONTRACT,
+        open=Price(Decimal("17999")),
+        high=Price(Decimal("17999")),
+        low=Price(Decimal("17999")),
+        close=Price(Decimal("17999")),
+        volume=1,
+        start=bar1.start,
+        end=bar1.end,
+    )
+    conflicting_record = BarRecord(
+        bar=conflicting_bar,
+        period=BarPeriod.SIXTY_MINUTE,
+        trading_day=bar1.start.value.date(),
+        session=MarketSession.DAY,
+        source=BarDataSource.BACKFILLED_FROM_YFINANCE,
+        is_gap_recovery=False,
+        created_at=bar1.start,
+        updated_at=bar1.start,
+    )
+    repo.record_conflict(
+        BarConflictAudit(
+            existing=existing_record, incoming=conflicting_record, detected_at=_ts(11, 0)
+        )
+    )
+
+    tail = service.continuous_warm_up_bars(_INSTRUMENT, _CONTRACT)
+    assert tail == ()
 
 
 def test_recorded_range_none_when_nothing_persisted() -> None:

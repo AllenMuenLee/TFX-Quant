@@ -24,13 +24,17 @@ from tfx_quant.application.events.events import (
     BrokerLoggedOut,
     BrokerLoginSucceeded,
     BrokerSessionReady,
+    ChannelHealthChanged,
+    ConnectivityReconciled,
     InstrumentSwitchCompleted,
     MarketDataFreshnessChanged,
     MarketDataGapCleared,
     MarketDataGapDetected,
     MarketDataTickReceived,
+    SafePauseTriggered,
 )
 from tfx_quant.desktop.composition import ServiceContainer, compute_readiness
+from tfx_quant.desktop.connectivity_panel import ConnectivityPanel
 from tfx_quant.desktop.instrument_selection_panel import InstrumentSelectionPanel
 from tfx_quant.desktop.login_dialog import LoginDialog
 from tfx_quant.desktop.market_data_panel import MarketDataPanel
@@ -96,6 +100,10 @@ class ReadinessFrame(wx.Frame):
 
         self._market_data_panel = MarketDataPanel(self._panel, services)
         self._sizer.Add(self._market_data_panel, 0, wx.EXPAND | wx.ALL, 6)
+        self._sizer.Add(wx.StaticLine(self._panel), 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+
+        self._connectivity_panel = ConnectivityPanel(self._panel, services)
+        self._sizer.Add(self._connectivity_panel, 0, wx.EXPAND | wx.ALL, 6)
 
         self._panel.SetSizer(self._sizer)
         self._refresh()
@@ -112,6 +120,9 @@ class ReadinessFrame(wx.Frame):
             services.event_coordinator.subscribe(MarketDataFreshnessChanged, self._on_broker_event),
             services.event_coordinator.subscribe(MarketDataGapDetected, self._on_broker_event),
             services.event_coordinator.subscribe(MarketDataGapCleared, self._on_broker_event),
+            services.event_coordinator.subscribe(ChannelHealthChanged, self._on_broker_event),
+            services.event_coordinator.subscribe(SafePauseTriggered, self._on_broker_event),
+            services.event_coordinator.subscribe(ConnectivityReconciled, self._on_broker_event),
         ]
         self.Bind(wx.EVT_CLOSE, self._on_close)
 
@@ -165,6 +176,7 @@ class ReadinessFrame(wx.Frame):
 
         self._instrument_selection_panel.refresh()
         self._market_data_panel.refresh()
+        self._connectivity_panel.refresh()
 
         self._sizer.Layout()
         self._panel.SetSizerAndFit(self._sizer)

@@ -66,6 +66,14 @@ class TradingSettings(BaseModel):
     holiday dates are a best-effort web-search seed, not yet confirmed against TAIFEX's
     official calendar (see `infrastructure/market_data/trading_calendar.example.json`'s
     own warning)."""
+    yahoo_ticker_mapping_path: str | None = None
+    """Path to the controlled 內部商品／契約 -> Yahoo ticker JSON file (see
+    `application.ports.yahoo_ticker_mapping`). `None` falls back to the bundled
+    example/seed file, whose `mappings` array is deliberately empty — no confirmed
+    Yahoo Finance ticker for any TAIFEX futures contract has been verified (see
+    `infrastructure/market_data/yahoo_ticker_mapping.example.json`'s own warning), so
+    the yfinance backfill simply finds nothing to query until an operator supplies a
+    real, confirmed mapping."""
     market_data_db_path: str | None = None
     """Path to the SQLite database file this software persists its own self-aggregated
     two-month 60-minute bar history to (see `application.ports.bar_record_repository`

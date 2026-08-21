@@ -374,7 +374,13 @@ class LoginDialog(wx.Dialog):
             self.EndModal(wx.ID_OK)
 
     def _on_login_failed(self, event: BrokerLoginFailed) -> None:
-        log_warning(_logger, "login_result", succeeded=False, retriable=event.retriable)
+        # `event.reason` is the only place this text previously reached — the wx
+        # StaticText it's shown in wraps at a fixed width and can visually truncate a
+        # long vendor message. Logging it here means the full text always lands in the
+        # terminal (telemetry's StreamHandler) and tfx_quant.log too, not just the UI.
+        log_warning(
+            _logger, "login_result", succeeded=False, retriable=event.retriable, reason=event.reason
+        )
         wx.CallAfter(self._handle_terminal_failure, f"登入失敗：{event.reason}")
 
     def _on_login_timed_out(self, _event: BrokerLoginTimedOut) -> None:

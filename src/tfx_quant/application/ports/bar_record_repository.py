@@ -13,7 +13,7 @@ from datetime import date
 from enum import StrEnum
 from typing import Protocol
 
-from tfx_quant.domain.bar_record import BarPeriod, BarRecord
+from tfx_quant.domain.bar_record import BarConflictAudit, BarPeriod, BarRecord
 from tfx_quant.domain.contract import ContractMonth
 from tfx_quant.domain.instrument import Instrument
 from tfx_quant.domain.timestamp import Timestamp
@@ -87,6 +87,17 @@ class BarRecordRepository(Protocol):
         `BarRecordNotFoundError` if no row exists for `record.identity`."""
         ...
 
+    def get_one(
+        self, instrument: Instrument, contract: ContractMonth, period: BarPeriod, start: Timestamp
+    ) -> BarRecord | None:
+        """The single record for this exact bar identity, or `None` if nothing is
+        stored for it yet. Used to build a `domain.bar_record.BarConflictAudit` when
+        `upsert_closed_bar` returns `CONFLICT_REJECTED` — the existing row must be
+        re-read fresh rather than trusted from an earlier snapshot, since a
+        `CONFLICT_REJECTED` outcome can arise from a genuine race (a local live-
+        aggregated bar written after an earlier gap-detection snapshot was taken)."""
+        ...
+
     def list_recent(
         self,
         instrument: Instrument,
@@ -132,4 +143,28 @@ class BarRecordRepository(Protocol):
         `trading_day < cutoff_trading_day`. Scoped to the bar-records table only — never
         touches orders, fills, positions, or audit data (which don't live in this
         repository at all)."""
+        ...
+
+    def record_conflict(self, audit: BarConflictAudit) -> None:
+        """Persists a `CONFLICT_REJECTED` outcome as its own audit row — never called
+        for `INSERTED`/`DUPLICATE_IGNORED`. The rejected write itself is never applied
+        (see `upsert_closed_bar`'s docstring); this only records that it was attempted,
+        for the "保存衝突 audit 與兩方摘要" requirement. Raises
+        `BarUpsertRepositoryError` if the write itself failed."""
+        ...
+
+    def list_conflicted_trading_days(
+        self,
+        instrument: Instrument,
+        contract: ContractMonth,
+        period: BarPeriod,
+        *,
+        since_trading_day: date,
+    ) -> frozenset[date]:
+        """Every trading day with at least one unresolved conflict audit row on or after
+        `since_trading_day` — used by `application.market_data.bar_service.
+        MarketDataBarService.continuous_warm_up_bars()` to exclude a conflicted day's
+        bars from the warm-up/signal-eligible continuity segment (the "阻擋該區段驅動
+        訊號" requirement), without `continuous_segments()` itself needing to know
+        anything about conflicts."""
         ...

@@ -8,17 +8,16 @@ implementation prompt requires storing — 週期 (period), 交易日 (trading_d
 existing `Bar` construction site to know about them.
 
 `source` is `BarDataSource.AGGREGATED_FROM_YUANTA_REALTIME` for the vast majority of rows
-— bars this software aggregated itself from real-time pushes it actually received (see
-`docs/adr/0006-market-data-and-bar-aggregation.md` decision 7). A second value,
-`BACKFILLED_FROM_YUANTA_KLINE`, exists for rows filled from the vendor's own official
-`GetKLine` (K線查詢) history query when the rolling two-month window has a day this
-process never observed live — see `docs/adr/0007-two-month-bar-history-persistence.md`'s
-extension decision for the honesty caveat around that endpoint (its own docs attach
-"僅提供台股上市櫃商品查詢" to `MarketType`, yet `enumMarketType` does define `TAIFEX`;
-this is an explicit, flagged product decision to call it for futures anyway, not a
-verified vendor guarantee). Neither source is ever a third-party feed, a manual import, a
-carried-forward previous close, or a synthesized value — only these two vendor-sourced
-paths exist, and a row's `source` must always say honestly which one produced it.
+— bars this software aggregated itself from real-time Yuanta pushes it actually received
+(see `docs/adr/0006-market-data-and-bar-aggregation.md` decision 7). A second value,
+`BACKFILLED_FROM_YFINANCE`, exists for rows filled from the third-party `yfinance`
+package when the rolling two-month window has a canonical bar identity this process never
+observed live — see `docs/adr/0007-two-month-bar-history-persistence.md`'s yfinance
+extension decision. Unlike `AGGREGATED_FROM_YUANTA_REALTIME`, this source is explicitly
+**not** an official Yuanta/TAIFEX record — a genuine third-party feed, never conflated
+with the real-time-aggregated path, and never presented as one. Neither source is ever a
+manual import, a carried-forward previous close, or a synthesized value — a row's
+`source` must always say honestly which one produced it.
 """
 
 from __future__ import annotations
@@ -58,13 +57,14 @@ class BarDataSource(StrEnum):
     """A bar this software aggregated itself from real-time Yuanta quote pushes it
     actually received while running. Never third-party data or a synthesized value —
     see the module docstring."""
-    BACKFILLED_FROM_YUANTA_KLINE = "BACKFILLED_FROM_YUANTA_KLINE"
-    """A bar filled from the vendor's own official `GetKLine` history query
-    (application.ports.historical_price_query.HistoricalPriceQueryPort), used only to
-    cover a day within the rolling two-month window this process never observed live.
-    Still a genuine Yuanta-sourced bar, not a synthesized/carried-forward value — but
-    distinct from `AGGREGATED_FROM_YUANTA_REALTIME` so the UI and any future signal
-    logic can tell the two apart. See the module docstring's honesty caveat."""
+    BACKFILLED_FROM_YFINANCE = "BACKFILLED_FROM_YFINANCE"
+    """A bar filled from the third-party `yfinance` package
+    (`application.ports.yahoo_history_query.YahooHistoryQueryPort`), used only to cover
+    a canonical bar identity within the rolling two-month window this process never
+    observed live. A genuine third-party (Yahoo Finance) record, never a
+    synthesized/carried-forward value — but also never a Yuanta/TAIFEX official record,
+    so it is always kept distinct from `AGGREGATED_FROM_YUANTA_REALTIME` in storage, the
+    UI, and any future signal logic. See the module docstring."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +103,29 @@ class BarRecord:
         """商品、契約、週期及 start — the unique bar identity dedup and the database
         unique constraint are both built on."""
         return (self.bar.instrument, self.bar.contract, self.period, self.bar.start)
+
+
+@dataclass(frozen=True, slots=True)
+class BarConflictAudit:
+    """One `CONFLICT_REJECTED` outcome from `BarRecordRepository.upsert_closed_bar()`,
+    kept as its own audit row rather than discarded — the "保存衝突 audit 與兩方摘要"
+    the yfinance-backfill extension of the implementation prompt requires. `existing` is
+    the canonical bar this codebase already had (never overwritten); `incoming` is the
+    rejected bar an attempted write proposed instead — always a `BACKFILLED_FROM_YFINANCE`
+    row today, since a same-identity conflict between two `AGGREGATED_FROM_YUANTA_REALTIME`
+    writes can't happen (an identical live aggregator producing two different OHLCV
+    values for the same boundary would be an aggregation bug, not an expected outcome
+    this audit trail is meant to model)."""
+
+    existing: BarRecord
+    incoming: BarRecord
+    detected_at: Timestamp
+
+    def __post_init__(self) -> None:
+        if self.existing.identity != self.incoming.identity:
+            raise InvalidBarRecordError(
+                "BarConflictAudit requires existing/incoming to share the same bar identity"
+            )
 
 
 def rolling_two_month_start(today: date) -> date:

@@ -15,6 +15,7 @@ from decimal import Decimal
 from tfx_quant.application.ports.broker_session import LogoutReason, SessionCapabilities
 from tfx_quant.domain.account import TradingAccount
 from tfx_quant.domain.bar import Bar
+from tfx_quant.domain.connectivity import ChannelHealth, ChannelId, SafePauseRecord
 from tfx_quant.domain.contract import ContractMonth
 from tfx_quant.domain.fill import Fill
 from tfx_quant.domain.instrument import Instrument
@@ -257,17 +258,21 @@ class BarRetentionCleanupCompleted(Event):
 @dataclass(frozen=True, slots=True)
 class BarBackfillCompleted(Event):
     """One `BarHistoryBackfillService` run finished for `(instrument, contract)` — the
-    "audit 摘要" for the vendor `GetKLine` backfill, symmetric with
-    `BarRetentionCleanupCompleted`. `requested_day_count` is how many trading days in
-    the rolling two-month window had no locally-recorded bar when this run started;
-    `filled_day_count` is how many of those actually got at least one bar written this
-    run (the rest remain gaps — a vendor rejection, timeout, or off-grid timestamp is
-    never retried synchronously, only on the next trigger)."""
+    "audit 摘要" for the yfinance backfill, symmetric with
+    `BarRetentionCleanupCompleted`. `requested_bar_count` is how many canonical 60-
+    minute bar identities in the rolling two-month window had no locally-recorded bar
+    when this run started; `filled_bar_count` is how many of those actually got written
+    this run (the rest remain gaps — a missing ticker mapping, an empty/error yfinance
+    response, or a bar that fails boundary alignment is never retried synchronously,
+    only on the next trigger). `conflict_count` is how many attempted writes this run
+    hit a `CONFLICT_REJECTED` outcome against an existing local bar — see
+    `domain.bar_record.BarConflictAudit`."""
 
     instrument: Instrument
     contract: ContractMonth
-    requested_day_count: int
-    filled_day_count: int
+    requested_bar_count: int
+    filled_bar_count: int
+    conflict_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -371,6 +376,40 @@ class ManualPositionSyncCompleted(Event):
     baseline_before: NetPosition
     baseline_after: NetPosition
     correlation_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelHealthChanged(Event):
+    """One connectivity channel's connected/stale/error status changed — published only
+    on a meaningful change (never per-message/per-tick), same "publish on change only"
+    convention as `BrokerCapabilitiesChanged`/`MarketDataFreshnessChanged`. See
+    `application.connectivity.connectivity_monitor.ConnectivityMonitor`."""
+
+    channel: ChannelId
+    health: ChannelHealth
+
+
+@dataclass(frozen=True, slots=True)
+class SafePauseTriggered(Event):
+    """A new connectivity safe-pause episode began — see `domain.connectivity.
+    SafePauseRecord`. Unlike `BrokerSessionInvalidated`/`MarketDataFreshnessChanged`/
+    `OrderRequiresManualReview`/`ReversalPausedSafe` ("fires reliably, does not itself
+    enforce a strategy-wide pause"), this event's publisher *does* drive
+    `StrategyStateMachine` toward `PAUSED_SAFE`/`FAULTED` itself before publishing —
+    same "this feature's own job, not deferred" split as `PositionDiscrepancyDetected`."""
+
+    record: SafePauseRecord
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectivityReconciled(Event):
+    """A fresh `BrokerSessionReady` was observed after a safe-pause episode, and the
+    synchronous reconnect-reconciliation fan-out (`OrderManager.reconcile_on_startup`,
+    `PositionReconciliationService.reconcile(RECONNECT)`) has run — see
+    `docs/adr/0011-connectivity-reconnect-and-safe-pause.md`'s subscription-order note.
+    Never itself resumes `RUNNING`."""
+
+    record: SafePauseRecord
 
 
 @dataclass(frozen=True, slots=True)

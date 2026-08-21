@@ -16,8 +16,6 @@ unit-test coverage via a fake `SparkAdapterPort`, independent of this file.
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable
-from datetime import date
 from typing import Any
 
 from tfx_quant.application.settings.trading_settings import Environment
@@ -29,11 +27,6 @@ from tfx_quant.infrastructure.yuanta.spark_client import SparkApiClient
 from tfx_quant.telemetry import get_logger, log_debug, log_error, log_info
 
 _logger = get_logger(__name__)
-
-KLineResponseHandler = Callable[[Any], None]
-"""Receives the raw `KLineResult` .NET object from `OnResponse` — narrowed to typed
-primitives by `spark_historical_price_adapter.py`, not here (matches this module's own
-"pull primitives, hand off immediately" split)."""
 
 
 def account_to_spark_string(account: TradingAccount) -> str:
@@ -52,7 +45,6 @@ class SparkApiSessionAdapter:
         self._client: SparkApiClient | None = None
         self._orchestrator: BrokerSessionOrchestrator | None = None
         self._generation = 0
-        self._kline_handler: KLineResponseHandler | None = None
 
     def bind_orchestrator(self, orchestrator: BrokerSessionOrchestrator) -> None:
         """Wires the callback direction; `composition.py` calls this once, right
@@ -61,16 +53,6 @@ class SparkApiSessionAdapter:
         orchestrator — resolved via this explicit two-step wiring instead of a
         constructor cycle)."""
         self._orchestrator = orchestrator
-
-    def bind_kline_handler(self, handler: KLineResponseHandler) -> None:
-        """Wires `GetKLine` responses to `SparkHistoricalPriceQueryAdapter` — the same
-        two-step wiring `bind_orchestrator` uses, kept separate since the two-month
-        bar-history backfill is not part of session bring-up and has nothing to do
-        with `BrokerSessionOrchestrator`. This adapter stays the *only* subscriber
-        registered on the vendor's single `OnResponse` .NET event; every consumer
-        (session bring-up, market-data pushes, `GetKLine` results) is dispatched from
-        one place (`_on_response`) by `strIndex`."""
-        self._kline_handler = handler
 
     # -- SparkAdapterPort -------------------------------------------------------------
 
@@ -131,21 +113,6 @@ class SparkApiSessionAdapter:
         assert self._client is not None
         self._client.unsubscribe_stock_tick(account_to_spark_string(account), [symbol])
 
-    def request_kline(
-        self, account: TradingAccount, symbol: str, start_date: date, end_date: date
-    ) -> bool:
-        """Fires one `GetKLine` call; the result arrives later via `OnResponse` and is
-        forwarded to whatever handler `bind_kline_handler` registered. Raises
-        `AssertionError` if called before `open_and_login` — same "must be connected
-        first" contract every other query method here already has."""
-        assert self._client is not None
-        return self._client.get_kline(
-            account_to_spark_string(account),
-            symbol,
-            start_date.strftime("%Y/%m/%d"),
-            end_date.strftime("%Y/%m/%d"),
-        )
-
     # -- OnResponse dispatch --------------------------------------------------------
 
     def _on_response(
@@ -174,8 +141,6 @@ class SparkApiSessionAdapter:
                 self._orchestrator.handle_real_report_query_result(generation)
             elif str_index == "GetFutStoreSummary":
                 self._orchestrator.handle_position_query_result(generation)
-            elif str_index == "GetKLine" and self._kline_handler is not None:
-                self._kline_handler(obj_value)
             return
 
         if int_mark == 2:  # 訂閱回應資訊 (subscription push)

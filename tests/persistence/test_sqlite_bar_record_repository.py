@@ -11,7 +11,13 @@ from tfx_quant.application.ports.bar_record_repository import (
     BarUpsertOutcome,
 )
 from tfx_quant.domain.bar import Bar
-from tfx_quant.domain.bar_record import BarDataSource, BarPeriod, BarRecord, MarketSession
+from tfx_quant.domain.bar_record import (
+    BarConflictAudit,
+    BarDataSource,
+    BarPeriod,
+    BarRecord,
+    MarketSession,
+)
 from tfx_quant.domain.contract import ContractMonth
 from tfx_quant.domain.instrument import Instrument
 from tfx_quant.domain.money import Price
@@ -238,3 +244,88 @@ def test_is_gap_recovery_round_trips(repo: SqliteBarRecordRepository) -> None:
         _INSTRUMENT, _CONTRACT, BarPeriod.SIXTY_MINUTE, since_trading_day=date(2026, 1, 1)
     )[0]
     assert found.is_gap_recovery is True
+
+
+def test_get_one_returns_none_when_absent(repo: SqliteBarRecordRepository) -> None:
+    start = _ts(2026, 9, 16, 8, 45)
+    assert repo.get_one(_INSTRUMENT, _CONTRACT, BarPeriod.SIXTY_MINUTE, start) is None
+
+
+def test_get_one_returns_stored_record(repo: SqliteBarRecordRepository) -> None:
+    start, end = _ts(2026, 9, 16, 8, 45), _ts(2026, 9, 16, 9, 45)
+    record = _record(start, end, price="17500")
+    repo.upsert_closed_bar(record)
+
+    found = repo.get_one(_INSTRUMENT, _CONTRACT, BarPeriod.SIXTY_MINUTE, start)
+    assert found is not None
+    assert found.bar.open.amount == Decimal("17500")
+
+
+def _yfinance_record(start: Timestamp, end: Timestamp, *, price: str) -> BarRecord:
+    return BarRecord(
+        bar=_bar(start, end, price=price),
+        period=BarPeriod.SIXTY_MINUTE,
+        trading_day=start.value.date(),
+        session=MarketSession.DAY,
+        source=BarDataSource.BACKFILLED_FROM_YFINANCE,
+        is_gap_recovery=False,
+        created_at=start,
+        updated_at=start,
+    )
+
+
+def test_record_conflict_and_list_conflicted_trading_days(
+    repo: SqliteBarRecordRepository,
+) -> None:
+    start, end = _ts(2026, 9, 16, 8, 45), _ts(2026, 9, 16, 9, 45)
+    existing = _record(start, end, price="17500")
+    repo.upsert_closed_bar(existing)
+    incoming = _yfinance_record(start, end, price="17999")
+    assert repo.upsert_closed_bar(incoming) is BarUpsertOutcome.CONFLICT_REJECTED
+
+    audit = BarConflictAudit(existing=existing, incoming=incoming, detected_at=Timestamp.now())
+    repo.record_conflict(audit)
+
+    conflicted = repo.list_conflicted_trading_days(
+        _INSTRUMENT, _CONTRACT, BarPeriod.SIXTY_MINUTE, since_trading_day=date(2026, 1, 1)
+    )
+    assert conflicted == frozenset({start.value.date()})
+
+    # White-box check of the audit row's stored summary of both sides.
+    row = repo._conn.execute(
+        "SELECT existing_source, existing_close, incoming_source, incoming_close "
+        "FROM bar_backfill_conflicts"
+    ).fetchone()
+    assert row == (
+        BarDataSource.AGGREGATED_FROM_YUANTA_REALTIME.value,
+        "17500",
+        BarDataSource.BACKFILLED_FROM_YFINANCE.value,
+        "17999",
+    )
+
+
+def test_list_conflicted_trading_days_empty_when_none_recorded(
+    repo: SqliteBarRecordRepository,
+) -> None:
+    conflicted = repo.list_conflicted_trading_days(
+        _INSTRUMENT, _CONTRACT, BarPeriod.SIXTY_MINUTE, since_trading_day=date(2026, 1, 1)
+    )
+    assert conflicted == frozenset()
+
+
+def test_list_conflicted_trading_days_respects_since_trading_day(
+    repo: SqliteBarRecordRepository,
+) -> None:
+    start, end = _ts(2026, 5, 1, 8, 45), _ts(2026, 5, 1, 9, 45)
+    existing = _record(start, end, price="17500")
+    repo.upsert_closed_bar(existing)
+    incoming = _yfinance_record(start, end, price="17999")
+    repo.upsert_closed_bar(incoming)
+    repo.record_conflict(
+        BarConflictAudit(existing=existing, incoming=incoming, detected_at=Timestamp.now())
+    )
+
+    conflicted = repo.list_conflicted_trading_days(
+        _INSTRUMENT, _CONTRACT, BarPeriod.SIXTY_MINUTE, since_trading_day=date(2026, 6, 18)
+    )
+    assert conflicted == frozenset()

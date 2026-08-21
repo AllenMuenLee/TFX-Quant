@@ -1,6 +1,6 @@
 # Feature 15 — Simulator, Replay, and Automated Acceptance Tests
 
-> **API 文件唯一來源：實作前必須直接讀取[元大 SPARK API 官方入口](https://www.yuanta.com.tw/file-repository/content/API/page/index.html)及其下方連結的 API 說明文件、範例、元件下載與換版資訊。不得使用專案內既有資料夾、舊 SDK 文件、舊範例或既有程式碼反推 API 規格；若與本 prompt 其他描述衝突，以官方線上文件當下內容為準。**
+> **API 文件唯一來源：實作前必須直接讀取專案根目錄 [`交易API元件及說明文件/`](../../交易API元件及說明文件/) 內的元大期貨交易 API 說明、Python 範例、元件與版本資訊。禁止使用 SPARK API 網站、舊 SPARK SDK、舊範例或既有 SPARK 程式碼反推 API；若與本 prompt 其他描述衝突，以該資料夾內文件為準。資料夾缺少、文件未明載或內容矛盾時，須停止相關實作並列為 blocker。市場價格、行情與 OHLCV 不屬於此交易 API 規格，一律使用 `yfinance`。**
 > **不得臆測：API 名稱、參數、回傳值、事件、錯誤碼、登入方式、環境、平台、位元數與能力都必須有上述官方文件依據；文件未明載者須標成待確認並隔離於 adapter，不得自行補造。**
 
 > 強制使用 Python 開發；使用 pytest 建立 broker simulator、虛擬時鐘、回放與故障注入測試。
@@ -12,7 +12,7 @@
 ## 模擬能力
 
 - 播放 tick、歷史 K 棒、交易日與時鐘；可控制速度、暫停及跳到指定時間。
-- 模擬登入、行情、送單、ack、部分／全部成交、拒單、取消、回報重複／亂序／延遲、查詢矛盾與各通道斷線。
+- 分別模擬期貨 API 的登入、送單、ack、部分／全部成交、拒單、取消、回報重複／亂序／延遲、查詢矛盾與通道斷線，以及 yfinance 的空資料、延遲、stale、rate limit、schema 變更與 ticker mapping 失敗。
 - 模擬手機 App 改變持倉，以及程式在 workflow 任意持久化點崩潰與重啟。
 - 使用與正式 adapter 相同的 application interface，不得在策略內加入 `if simulator` 分支。
 

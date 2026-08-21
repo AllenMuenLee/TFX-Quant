@@ -132,17 +132,17 @@ class TradingCalendar:
         self, open_ts: Timestamp, entry: InstrumentMasterEntry
     ) -> tuple[Timestamp, Timestamp] | None:
         """The (open, close) boundary whose open-label timestamp exactly equals
-        `open_ts` — used to resolve a vendor-supplied historical bar timestamp
-        (`application.ports.historical_price_query.VendorKLineBar.at`) under this
-        codebase's own open-time bar-labeling convention (see `domain.bar.Bar`'s
-        docstring). The vendor's `GetKLine` docs never state whether `TimeStamp` is an
-        open or close label for intraday periods, so this is a stated assumption, not a
-        verified fact — see `docs/adr/0007-two-month-bar-history-persistence.md`'s
-        extension decision. Returns `None` when `open_ts` isn't exactly one of this
-        calendar/entry's own boundary opens (off-grid vendor timestamp, the close-label
-        interpretation being the correct one after all, or a non-trading period) —
-        callers must never snap or coerce it to the nearest boundary, only accept an
-        exact match; anything else is left as an unresolved gap."""
+        `open_ts` — used to resolve a historical bar timestamp from a third-party source
+        (`application.ports.yahoo_history_query.YahooBar.at`) under this codebase's own
+        open-time bar-labeling convention (see `domain.bar.Bar`'s docstring). Whether
+        `yfinance`'s `interval="1h"` index labels a bar's open or close time is not
+        documented, so this is a stated assumption, not a verified fact — see
+        `docs/adr/0007-two-month-bar-history-persistence.md`'s yfinance extension
+        decision. Returns `None` when `open_ts` isn't exactly one of this calendar/
+        entry's own boundary opens (off-grid timestamp, the close-label interpretation
+        being the correct one after all, or a non-trading period) — callers must never
+        snap or coerce it to the nearest boundary, only accept an exact match; anything
+        else is left as an unresolved gap."""
         d = open_ts.value.date()
         for offset in _TRADING_DAY_SEARCH_OFFSETS:
             trading_day = d + timedelta(days=offset)

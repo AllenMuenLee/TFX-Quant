@@ -13,6 +13,11 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from tfx_quant.application.connectivity.connectivity_monitor import ConnectivityMonitor
+from tfx_quant.application.connectivity.gateway_tracking import (
+    ConnectivityTrackingBrokerSession,
+    ConnectivityTrackingTradeGateway,
+)
 from tfx_quant.application.events.event_coordinator import EventCoordinator
 from tfx_quant.application.instrument_selection.instrument_selection_service import (
     InstrumentSelectionService,
@@ -25,10 +30,11 @@ from tfx_quant.application.order_management.order_manager import OrderManager
 from tfx_quant.application.ports.bar_signal_state import BarSignalStateStore
 from tfx_quant.application.ports.broker_session import IBrokerSession
 from tfx_quant.application.ports.clock import Clock
-from tfx_quant.application.ports.historical_price_query import HistoricalPriceQueryPort
 from tfx_quant.application.ports.identity import IdGenerator
 from tfx_quant.application.ports.instrument_master import InstrumentMasterRepository
 from tfx_quant.application.ports.trading_calendar import TradingCalendarRepository
+from tfx_quant.application.ports.yahoo_history_query import YahooHistoryQueryPort
+from tfx_quant.application.ports.yahoo_ticker_mapping import YahooTickerMappingRepository
 from tfx_quant.application.ports.yuanta_gateways import QuoteGatewayPort, TradeGatewayPort
 from tfx_quant.application.position_reconciliation.reconciliation_service import (
     PositionReconciliationService,
@@ -36,11 +42,16 @@ from tfx_quant.application.position_reconciliation.reconciliation_service import
 from tfx_quant.application.reversal_scaling.reversal_service import ReversalWorkflowService
 from tfx_quant.application.reversal_scaling.scaling_service import ScalingService
 from tfx_quant.application.settings.trading_settings import TradingSettings, validate_startup
+from tfx_quant.domain.quantity import NetPosition
 from tfx_quant.domain.strategy_state import StrategyStateMachine
 from tfx_quant.infrastructure.clock import SystemClock
 from tfx_quant.infrastructure.identity import UuidIdGenerator
+from tfx_quant.infrastructure.market_data.mock_yahoo_history_query import MockYahooHistoryQuery
 from tfx_quant.infrastructure.market_data.trading_calendar_repository import (
     JsonTradingCalendarRepository,
+)
+from tfx_quant.infrastructure.market_data.yahoo_ticker_mapping_repository import (
+    JsonYahooTickerMappingRepository,
 )
 from tfx_quant.infrastructure.yuanta import login_preferences
 from tfx_quant.infrastructure.yuanta.broker_session_gateway_views import (
@@ -51,7 +62,6 @@ from tfx_quant.infrastructure.yuanta.instrument_master_repository import (
     JsonInstrumentMasterRepository,
 )
 from tfx_quant.infrastructure.yuanta.mock_broker_session import MockBrokerSession
-from tfx_quant.infrastructure.yuanta.mock_historical_price_query import MockHistoricalPriceQuery
 from tfx_quant.infrastructure.yuanta.mock_quote_gateway import MockQuoteGateway
 from tfx_quant.infrastructure.yuanta.mock_trade_gateway import MockTradeGateway
 from tfx_quant.infrastructure.yuanta.preflight import raise_if_any_failed, run_preflight_checks
@@ -81,6 +91,12 @@ _DEFAULT_TRADING_CALENDAR_PATH = (
     / "market_data"
     / "trading_calendar.example.json"
 )
+_DEFAULT_YAHOO_TICKER_MAPPING_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "infrastructure"
+    / "market_data"
+    / "yahoo_ticker_mapping.example.json"
+)
 
 
 @dataclass
@@ -101,6 +117,7 @@ class ServiceContainer:
     reversal_workflow_service: ReversalWorkflowService
     scaling_service: ScalingService
     reconciliation_service: PositionReconciliationService
+    connectivity_monitor: ConnectivityMonitor
 
 
 def load_settings(path: Path) -> TradingSettings:
@@ -126,6 +143,7 @@ def load_settings(path: Path) -> TradingSettings:
         max_net_lots=settings.max_net_lots,
         instrument_master_path_configured=settings.instrument_master_path is not None,
         trading_calendar_path_configured=settings.trading_calendar_path is not None,
+        yahoo_ticker_mapping_path_configured=settings.yahoo_ticker_mapping_path is not None,
         market_data_db_path_configured=settings.market_data_db_path is not None,
         order_db_path_configured=settings.order_db_path is not None,
         reversal_workflow_db_path_configured=settings.reversal_workflow_db_path is not None,
@@ -144,6 +162,12 @@ def _resolve_trading_calendar_path(settings: TradingSettings) -> Path:
     if settings.trading_calendar_path is None:
         return _DEFAULT_TRADING_CALENDAR_PATH
     return Path(settings.trading_calendar_path)
+
+
+def _resolve_yahoo_ticker_mapping_path(settings: TradingSettings) -> Path:
+    if settings.yahoo_ticker_mapping_path is None:
+        return _DEFAULT_YAHOO_TICKER_MAPPING_PATH
+    return Path(settings.yahoo_ticker_mapping_path)
 
 
 def _resolve_market_data_db_path(settings: TradingSettings) -> Path:
@@ -189,6 +213,25 @@ def _resolve_position_baseline_db_path(settings: TradingSettings) -> Path:
     return base / "tfx_quant" / "position_baselines.sqlite3"
 
 
+def _current_expected_net(
+    instrument_selection: InstrumentSelectionService,
+    broker_session: IBrokerSession,
+    reconciliation_service: PositionReconciliationService,
+) -> NetPosition | None:
+    """`ConnectivityMonitor`'s `position_summary_provider` — the "當時...持倉摘要" a
+    `SafePauseRecord` carries. `None` when there's no current selection/account to
+    summarize yet (e.g. a pause triggered before the operator has picked an
+    instrument), same "nothing to report yet" posture as every other optional summary
+    field in this codebase."""
+    selection = instrument_selection.current
+    account = broker_session.selected_account
+    if selection is None or account is None:
+        return None
+    return reconciliation_service.expected_net_lookup(
+        account, selection.instrument, selection.contract
+    )
+
+
 def build_services(settings: TradingSettings) -> ServiceContainer:
     log_info(_logger, "module_load_started", use_mock=settings.use_mock)
     clock: Clock = SystemClock()
@@ -220,16 +263,20 @@ def build_services(settings: TradingSettings) -> ServiceContainer:
     )
     bar_signal_state_store: BarSignalStateStore = market_data_bar_service
 
+    yahoo_ticker_mapping: YahooTickerMappingRepository = JsonYahooTickerMappingRepository(
+        _resolve_yahoo_ticker_mapping_path(settings)
+    )
+
     trade_gateway: TradeGatewayPort
     quote_gateway: QuoteGatewayPort
     broker_session: IBrokerSession
-    historical_price_query: HistoricalPriceQueryPort
+    yahoo_history_query: YahooHistoryQueryPort
     if settings.use_mock:
         log_info(_logger, "module_loaded", module="broker_session", kind="mock")
         trade_gateway = MockTradeGateway()
         quote_gateway = MockQuoteGateway()
         broker_session = MockBrokerSession(event_publisher=event_coordinator)
-        historical_price_query = MockHistoricalPriceQuery()
+        yahoo_history_query = MockYahooHistoryQuery()
     else:
         log_info(_logger, "preflight_checks_started")
         raise_if_any_failed(run_preflight_checks())
@@ -240,9 +287,6 @@ def build_services(settings: TradingSettings) -> ServiceContainer:
         # docs/adr/0004-broker-session-architecture.md for why this glue is kept as
         # thin and isolated as possible.
         from tfx_quant.infrastructure.yuanta.spark_api_adapter import SparkApiSessionAdapter
-        from tfx_quant.infrastructure.yuanta.spark_historical_price_adapter import (
-            SparkHistoricalPriceQueryAdapter,
-        )
 
         adapter = SparkApiSessionAdapter()
         orchestrator = BrokerSessionOrchestrator(
@@ -257,8 +301,42 @@ def build_services(settings: TradingSettings) -> ServiceContainer:
         trade_gateway = BrokerSessionTradeGatewayView(orchestrator)
         quote_gateway = BrokerSessionQuoteGatewayView(orchestrator, instrument_master)
         broker_session = orchestrator
-        historical_price_query = SparkHistoricalPriceQueryAdapter(adapter)
         log_info(_logger, "module_loaded", module="broker_session", kind="spark_api")
+
+        # Imported lazily, same isolation rationale as the SPARK API adapter above:
+        # this module pulls in yfinance/pandas, which only need to exist for the real
+        # (non-mock) branch — see infrastructure/market_data/yfinance_history_adapter.py.
+        from tfx_quant.infrastructure.market_data.yfinance_history_adapter import (
+            YfinanceHistoryQueryAdapter,
+        )
+
+        yahoo_history_query = YfinanceHistoryQueryAdapter()
+        log_info(_logger, "module_loaded", module="yahoo_history_query", kind="yfinance")
+
+    # `connectivity_monitor` is built against the *raw* `broker_session` (its own
+    # reconnect attempts call `IBrokerSession.start()` directly — see
+    # `ConnectivityMonitor.__init__`'s docstring) before `trade_gateway`/
+    # `broker_session` are rebound to their connectivity-tracking wrappers below, so
+    # every other service in this function (instrument selection, order management,
+    # position reconciliation, reversal/scaling) sees the wrapped versions uniformly.
+    # `order_summary_provider`/`position_summary_provider` are forward references to
+    # `order_repository`/`instrument_selection`/`broker_session`, all assigned further
+    # down this same function — safe because Python closures resolve names at call
+    # time, and nothing calls these providers until well after `build_services()`
+    # returns (a safe-pause trigger, at the earliest) — see
+    # docs/adr/0011-connectivity-reconnect-and-safe-pause.md.
+    connectivity_monitor = ConnectivityMonitor(
+        broker_session=broker_session,
+        strategy_state_machine=strategy_state_machine,
+        clock=clock,
+        event_bus=event_coordinator,
+        order_summary_provider=lambda: len(order_repository.list_active()),
+        position_summary_provider=lambda: _current_expected_net(
+            instrument_selection, broker_session, reconciliation_service
+        ),
+    )
+    trade_gateway = ConnectivityTrackingTradeGateway(trade_gateway, connectivity_monitor)
+    broker_session = ConnectivityTrackingBrokerSession(broker_session, connectivity_monitor)
 
     instrument_selection = InstrumentSelectionService(
         strategy_state_machine=strategy_state_machine,
@@ -276,7 +354,8 @@ def build_services(settings: TradingSettings) -> ServiceContainer:
         trading_calendar_repository=trading_calendar,
         instrument_master=instrument_master,
         bar_record_repository=bar_record_repository,
-        historical_price_query=historical_price_query,
+        yahoo_ticker_mapping=yahoo_ticker_mapping,
+        yahoo_history_query=yahoo_history_query,
     )
 
     order_db_path = _resolve_order_db_path(settings)
@@ -340,6 +419,11 @@ def build_services(settings: TradingSettings) -> ServiceContainer:
         position_lookup=reconciliation_service.expected_net_lookup,
     )
 
+    # Must run after `reconciliation_service`/`order_manager` have all subscribed their
+    # own `BrokerSessionReady` handlers — see `ConnectivityMonitor.
+    # attach_reconnect_reconciliation_watcher`'s docstring.
+    connectivity_monitor.attach_reconnect_reconciliation_watcher()
+
     reversal_workflow_service = ReversalWorkflowService(
         order_manager=order_manager,
         order_repository=order_repository,
@@ -378,6 +462,7 @@ def build_services(settings: TradingSettings) -> ServiceContainer:
         reversal_workflow_service=reversal_workflow_service,
         scaling_service=scaling_service,
         reconciliation_service=reconciliation_service,
+        connectivity_monitor=connectivity_monitor,
     )
 
 
@@ -402,7 +487,24 @@ def compute_readiness(services: ServiceContainer) -> list[tuple[str, bool]]:
             "Market data: bar history persistence",
             not services.market_data_bar_service.is_persistence_degraded(),
         ),
+        (
+            "Market data: yfinance backfill",
+            not services.bar_history_backfill_service.is_degraded(),
+        ),
+        ("Connectivity: no unresolved safe-pause", _connectivity_pause_resolved(services)),
     ]
+
+
+def _connectivity_pause_resolved(services: ServiceContainer) -> bool:
+    """True when there has never been a connectivity safe-pause this session, or the
+    most recent one has already been reconciled (a fresh `BrokerSessionReady` plus the
+    synchronous order/fill/position reconnect-reconciliation fan-out — see
+    `ConnectivityMonitor.attach_reconnect_reconciliation_watcher`). Deliberately does
+    *not* mean "safe to resume" — `StrategyState` staying `PAUSED_SAFE` until a human
+    restarts the strategy is unaffected either way; this only distinguishes "actively
+    broken" from "resolved, awaiting a manual restart" for this diagnostics row."""
+    record = services.connectivity_monitor.current_pause()
+    return record is None or record.reconciled
 
 
 def log_startup_readiness(services: ServiceContainer) -> None:

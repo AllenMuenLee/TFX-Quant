@@ -27,7 +27,7 @@ import wx.adv
 
 from tfx_quant.desktop.composition import ServiceContainer
 from tfx_quant.domain.bar import Bar, CandleColor
-from tfx_quant.domain.bar_record import BarRecord
+from tfx_quant.domain.bar_record import BarDataSource, BarRecord
 from tfx_quant.telemetry import get_logger, log_info
 
 _logger = get_logger(__name__)
@@ -36,6 +36,14 @@ _CANDLE_LABEL_ZH = {
     CandleColor.RED: "紅",
     CandleColor.BLACK: "黑",
     CandleColor.DOJI: "十字",
+}
+_SOURCE_LABEL_ZH = {
+    BarDataSource.AGGREGATED_FROM_YUANTA_REALTIME: (
+        "本軟體自行聚合（元大即時行情，非官方歷史 K 棒）"
+    ),
+    BarDataSource.BACKFILLED_FROM_YFINANCE: (
+        "yfinance 回補（第三方資料，非元大／期交所官方紀錄）"
+    ),
 }
 _BAR_ROWS_SHOWN = 200
 _DEFAULT_QUERY_DAYS = 7
@@ -52,10 +60,8 @@ def _format_bar(bar: Bar) -> str:
 
 def _format_record(record: BarRecord) -> str:
     completeness = "缺口後首根，前段資料可能不完整" if record.is_gap_recovery else "完整"
-    return (
-        f"{_format_bar(record.bar)}｜來源：本軟體自行聚合（非元大官方歷史 K 棒）"
-        f"｜完整性：{completeness}"
-    )
+    source = _SOURCE_LABEL_ZH[record.source]
+    return f"{_format_bar(record.bar)}｜來源：{source}｜完整性：{completeness}"
 
 
 def _wx_date_to_date(value: wx.DateTime) -> date:

@@ -57,6 +57,12 @@ class MockBrokerSession:
         self.subscribed_symbols: set[str] = set()
         """Exposed for test assertions — see `subscribe_market_data`/
         `unsubscribe_market_data`."""
+        self._scripted_start_failures = 0
+        self._scripted_start_failure_reason = "模擬重連失敗"
+        self._scripted_start_failure_retriable = True
+        self.start_calls: list[LoginRequest] = []
+        """Every `start()` call, in order — lets a reconnect test assert how many
+        automatic retry attempts `ConnectivityMonitor` actually made."""
 
     # -- IBrokerSession -----------------------------------------------------------
 
@@ -73,9 +79,18 @@ class MockBrokerSession:
         return self._selected_account
 
     def start(self, request: LoginRequest) -> None:
-        """`request` is accepted for `IBrokerSession` compliance but ignored — this
-        mock always runs the scripted happy path below; use the `simulate_*` methods
-        to script other outcomes."""
+        """`request` is otherwise ignored — this mock always runs the scripted happy
+        path below unless `script_start_failures()` has queued failures first (the
+        Feature 09 reconnect-retry acceptance scenario); use the other `simulate_*`
+        methods to script other outcomes."""
+        self.start_calls.append(request)
+        if self._scripted_start_failures > 0:
+            self._scripted_start_failures -= 1
+            self.simulate_login_failed(
+                self._scripted_start_failure_reason,
+                retriable=self._scripted_start_failure_retriable,
+            )
+            return
         self.simulate_login_success((_DEFAULT_MOCK_ACCOUNT,))
 
     def select_account(self, account: TradingAccount) -> None:
@@ -134,6 +149,17 @@ class MockBrokerSession:
         self._publish(BrokerSessionInvalidated(at=Timestamp.now(), reason=reason))
         self._selected_account = None
         self._set_capabilities(SessionCapabilities())
+
+    def script_start_failures(
+        self, count: int, *, reason: str = "模擬重連失敗", retriable: bool = True
+    ) -> None:
+        """Scripts the next `count` `start()` calls to fail (publishing
+        `BrokerLoginFailed`) before falling back to the normal happy path — the
+        `ConnectivityMonitor` reconnect-retry acceptance scenario (Feature 09):
+        "重連失敗" and "重連失敗數次後成功"."""
+        self._scripted_start_failures = count
+        self._scripted_start_failure_reason = reason
+        self._scripted_start_failure_retriable = retriable
 
     # -- Internal ---------------------------------------------------------------
 

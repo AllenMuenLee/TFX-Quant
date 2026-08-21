@@ -31,7 +31,13 @@ from tfx_quant.application.ports.bar_record_repository import (
     RetentionCleanupSummary,
 )
 from tfx_quant.domain.bar import Bar
-from tfx_quant.domain.bar_record import BarDataSource, BarPeriod, BarRecord, MarketSession
+from tfx_quant.domain.bar_record import (
+    BarConflictAudit,
+    BarDataSource,
+    BarPeriod,
+    BarRecord,
+    MarketSession,
+)
 from tfx_quant.domain.contract import ContractMonth
 from tfx_quant.domain.instrument import Instrument
 from tfx_quant.domain.money import Price
@@ -83,6 +89,30 @@ CREATE TABLE IF NOT EXISTS bar_record_revisions (
     reason TEXT NOT NULL,
     revised_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS bar_backfill_conflicts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    instrument TEXT NOT NULL,
+    contract_year INTEGER NOT NULL,
+    contract_month INTEGER NOT NULL,
+    period TEXT NOT NULL,
+    start_at TEXT NOT NULL,
+    trading_day TEXT NOT NULL,
+    existing_source TEXT NOT NULL,
+    existing_open TEXT NOT NULL,
+    existing_high TEXT NOT NULL,
+    existing_low TEXT NOT NULL,
+    existing_close TEXT NOT NULL,
+    existing_volume INTEGER NOT NULL,
+    incoming_source TEXT NOT NULL,
+    incoming_open TEXT NOT NULL,
+    incoming_high TEXT NOT NULL,
+    incoming_low TEXT NOT NULL,
+    incoming_close TEXT NOT NULL,
+    incoming_volume INTEGER NOT NULL,
+    detected_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bar_backfill_conflicts_trading_day
+    ON bar_backfill_conflicts (instrument, contract_year, contract_month, period, trading_day);
 """
 
 _SELECT_COLUMNS = (
@@ -266,6 +296,24 @@ class SqliteBarRecordRepository:
 
     # -- Reads --------------------------------------------------------------------
 
+    def get_one(
+        self, instrument: Instrument, contract: ContractMonth, period: BarPeriod, start: Timestamp
+    ) -> BarRecord | None:
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT {_SELECT_COLUMNS} FROM bar_records "
+                "WHERE instrument = ? AND contract_year = ? AND contract_month = ? "
+                "AND period = ? AND start_at = ?",
+                (
+                    instrument.value,
+                    contract.year,
+                    contract.month,
+                    period.value,
+                    start.value.isoformat(),
+                ),
+            ).fetchone()
+        return None if row is None else _row_to_record(row)
+
     def list_recent(
         self,
         instrument: Instrument,
@@ -370,6 +418,78 @@ class SqliteBarRecordRepository:
         return RetentionCleanupSummary(
             cutoff_trading_day=cutoff_trading_day, deleted_count=deleted_count, ran_at=ran_at
         )
+
+    def record_conflict(self, audit: BarConflictAudit) -> None:
+        existing, incoming = audit.existing, audit.incoming
+        try:
+            with self._lock:
+                self._conn.execute(
+                    """
+                    INSERT INTO bar_backfill_conflicts (
+                        instrument, contract_year, contract_month, period, start_at,
+                        trading_day, existing_source, existing_open, existing_high,
+                        existing_low, existing_close, existing_volume, incoming_source,
+                        incoming_open, incoming_high, incoming_low, incoming_close,
+                        incoming_volume, detected_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        incoming.bar.instrument.value,
+                        incoming.bar.contract.year,
+                        incoming.bar.contract.month,
+                        incoming.period.value,
+                        incoming.bar.start.value.isoformat(),
+                        incoming.trading_day.isoformat(),
+                        existing.source.value,
+                        str(existing.bar.open.amount),
+                        str(existing.bar.high.amount),
+                        str(existing.bar.low.amount),
+                        str(existing.bar.close.amount),
+                        existing.bar.volume,
+                        incoming.source.value,
+                        str(incoming.bar.open.amount),
+                        str(incoming.bar.high.amount),
+                        str(incoming.bar.low.amount),
+                        str(incoming.bar.close.amount),
+                        incoming.bar.volume,
+                        audit.detected_at.value.isoformat(),
+                    ),
+                )
+                self._conn.commit()
+        except sqlite3.Error as exc:
+            raise BarUpsertRepositoryError(f"bar conflict audit write failed: {exc}") from exc
+        log_error(
+            _logger,
+            "bar_backfill_conflict_recorded",
+            instrument=incoming.bar.instrument.value,
+            contract=incoming.bar.contract.code,
+            bar_start=incoming.bar.start.value.isoformat(),
+            existing_source=existing.source.value,
+            incoming_source=incoming.source.value,
+        )
+
+    def list_conflicted_trading_days(
+        self,
+        instrument: Instrument,
+        contract: ContractMonth,
+        period: BarPeriod,
+        *,
+        since_trading_day: date,
+    ) -> frozenset[date]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT trading_day FROM bar_backfill_conflicts "
+                "WHERE instrument = ? AND contract_year = ? AND contract_month = ? "
+                "AND period = ? AND trading_day >= ?",
+                (
+                    instrument.value,
+                    contract.year,
+                    contract.month,
+                    period.value,
+                    since_trading_day.isoformat(),
+                ),
+            ).fetchall()
+        return frozenset(date.fromisoformat(row[0]) for row in rows)
 
 
 def _ohlcv_matches(a: Bar, b: Bar) -> bool:

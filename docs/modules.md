@@ -14,9 +14,14 @@ dependency, no I/O. `Instrument`, `ContractMonth`, `InstrumentMasterEntry` (Feat
 resolver), `BarAggregator`/`CandleStreakCounter` (Feature 04 — 60-minute bar aggregation
 and red/black/doji streak counting; see `docs/adr/0006-market-data-and-bar-
 aggregation.md`), `BarRecord`/`BarPeriod`/`MarketSession`/`BarDataSource`/
-`rolling_two_month_start`/`ContinuitySegment`/`continuous_segments` (`bar_record.py` —
-the two-month bar-history extension's persisted-record shape, rolling-window math, and
-gap-detection; see `docs/adr/0007-two-month-bar-history-persistence.md`),
+`rolling_two_month_start`/`ContinuitySegment`/`continuous_segments`/`BarConflictAudit`
+(`bar_record.py` — the two-month bar-history extension's persisted-record shape,
+rolling-window math, and gap-detection; `BarDataSource` has two members,
+`AGGREGATED_FROM_YUANTA_REALTIME` and `BACKFILLED_FROM_YFINANCE`; `BarConflictAudit`
+(existing/incoming `BarRecord` + detected-at) is the yfinance-backfill extension's
+local-vs-third-party conflict audit shape; see `docs/adr/0007-two-month-bar-history-
+persistence.md`), `chunk_consecutive_days` (`bar_history_backfill.py` — pure date-range
+chunking for the yfinance backfill's bounded batch queries, vendor-neutral by design),
 `StrategySignal`, `Position`, `Order`/`ClientOrderId`, `Fill` (+ `broker_fill_no`/
 `broker_seq_no` — Feature 06), `Pnl`, `StrategyState` + `StrategyStateMachine`,
 `OrderStatus`/`LocalOrderId`/`OrderReport`/`OrderIntent`/`OrderStateMachine`/
@@ -34,16 +39,23 @@ exception handler and Feature 08's `PositionReconciliationService` both use),
 `SUSPECTED_CAUSE_HYPOTHESES`/`PositionBaseline`/`ReconciliationRecord`/
 `ManualSyncPreflight`/`ManualSyncRecord` (`position_reconciliation.py` — Feature 08's
 expected-vs-actual-position comparison model and manual-sync gate/audit shapes; see
-`docs/adr/0010-position-reconciliation-and-manual-sync.md`). All illegal-state
-construction raises a `DomainError` subclass from `domain/errors.py`.
+`docs/adr/0010-position-reconciliation-and-manual-sync.md`), `ChannelId`/`ChannelHealth`/
+`SafePauseReason`/`SafePauseRecord`/`clock_skew_seconds` (`connectivity.py` — Feature 09's
+per-channel connectivity health snapshot and the connectivity safe-pause audit record;
+see `docs/adr/0011-connectivity-reconnect-and-safe-pause.md`), `ReconnectBackoffPolicy`
+(`reconnect_backoff.py` — Feature 09's capped-exponential-with-jitter reconnect backoff,
+deliberately not a reuse of `infrastructure.yuanta.backoff.BackoffPolicy`, which is
+jitter-free by design — see the same ADR). All illegal-state construction raises a
+`DomainError` subclass from `domain/errors.py`.
 
 ## `application`
 
 - `application/ports/` — `Protocol` interfaces (`Clock`, `IdGenerator`,
   `TradeGatewayPort`, `QuoteGatewayPort`, `IBrokerSession`, `InstrumentMasterRepository`,
   `BarSignalStateStore`, `TradingCalendarRepository`, `BarRecordRepository`,
-  `OrderRepository`, `ReversalWorkflowRepository`, `PositionBaselineRepository`) that
-  infrastructure/persistence implementations satisfy.
+  `OrderRepository`, `ReversalWorkflowRepository`, `PositionBaselineRepository`,
+  `YahooTickerMappingRepository`, `YahooHistoryQueryPort`) that infrastructure/persistence
+  implementations satisfy.
   `IBrokerSession` (Feature 02) is the Yuanta login/session-lifecycle port — richer than,
   and additive to, `TradeGatewayPort`/`QuoteGatewayPort`; see `docs/adr/0004-broker-session-
   architecture.md`. `InstrumentMasterRepository`/`BarSignalStateStore` (Feature 03) are
@@ -52,7 +64,13 @@ construction raises a `DomainError` subclass from `domain/errors.py`.
   （休市／提早收盤）lookup seam — see `docs/adr/0006-market-data-and-bar-
   aggregation.md`. `BarRecordRepository` (the two-month bar-history extension) is the
   closed-bar persistence seam `SqliteBarRecordRepository` implements — see
-  `docs/adr/0007-two-month-bar-history-persistence.md`. `OrderRepository` (Feature 06) is
+  `docs/adr/0007-two-month-bar-history-persistence.md`; the yfinance-backfill revision of
+  that same extension adds `get_one`/`record_conflict`/`list_conflicted_trading_days` to
+  it. `YahooTickerMappingRepository` (內部商品／契約 -> Yahoo ticker lookup, backed by
+  `JsonYahooTickerMappingRepository`) and `YahooHistoryQueryPort` (`YahooBar`/
+  `YahooHistoryQueryError`, backed by `YfinanceHistoryQueryAdapter`/
+  `MockYahooHistoryQuery`) are that same revision's two new ports — see the same ADR's
+  2026-08-21 extension section. `OrderRepository` (Feature 06) is
   the order-intent persistence seam `SqliteOrderRepository` implements, plus
   `TradeGatewayPort`'s new `submit_order`/`cancel_order`/`query_order_reports`/
   `query_fills` methods — see `docs/adr/0008-order-and-fill-state-machine.md`.
@@ -65,7 +83,9 @@ construction raises a `DomainError` subclass from `domain/errors.py`.
   serialized event-processing queue. Feature 04 adds `MarketDataTickReceived`,
   `BarClosed`, `MarketDataFreshnessChanged`, `MarketDataGapDetected`/
   `MarketDataGapCleared`; the two-month bar-history extension adds
-  `BarPersistenceHealthChanged`/`BarRetentionCleanupCompleted`; Feature 06 reshapes
+  `BarPersistenceHealthChanged`/`BarRetentionCleanupCompleted`, and its yfinance-backfill
+  revision adds `BarBackfillCompleted` (instrument/contract + requested/filled/conflict
+  bar counts — the yfinance run's own "audit 摘要"); Feature 06 reshapes
   `OrderReportReceived` (now carries `OrderReport`, not `Order`) and adds
   `OrderStateTransitioned`/`OrderRequiresManualReview`; Feature 07 adds
   `ReversalWorkflowStarted`/`ReversalFlatConfirmed`/`ReverseEntryBlocked`/
@@ -74,7 +94,14 @@ construction raises a `DomainError` subclass from `domain/errors.py`.
   adds `PositionDiscrepancyDetected`/`ManualPositionSyncCompleted` — the former is the
   one event in this codebase whose publisher *also* directly enforces the
   `StrategyState` pause itself, rather than "fires reliably, doesn't enforce" (see
-  `docs/adr/0010-position-reconciliation-and-manual-sync.md`).
+  `docs/adr/0010-position-reconciliation-and-manual-sync.md`). Feature 09 adds
+  `ChannelHealthChanged` (published only on a meaningful per-channel change, never
+  per-message/per-tick), `SafePauseTriggered` (the second event, after
+  `PositionDiscrepancyDetected`, whose publisher — `ConnectivityMonitor` — also directly
+  enforces the `StrategyState` pause itself), and `ConnectivityReconciled` (published once
+  a fresh `BrokerSessionReady` following a pause has let the existing reconnect-
+  reconciliation fan-out run — see `docs/adr/0011-connectivity-reconnect-and-safe-
+  pause.md`).
 - `application/safety/` — `SafetyChecklist` + `StartupSafetyGate`, the only path into
   `StrategyState.RUNNING`. Nine independent checklist items as of Feature 03.
 - `application/settings/` — `TradingSettings` (pydantic) + `validate_startup()`.
@@ -94,8 +121,19 @@ construction raises a `DomainError` subclass from `domain/errors.py`.
   from both `clear()` and `_on_session_ready()`) that restores the streak counter and
   recent-bars view from persisted history on startup/reconnect/switch; startup + daily
   retention cleanup; and the `continuous_warm_up_bars`/`recorded_range`/`query_history`/
-  `is_persistence_degraded`/`candle_streak` query methods. See `docs/adr/0007-two-month-
-  bar-history-persistence.md`.
+  `is_persistence_degraded`/`candle_streak` query methods — `continuous_warm_up_bars` also
+  excludes any trading day with an unresolved yfinance conflict (see below). See
+  `docs/adr/0007-two-month-bar-history-persistence.md`. `bar_history_backfill_service.py`
+  (the same extension's yfinance-backfill revision) adds `BarHistoryBackfillService`: a
+  second, independent writer that computes the rolling window's missing canonical bar
+  identities (bar-level, not day-level — see the ADR's 2026-08-21 decision 11), queries
+  `YahooHistoryQueryPort` in bounded, padded date-range chunks, aligns/validates each
+  returned bar against `TradingCalendar.boundary_for_open`, and upserts via
+  `BarRecordRepository` — same "never blocks the `EventCoordinator` dispatch thread, runs
+  on its own background thread" shape as the (now-superseded) vendor `GetKLine` path it
+  replaced. Triggers on `BrokerSessionReady`/`InstrumentSwitchCompleted` plus its own
+  `start()`/`stop()`-owned daily-rollover timer; exposes `is_degraded()` (missing ticker
+  mapping or an unresolved conflict for the active contract) for the readiness screen.
 - `application/order_management/` (Feature 06) — `OrderManager`, the only component
   allowed to turn a trading intent into a real Yuanta order, plus its `OrderRequest`
   input DTO, `validation.validate_exposure_within_cap`, and its own `errors.py`
@@ -127,6 +165,27 @@ construction raises a `DomainError` subclass from `domain/errors.py`.
   never itself submits an order or resumes `RUNNING`. `errors.py`
   (`ManualSyncBlockedError`/`StaleSyncConfirmationError`). See `docs/adr/0010-position-
   reconciliation-and-manual-sync.md`.
+- `application/connectivity/` (Feature 09) — `connectivity_monitor.ConnectivityMonitor`:
+  tracks the five `domain.connectivity.ChannelHealth` records, drives
+  `StrategyStateMachine` toward `PAUSED_SAFE`/`FAULTED` itself on market-data staleness,
+  a trade/order-reports capability regression, a query failure, or excessive clock skew
+  (the third exception, after `PositionDiscrepancyDetected`/`ReversalPausedSafe`'s "fires
+  reliably" siblings, to this codebase's "event fires, doesn't enforce" split), and is
+  the reconnect coordinator: capped/jittered retry of `IBrokerSession.start()` after a
+  passive post-ready disconnect (`domain.reconnect_backoff.ReconnectBackoffPolicy`),
+  cancellable, remembering the operator's `LoginRequest` via
+  `gateway_tracking.ConnectivityTrackingBrokerSession`. Its `BrokerSessionReady` handling
+  is deliberately split in two — `_on_session_ready_core` (subscribed unconditionally)
+  vs. `_on_session_ready_reconciled` (subscribed only via the explicit
+  `attach_reconnect_reconciliation_watcher()` call `desktop/composition.py` makes last) —
+  so the "reconnect-reconciliation fan-out already ran" audit flag relies on
+  `EventCoordinator`'s documented subscription-order dispatch guarantee rather than a new
+  completion event from `OrderManager`/`PositionReconciliationService`.
+  `gateway_tracking.ConnectivityTrackingTradeGateway` implements `TradeGatewayPort` as a
+  pure observer wrapped around the real one — every query/submit/cancel call other
+  services already make is timed and its outcome reported to the monitor, never an
+  additional broker call, never a swallowed exception. See `docs/adr/0011-connectivity-
+  reconnect-and-safe-pause.md`.
 
 Depends only on `domain`.
 
@@ -140,7 +199,19 @@ state is `application.market_data.MarketDataBarService`, Feature 04) are generic
 `infrastructure/market_data/` (Feature 04) — `JsonTradingCalendarRepository`, backed by
 `trading_calendar.example.json` (a best-effort, web-search-seeded 2026 TAIFEX holiday
 list, explicitly flagged unconfirmed); generic, not Yuanta-specific, since exchange
-holidays aren't vendor data. `infrastructure/yuanta/` is the Yuanta-specific adapter —
+holidays aren't vendor data. The two-month bar-history extension's yfinance-backfill
+revision adds three more files to this same package:
+`yahoo_ticker_mapping_repository.py` (`JsonYahooTickerMappingRepository`, backed by
+`yahoo_ticker_mapping.example.json` — deliberately shipped with an empty `mappings`
+array, since no Yahoo Finance ticker for any TAIFEX futures contract has been confirmed;
+see `docs/adr/0007-two-month-bar-history-persistence.md`'s 2026-08-21 extension);
+`yfinance_history_adapter.py` (`YfinanceHistoryQueryAdapter`, the real
+`YahooHistoryQueryPort` — the **only** module allowed to `import yfinance`/`import
+pandas`, isolated the same way `infrastructure/yuanta/` isolates vendor types, imported
+lazily by `desktop/composition.py` only in the real, non-mock branch); and
+`mock_yahoo_history_query.py` (`MockYahooHistoryQuery`, always returns an empty result —
+mock mode has no network access, so every range simply stays a gap). `infrastructure/
+yuanta/` is the Yuanta-specific adapter —
 the **only** package allowed to import vendor (`pythonnet`/`YuantaOneAPI`) types (its
 `instrument_master_repository.py`, added by Feature 03, and `market_data_parsing.py`,
 added by Feature 04, are exceptions to that part only — plain parsing/JSON I/O, no
@@ -171,6 +242,11 @@ broker's position query changing over time independent of any simulated fill. Fe
 adds `fail_next_query_positions()`, so tests can script a transient
 `query_positions()` failure (raise once, then resume normal scripted results) without a
 real vendor connection — see `docs/adr/0010-position-reconciliation-and-manual-sync.md`.
+Feature 09 adds `mock_broker_session.py`'s `MockBrokerSession.script_start_failures()`
+(the next N `start()` calls publish `BrokerLoginFailed` before falling back to the
+scripted happy path) and `start_calls` (every `start()` call, in order), so
+`ConnectivityMonitor`'s reconnect retry/exhaustion behavior can be tested without a real
+vendor connection — see `docs/adr/0011-connectivity-reconnect-and-safe-pause.md`.
 
 ## `persistence`
 
@@ -180,7 +256,11 @@ first real schema/repository: `sqlite_bar_record_repository.py`
 (`SqliteBarRecordRepository`, implementing `application.ports.bar_record_repository.
 BarRecordRepository` — `bar_records` + `bar_record_revisions` tables, prices/timestamps
 stored as exact-round-trip `TEXT`, a `threading.Lock` serializing access from the
-writer thread/UI thread/event thread). Broader migrations/other repositories remain
+writer thread/UI thread/event thread). The yfinance-backfill revision of that same
+extension adds a third table, `bar_backfill_conflicts` (append-only, same shape as
+`bar_record_revisions` — both sides' full OHLCV summary plus `detected_at`), backing the
+new `record_conflict`/`list_conflicted_trading_days` port methods. Broader
+migrations/other repositories remain
 Feature 14's job — see `docs/adr/0007-two-month-bar-history-persistence.md`. Feature 06
 adds `sqlite_order_repository.py` (`SqliteOrderRepository`, implementing
 `application.ports.order_repository.OrderRepository` — a single `order_intents` table,
@@ -219,9 +299,20 @@ label and a red/black/doji streak display, and folds "recent" and "historical" c
 bars into one list backed by `MarketDataBarService.query_history()` — a date-range
 picker + 查詢 button lets the operator jump to a different day, but every `refresh()`
 re-queries the currently-selected range so today's view keeps updating live without a
-separate "recent bars" data path), `__main__.py` (the `python -m tfx_quant.desktop`
-entrypoint — also starts/stops `MarketDataBarService`'s, (Feature 06) `OrderManager`'s,
-and (Feature 08) `PositionReconciliationService`'s background timers alongside the
+separate "recent bars" data path; the yfinance-backfill revision of the same extension
+makes each row's displayed 來源 honest per-record — `AGGREGATED_FROM_YUANTA_REALTIME` vs.
+`BACKFILLED_FROM_YFINANCE` — instead of a single hardcoded label), `connectivity_panel.py`
+(Feature 09 — per-channel
+connectivity health table, the current `SafePauseRecord`'s reason/detected/effective time
+if any, reconnect-attempt status, and the one operator control this feature adds, a "停止
+重連" button bound to `ConnectivityMonitor.cancel_reconnect()`; same pure-display,
+`ReadinessFrame`-owns-the-subscriptions pattern as `MarketDataPanel` — no "press
+continue"/resume control exists, since nothing yet drives `StrategyState` into
+`STARTING`/`RUNNING` at all, same documented gap as Feature 06/07/08), `__main__.py` (the
+`python -m tfx_quant.desktop` entrypoint — also starts/stops `MarketDataBarService`'s,
+`BarHistoryBackfillService`'s (the two-month bar-history extension's yfinance-backfill
+revision), (Feature 06) `OrderManager`'s, (Feature 08) `PositionReconciliationService`'s,
+and (Feature 09) `ConnectivityMonitor`'s background timers alongside the
 `EventCoordinator`'s; `ReversalWorkflowService`/`ScalingService` (Feature 07) need no
 start/stop of their own — neither owns a background timer; its uncaught-exception
 handler now calls the shared `domain.strategy_state.attempt_safe_pause()` helper rather
@@ -231,7 +322,15 @@ than inlining the PAUSED_SAFE-else-FAULTED fallback logic itself). `app.py`'s
 active — the "回到前景時查詢持倉" trigger. `composition.py` also resolves
 `TradingSettings.market_data_db_path` (defaulting to a per-user
 `%LOCALAPPDATA%/tfx_quant/market_data.sqlite3`) and wires `SqliteBarRecordRepository`
-into `MarketDataBarService`, (Feature 06) resolves `TradingSettings.order_db_path`
+into `MarketDataBarService`, resolves `TradingSettings.yahoo_ticker_mapping_path`
+(defaulting to the bundled, deliberately-empty `yahoo_ticker_mapping.example.json`) into
+`JsonYahooTickerMappingRepository`, and wires `use_mock`'s `MockYahooHistoryQuery` or
+(lazily imported, same isolation rationale as the SPARK API adapter)
+`YfinanceHistoryQueryAdapter` plus both of the above into `BarHistoryBackfillService`
+(the two-month bar-history extension's yfinance-backfill revision — see
+`docs/adr/0007-two-month-bar-history-persistence.md`'s 2026-08-21 extension), whose
+`is_degraded()` backs a new `compute_readiness()` row ("Market data: yfinance
+backfill"), (Feature 06) resolves `TradingSettings.order_db_path`
 (defaulting to `%LOCALAPPDATA%/tfx_quant/orders.sqlite3`) and wires
 `SqliteOrderRepository` into `OrderManager`, (Feature 07) resolves
 `TradingSettings.reversal_workflow_db_path` (defaulting to
@@ -241,14 +340,23 @@ resolves `TradingSettings.position_baseline_db_path` (defaulting to
 `%LOCALAPPDATA%/tfx_quant/position_baselines.sqlite3`) and wires
 `SqlitePositionBaselineRepository`/`PositionReconciliationService` — whose
 `expected_net_lookup` now replaces Feature 06's always-flat `position_lookup`
-placeholder as `OrderManager`'s real position source. No order-entry UI control exists
-yet, so nothing in this package calls `OrderManager.submit()`/`ReversalWorkflowService.
-start_reversal()`/`ScalingService.evaluate_and_submit()`, and the manual-sync
-confirmation button (`PositionReconciliationService.confirm_manual_sync()`) has no UI
-caller yet either (see `docs/adr/0008-order-and-fill-state-machine.md`,
-`docs/adr/0009-safe-reversal-and-scaling.md`, and `docs/adr/0010-position-
-reconciliation-and-manual-sync.md`). The only package allowed to depend on everything
-else; nothing depends on it.
+placeholder as `OrderManager`'s real position source. (Feature 09) builds
+`ConnectivityMonitor` against the *raw* `broker_session` before rebinding both
+`trade_gateway`/`broker_session` to their `application.connectivity.gateway_tracking`
+tracking wrappers for every other service — avoiding a construction cycle, since the
+wrappers themselves need a `ConnectivityMonitor` reference — and calls
+`connectivity_monitor.attach_reconnect_reconciliation_watcher()` last, strictly after
+`bar_history_backfill_service`/`reconciliation_service`/`order_manager` have all
+subscribed their own `BrokerSessionReady` handlers (see `docs/adr/0011-connectivity-
+reconnect-and-safe-pause.md`'s wiring-order decisions). `compute_readiness()` gains one
+Feature 09 row ("Connectivity: no unresolved safe-pause"). No order-entry UI control
+exists yet, so nothing in this package calls `OrderManager.submit()`/
+`ReversalWorkflowService.start_reversal()`/`ScalingService.evaluate_and_submit()`, and
+the manual-sync confirmation button (`PositionReconciliationService.
+confirm_manual_sync()`) has no UI caller yet either (see `docs/adr/0008-order-and-fill-
+state-machine.md`, `docs/adr/0009-safe-reversal-and-scaling.md`, `docs/adr/0010-position-
+reconciliation-and-manual-sync.md`, and `docs/adr/0011-connectivity-reconnect-and-safe-
+pause.md`). The only package allowed to depend on everything else; nothing depends on it.
 
 ## `tests`
 

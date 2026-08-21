@@ -43,8 +43,10 @@ def main() -> int:
     services = build_services(settings)
     services.event_coordinator.start()
     services.market_data_bar_service.start()
+    services.bar_history_backfill_service.start()
     services.order_manager.start()
     services.reconciliation_service.start()
+    services.connectivity_monitor.start()
     log_startup_readiness(services)
     try:
         app = TfxQuantApp(services)
@@ -53,8 +55,10 @@ def main() -> int:
         _handle_uncaught_exception(services, exc)
         raise
     finally:
+        services.connectivity_monitor.stop()
         services.reconciliation_service.stop()
         services.order_manager.stop()
+        services.bar_history_backfill_service.stop()
         services.market_data_bar_service.stop()
         services.event_coordinator.stop(timeout=5)
     return 0

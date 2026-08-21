@@ -8,7 +8,15 @@ from typing import Any
 import pytest
 from pydantic import SecretStr
 
-from tfx_quant.application.events.events import FillReceived
+from tfx_quant.application.connectivity.connectivity_monitor import ConnectivityMonitor
+from tfx_quant.application.connectivity.gateway_tracking import (
+    ConnectivityTrackingBrokerSession,
+    ConnectivityTrackingTradeGateway,
+)
+from tfx_quant.application.events.events import BrokerSessionInvalidated, FillReceived
+from tfx_quant.application.market_data.bar_history_backfill_service import (
+    BarHistoryBackfillService,
+)
 from tfx_quant.application.order_management.errors import OrderExposureExceededError
 from tfx_quant.application.order_management.order_manager import OrderManager, OrderRequest
 from tfx_quant.application.ports.broker_session import LoginRequest
@@ -26,6 +34,8 @@ from tfx_quant.domain.money import Price
 from tfx_quant.domain.order import OrderKind, TimeInForce
 from tfx_quant.domain.quantity import NetPosition, Quantity
 from tfx_quant.domain.side import Side
+from tfx_quant.domain.strategy_state import StrategyState
+from tfx_quant.domain.timestamp import Timestamp
 from tfx_quant.infrastructure.yuanta.errors import PreflightCheckFailed
 
 
@@ -262,3 +272,109 @@ def test_order_manager_position_lookup_is_the_reconciliation_service_not_a_flat_
     )
     with pytest.raises(OrderExposureExceededError):
         services.order_manager.submit(second_request)
+
+
+def test_bar_history_backfill_service_is_wired_into_service_container(
+    valid_settings_raw: dict[str, Any],
+) -> None:
+    settings = validate_startup(valid_settings_raw)
+    services = build_services(settings)
+    assert isinstance(services.bar_history_backfill_service, BarHistoryBackfillService)
+
+
+def test_yfinance_backfill_readiness_row_is_healthy_with_no_active_selection(
+    valid_settings_raw: dict[str, Any],
+) -> None:
+    """Nothing is selected yet at composition time, so the yfinance-backfill degraded
+    check (which only ever inspects the *currently active* contract) has nothing to
+    report — same "nothing failed yet is reported healthy" posture every other
+    readiness row in this codebase takes."""
+    settings = validate_startup(valid_settings_raw)
+    services = build_services(settings)
+    readiness = dict(compute_readiness(services))
+    assert readiness["Market data: yfinance backfill"] is True
+
+
+def test_yahoo_ticker_mapping_path_is_honored(
+    valid_settings_raw: dict[str, Any], tmp_path: Path
+) -> None:
+    """A configured `yahoo_ticker_mapping_path` must actually be the file
+    `BarHistoryBackfillService` consults — proven behaviorally (via `is_degraded()`
+    after an instrument switch) rather than by reaching into composition internals."""
+    mapping_path = tmp_path / "yahoo_ticker_mapping.json"
+    mapping_path.write_text(
+        json.dumps(
+            {
+                "mappings": [
+                    {
+                        "instrument": "MXF",
+                        "contract_year": 2026,
+                        "contract_month": 9,
+                        "yahoo_ticker": "TESTTICKER=F",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    valid_settings_raw["yahoo_ticker_mapping_path"] = str(mapping_path)
+    settings = validate_startup(valid_settings_raw)
+    services = build_services(settings)
+
+    resolved = services.instrument_selection.resolve_near_month(Instrument.MXF)
+    services.instrument_selection.switch_to(resolved)
+    # `BarHistoryBackfillService` only learns the active contract via its
+    # `InstrumentSwitchCompleted` subscription (unlike `MarketDataBarService.clear()`,
+    # which `switch_to()` calls synchronously) — the event coordinator must actually be
+    # dispatching for that handler to fire.
+    services.event_coordinator.start()
+    services.event_coordinator.stop(timeout=2)
+
+    # A configured mapping means "is_degraded" no longer reports the missing-ticker
+    # condition (mock mode's yahoo_history_query always returns empty, so there is
+    # nothing to conflict on either).
+    assert services.bar_history_backfill_service.is_degraded() is False
+
+
+def test_connectivity_monitor_is_wired_into_service_container(
+    valid_settings_raw: dict[str, Any],
+) -> None:
+    settings = validate_startup(valid_settings_raw)
+    services = build_services(settings)
+    assert isinstance(services.connectivity_monitor, ConnectivityMonitor)
+
+
+def test_broker_session_and_trade_gateway_are_connectivity_tracking_wrappers(
+    valid_settings_raw: dict[str, Any],
+) -> None:
+    """Feature 09's gateway wrappers must sit in front of every other service's
+    `broker_session`/`trade_gateway` dependency — see `docs/adr/0011-connectivity-
+    reconnect-and-safe-pause.md`'s wiring-order note."""
+    settings = validate_startup(valid_settings_raw)
+    services = build_services(settings)
+    assert isinstance(services.broker_session, ConnectivityTrackingBrokerSession)
+    assert isinstance(services.trade_gateway, ConnectivityTrackingTradeGateway)
+
+
+def test_full_disconnect_after_login_drives_a_connectivity_safe_pause_via_composition(
+    valid_settings_raw: dict[str, Any],
+) -> None:
+    settings = validate_startup(valid_settings_raw)
+    services = build_services(settings)
+    services.broker_session.start(_login_request())
+    assert services.broker_session.capabilities.is_session_ready is True
+    services.strategy_state_machine.transition(StrategyState.STARTING)
+    services.strategy_state_machine.transition(StrategyState.RUNNING)
+
+    services.event_coordinator.publish(
+        BrokerSessionInvalidated(at=Timestamp.now(), reason="composition wiring test: 斷線")
+    )
+    services.event_coordinator.start()
+    services.event_coordinator.stop(timeout=2)
+
+    assert services.strategy_state_machine.state is StrategyState.PAUSED_SAFE
+    record = services.connectivity_monitor.current_pause()
+    assert record is not None
+    assert record.detail == "composition wiring test: 斷線"
+    readiness = dict(compute_readiness(services))
+    assert readiness["Connectivity: no unresolved safe-pause"] is False

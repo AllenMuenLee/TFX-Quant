@@ -1,11 +1,14 @@
-"""Pure planning helpers for the two-month bar-history vendor backfill (Feature 04
-extension — 元大 SPARK API `GetKLine` 60分K query, see
-`docs/adr/0007-two-month-bar-history-persistence.md`'s extension decision).
+"""Pure planning helpers for the two-month bar-history yfinance backfill (Feature 04
+extension — see `docs/adr/0007-two-month-bar-history-persistence.md`'s yfinance
+extension decision).
 
 Kept as its own module rather than added to `bar_record.py` purely to avoid a
 `bar_record` <-> `trading_calendar` import cycle (`trading_calendar.py` already imports
 `bar_record.py` for `MarketSession`); this module needs neither, so it's free of that
-constraint.
+constraint. Vendor-neutral by design — nothing here assumes a particular history-query
+provider's per-call limits; the caller (`application.market_data.
+bar_history_backfill_service.BarHistoryBackfillService`) supplies its own
+`max_span_days`.
 """
 
 from __future__ import annotations
@@ -19,12 +22,11 @@ def chunk_consecutive_days(
 ) -> list[tuple[date, date]]:
     """Groups `missing_days` (must already be sorted ascending and deduped) into the
     minimum number of inclusive `(start, end)` calendar-date ranges, each spanning at
-    most `max_span_days` calendar days end-to-end — the vendor's own `GetKLine`
-    per-call limit for intraday periods (60分k: 5天/次, per the docs' own K線種類查詢
-    限制 table). Days that aren't calendar-consecutive (a weekend/holiday sitting
-    between two missing trading days) don't force a new chunk on their own, since
-    `GetKLine`'s `SDate`/`EDate` range is a plain calendar-date span and the vendor
-    itself only returns bars for the trading days actually within it."""
+    most `max_span_days` calendar days end-to-end — a bounded batch size for a single
+    history-query call, not a specific vendor's documented per-call limit. Days that
+    aren't calendar-consecutive (a weekend/holiday sitting between two missing trading
+    days) don't force a new chunk on their own, since a plain calendar-date `start`/`end`
+    range naturally only yields bars for the trading days actually within it."""
     if not missing_days:
         return []
     if max_span_days < 1:

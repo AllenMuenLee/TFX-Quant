@@ -1,6 +1,8 @@
 # 元大期貨自動交易系統：Implementation Prompts
 
-本目錄把客戶需求拆成 16 個可獨立開發與驗收的 feature。每個 prompt 都是可直接交給實作者或 coding agent 的工作指令。所有元大 API 功能一律以[元大 SPARK API 官方入口](https://www.yuanta.com.tw/file-repository/content/API/page/index.html)及其下方連結的 API 說明文件、範例、元件下載與換版資訊為唯一規格來源；不得讀取專案內既有資料夾、舊 SDK 文件、舊範例或既有程式碼來建立或反推 API 功能。實作時須記錄查閱日期與元件版本，且不得憑空假設介面。
+本目錄把客戶需求拆成可獨立開發與驗收的 feature。每個 prompt 都是可直接交給實作者或 coding agent 的工作指令。所有元大期貨交易 API 功能一律以專案根目錄的 [`交易API元件及說明文件/`](../交易API元件及說明文件/) 及其內的 API 說明、Python 範例、元件、版本資訊為唯一規格來源；不得再以 SPARK API 網站、舊 SPARK SDK、既有 SPARK 程式碼或記憶推導新介面。若資料夾不存在、內容不完整或互相矛盾，必須停止該 API 實作並列出待確認項目。實作時須記錄文件檔名、版本與查閱日期。
+
+所有市場價格、即時／延遲行情、OHLCV 與歷史 K 棒一律透過 `yfinance` adapter 取得；元大期貨 API 僅用於登入、帳戶、委託、成交、持倉及交易查詢，不得用來訂閱或補齊市場價格。不得混用 SPARK、元大行情 callback、其他行情商、合成 tick 或手工價格作為 fallback。yfinance 缺值、延遲、斷線或 ticker 無法可靠映射時保留 gap、進入 degraded／安全暫停，禁止猜值或以交易回報價格冒充行情。
 
 ## 強制技術要求：Python
 
@@ -21,26 +23,28 @@
 
 ## 建議實作順序
 
-1. `01-solution-foundation`
-2. `02-yuanta-api-session`、`03-instrument-contract-selection`
-3. `04-market-data-and-60m-bars`
-4. `06-order-and-fill-state-machine`
-5. `05-strategy-signal-engine`、`07-safe-reversal-and-scaling`
-6. `08-position-reconciliation`、`09-connectivity-and-safe-pause`
-7. `10-risk-eod-and-emergency-flatten`
-8. `14-persistence-and-recovery`、`13-logging-errors-and-audit`
-9. `11-pnl-and-trade-reports`、`12-windows-desktop-ui`
-10. `15-simulation-and-automated-tests`
-11. `16-installer-and-documentation`
+1. `00-spark-to-futures-api-migration`
+2. `01-solution-foundation`
+3. `02-yuanta-api-session`、`03-instrument-contract-selection`
+4. `04-market-data-and-60m-bars`
+5. `06-order-and-fill-state-machine`
+6. `05-strategy-signal-engine`、`07-safe-reversal-and-scaling`
+7. `08-position-reconciliation`、`09-connectivity-and-safe-pause`
+8. `10-risk-eod-and-emergency-flatten`
+9. `14-persistence-and-recovery`、`13-logging-errors-and-audit`
+10. `11-pnl-and-trade-reports`、`12-windows-desktop-ui`
+11. `15-simulation-and-automated-tests`
+12. `16-installer-and-documentation`
 
 ## Feature 索引
 
 | 編號 | Feature | 核心產出 |
 |---|---|---|
+| 00 | SPARK-to-Futures API migration | 移除舊 SPARK 設定並建立期貨交易 API 與 yfinance 設定基線 |
 | 01 | Solution foundation | Windows 技術棧、領域模型、模組界線與設定 |
 | 02 | Yuanta API session | 登入、憑證、帳號、API 執行緒與登出 |
 | 03 | Instrument selection | 小台／大台與契約月份選擇及切換保護 |
-| 04 | Market data and bars | 行情訂閱、60 分 K 聚合與交易時段 |
+| 04 | Market data and bars | yfinance 行情、60 分 K 正規化與交易時段 |
 | 05 | Strategy signal engine | 連續紅黑 K、加碼與進場時段規則 |
 | 06 | Order/fill state machine | 委託、成交、部分成交、拒單與冪等防護 |
 | 07 | Safe reversal/scaling | 完全平倉後反手、最多 2 口 |
