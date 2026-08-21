@@ -72,6 +72,30 @@ class TradingSettings(BaseModel):
     and `persistence.sqlite_bar_record_repository`). `None` falls back to a per-user
     data directory (`%LOCALAPPDATA%/tfx_quant/market_data.sqlite3` on Windows) —
     see `desktop.composition._resolve_market_data_db_path`."""
+    order_db_path: str | None = None
+    """Path to the SQLite database file `OrderManager` persists order intents to (see
+    `application.ports.order_repository` and `persistence.sqlite_order_repository`).
+    `None` falls back to a per-user data directory
+    (`%LOCALAPPDATA%/tfx_quant/orders.sqlite3` on Windows) — see
+    `desktop.composition._resolve_order_db_path`. Deliberately a separate file from
+    `market_data_db_path`, never the same connection — see
+    `docs/adr/0008-order-and-fill-state-machine.md`."""
+    reversal_workflow_db_path: str | None = None
+    """Path to the SQLite database file `ReversalWorkflowService` persists reversal
+    workflows to (see `application.ports.reversal_workflow_repository` and
+    `persistence.sqlite_reversal_workflow_repository`). `None` falls back to a per-user
+    data directory (`%LOCALAPPDATA%/tfx_quant/reversal_workflows.sqlite3` on Windows) —
+    see `desktop.composition._resolve_reversal_workflow_db_path`. Deliberately a
+    separate file from `order_db_path`/`market_data_db_path`, never the same connection
+    — see `docs/adr/0009-safe-reversal-and-scaling.md`."""
+    position_baseline_db_path: str | None = None
+    """Path to the SQLite database file `PositionReconciliationService` persists its
+    expected-position baselines to (see `application.ports.position_baseline_repository`
+    and `persistence.sqlite_position_baseline_repository`). `None` falls back to a
+    per-user data directory (`%LOCALAPPDATA%/tfx_quant/position_baselines.sqlite3` on
+    Windows) — see `desktop.composition._resolve_position_baseline_db_path`.
+    Deliberately a separate file from every other `*_db_path`, never the same connection
+    — see `docs/adr/0010-position-reconciliation-and-manual-sync.md`."""
 
     @field_validator("account_alias")
     @classmethod

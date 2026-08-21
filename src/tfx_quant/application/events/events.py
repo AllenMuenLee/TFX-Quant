@@ -18,7 +18,16 @@ from tfx_quant.domain.bar import Bar
 from tfx_quant.domain.contract import ContractMonth
 from tfx_quant.domain.fill import Fill
 from tfx_quant.domain.instrument import Instrument
-from tfx_quant.domain.order import Order
+from tfx_quant.domain.order import ClientOrderId
+from tfx_quant.domain.order_state_machine import LocalOrderId, OrderReport, OrderStatus
+from tfx_quant.domain.position_reconciliation import DiscrepancyKind, ReconciliationTrigger
+from tfx_quant.domain.quantity import NetPosition
+from tfx_quant.domain.reversal_workflow import (
+    FlatConfirmationResult,
+    ReversalWorkflowId,
+    ReversalWorkflowState,
+)
+from tfx_quant.domain.strategy_state import StrategyState
 from tfx_quant.domain.timestamp import Timestamp
 
 
@@ -37,12 +46,46 @@ class ConnectionStatusChanged(Event):
 
 @dataclass(frozen=True, slots=True)
 class OrderReportReceived(Event):
-    order: Order
+    """One broker order-level report (ack/reject/cancel-confirm/...) — see
+    `domain.order_state_machine.OrderReport`. Consumed exclusively by
+    `application.order_management.order_manager.OrderManager`."""
+
+    report: OrderReport
 
 
 @dataclass(frozen=True, slots=True)
 class FillReceived(Event):
+    """One broker fill report. Consumed exclusively by `OrderManager`."""
+
     fill: Fill
+
+
+@dataclass(frozen=True, slots=True)
+class OrderStateTransitioned(Event):
+    """One local `OrderIntent` moved from one `OrderStatus` to another — published after
+    every successfully applied order report or fill (never for a duplicate/out-of-order
+    report that was ignored). Available for future features (position reconciliation,
+    UI) to subscribe to without depending on `OrderManager` directly."""
+
+    local_order_id: LocalOrderId
+    client_order_id: ClientOrderId
+    from_status: OrderStatus
+    to_status: OrderStatus
+    trigger: str
+    broker_order_no: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class OrderRequiresManualReview(Event):
+    """An order reached `REJECTED`, `UNKNOWN`, or an otherwise undecidable state — the
+    safe-pause hook. Fires reliably; does not itself enforce a strategy-wide pause, same
+    split as `BrokerSessionInvalidated`/`MarketDataGapDetected` — gating `StrategyState`
+    on this is Feature 09/10's job."""
+
+    local_order_id: LocalOrderId
+    client_order_id: ClientOrderId
+    status: OrderStatus
+    reason: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,6 +268,109 @@ class BarBackfillCompleted(Event):
     contract: ContractMonth
     requested_day_count: int
     filled_day_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class ReversalWorkflowStarted(Event):
+    """A reversal workflow began (`ReversalWorkflowState.STARTED` persisted) — the
+    "workflow ID、起始實際持倉、目標方向" debug-log requirement's event counterpart.
+    Published once per `trigger_key`, never on a deduped resubmission."""
+
+    workflow_id: ReversalWorkflowId
+    account: TradingAccount
+    instrument: Instrument
+    contract: ContractMonth
+    trigger_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class ReversalFlatConfirmed(Event):
+    """The flat-confirmation gate passed — a fresh broker position query independently
+    corroborated the close order's full-fill report. The reverse entry order is
+    submitted only after this, never before — see `ReversalEntrySubmitted.at`."""
+
+    workflow_id: ReversalWorkflowId
+
+
+@dataclass(frozen=True, slots=True)
+class ReverseEntryBlocked(Event):
+    """The reverse entry order was *not* submitted — either the flat-confirmation gate
+    failed (`result` populated) or the workflow was blocked before ever querying a
+    position (too close to the mandatory EOD flatten deadline, or already flat with
+    nothing to reverse — `result` is `None` in that case). The explicit "在 flat 未確認
+    前應有明確的 reverse_entry_blocked 事件" requirement."""
+
+    workflow_id: ReversalWorkflowId
+    reason: str
+    result: FlatConfirmationResult | None
+
+
+@dataclass(frozen=True, slots=True)
+class ReversalEntrySubmitted(Event):
+    """The reverse entry order was submitted — always strictly after
+    `ReversalFlatConfirmed` for the same `workflow_id`. The acceptance test's "反向單
+    時間戳一定晚於全平成交及零持倉查詢" assertion anchors on this event's `at`."""
+
+    workflow_id: ReversalWorkflowId
+    entry_client_order_id: ClientOrderId
+
+
+@dataclass(frozen=True, slots=True)
+class ReversalCompleted(Event):
+    """The reverse entry order reached `OrderStatus.FILLED` — the workflow is done."""
+
+    workflow_id: ReversalWorkflowId
+
+
+@dataclass(frozen=True, slots=True)
+class ReversalPausedSafe(Event):
+    """A reversal workflow moved to `ReversalWorkflowState.PAUSED_SAFE` — partial fill,
+    reject, timeout, disconnect, or a contradictory query at any step. Fires reliably;
+    does not itself force a `StrategyState` transition, same "fires reliably, doesn't
+    enforce" split as `BrokerSessionInvalidated`/`OrderRequiresManualReview`. Nothing in
+    this codebase auto-resumes a paused workflow."""
+
+    workflow_id: ReversalWorkflowId
+    state: ReversalWorkflowState
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class PositionDiscrepancyDetected(Event):
+    """Broker-actual position diverged from this system's own expected baseline in
+    direction or quantity — `application.position_reconciliation.
+    PositionReconciliationService.reconcile()` found a `DiscrepancyKind != NONE`.
+
+    Unlike `BrokerSessionInvalidated`/`OrderRequiresManualReview`/`ReversalPausedSafe`
+    ("fires reliably, does not itself enforce a strategy-wide pause — gating
+    `StrategyState` is Feature 09/10's job"), this event's publisher *does* drive
+    `StrategyStateMachine` toward `PAUSED_SAFE`/`FAULTED` itself before publishing —
+    position reconciliation is explicitly this feature's own job per the implementation
+    prompt, not deferred."""
+
+    trigger: ReconciliationTrigger
+    account: TradingAccount
+    instrument: Instrument
+    contract: ContractMonth
+    expected_net: NetPosition
+    actual_net: NetPosition
+    discrepancy: DiscrepancyKind
+    resulting_strategy_state: StrategyState | None
+    correlation_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class ManualPositionSyncCompleted(Event):
+    """A human confirmed `PositionReconciliationService.confirm_manual_sync()` — the
+    expected baseline now equals the broker-confirmed actual position. The strategy
+    remains wherever it already was; this event never itself resumes `RUNNING`."""
+
+    account: TradingAccount
+    instrument: Instrument
+    contract: ContractMonth
+    baseline_before: NetPosition
+    baseline_after: NetPosition
+    correlation_id: str
 
 
 @dataclass(frozen=True, slots=True)

@@ -5,7 +5,7 @@ import itertools
 import pytest
 
 from tfx_quant.domain.errors import IllegalStateTransitionError
-from tfx_quant.domain.strategy_state import StrategyState, StrategyStateMachine
+from tfx_quant.domain.strategy_state import StrategyState, StrategyStateMachine, attempt_safe_pause
 
 LEGAL_TRANSITIONS = {
     (StrategyState.STOPPED, StrategyState.STARTING),
@@ -52,3 +52,33 @@ def test_running_is_only_reachable_from_starting() -> None:
 
 def test_new_machine_starts_stopped() -> None:
     assert StrategyStateMachine().state is StrategyState.STOPPED
+
+
+def test_attempt_safe_pause_from_running_reaches_paused_safe() -> None:
+    machine = StrategyStateMachine(initial=StrategyState.RUNNING)
+    resulting = attempt_safe_pause(machine)
+    assert resulting is StrategyState.PAUSED_SAFE
+    assert machine.state is StrategyState.PAUSED_SAFE
+
+
+@pytest.mark.parametrize(
+    "from_state", [StrategyState.STARTING, StrategyState.STOPPING, StrategyState.FAULTED]
+)
+def test_attempt_safe_pause_falls_back_to_faulted_when_paused_safe_unreachable(
+    from_state: StrategyState,
+) -> None:
+    machine = StrategyStateMachine(initial=from_state)
+    resulting = attempt_safe_pause(machine)
+    if StrategyStateMachine.can_transition(from_state, StrategyState.FAULTED):
+        assert resulting is StrategyState.FAULTED
+        assert machine.state is StrategyState.FAULTED
+    else:
+        assert resulting is None
+        assert machine.state is from_state
+
+
+def test_attempt_safe_pause_is_a_noop_when_neither_transition_is_legal() -> None:
+    machine = StrategyStateMachine(initial=StrategyState.STOPPED)
+    resulting = attempt_safe_pause(machine)
+    assert resulting is None
+    assert machine.state is StrategyState.STOPPED

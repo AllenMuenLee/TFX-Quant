@@ -20,3 +20,11 @@ class Fill:
     quantity: Quantity
     price: Price
     at: Timestamp
+    broker_fill_no: str
+    """The broker's own unique fill identifier — the dedup key and the "由 fill ID 串回
+    原 intent" traceability key every fill-related log record must carry alongside the
+    local order id."""
+    broker_seq_no: int
+    """Feeds the same per-order monotonic ordering/dedup gate as `OrderReport.
+    broker_seq_no` (see `domain/order_state_machine.py`) — order reports and fills for one
+    order share a single sequence space."""

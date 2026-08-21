@@ -1,7 +1,10 @@
 """`python -m tfx_quant.desktop` — launches the startup diagnostics screen.
 
-Sends no orders. Nothing in this feature can — see StartupSafetyGate and the domain
-layer's total absence of an order-sending code path.
+`OrderManager` (Feature 06) is wired up and running, but nothing in this desktop shell
+calls `OrderManager.submit()` yet — there is still no UI order-entry control and no
+strategy engine driving it automatically. See
+`application.order_management.order_manager.OrderManager` and
+`docs/adr/0008-order-and-fill-state-machine.md`.
 """
 
 from __future__ import annotations
@@ -15,7 +18,7 @@ from pathlib import Path
 from tfx_quant import __version__
 from tfx_quant.desktop.app import TfxQuantApp
 from tfx_quant.desktop.composition import build_services, load_settings, log_startup_readiness
-from tfx_quant.domain.strategy_state import StrategyState
+from tfx_quant.domain.strategy_state import attempt_safe_pause
 from tfx_quant.telemetry import get_logger, log_critical, log_info
 from tfx_quant.telemetry.setup import configure_logging
 
@@ -40,6 +43,8 @@ def main() -> int:
     services = build_services(settings)
     services.event_coordinator.start()
     services.market_data_bar_service.start()
+    services.order_manager.start()
+    services.reconciliation_service.start()
     log_startup_readiness(services)
     try:
         app = TfxQuantApp(services)
@@ -48,6 +53,8 @@ def main() -> int:
         _handle_uncaught_exception(services, exc)
         raise
     finally:
+        services.reconciliation_service.stop()
+        services.order_manager.stop()
         services.market_data_bar_service.stop()
         services.event_coordinator.stop(timeout=5)
     return 0
@@ -59,18 +66,10 @@ def _handle_uncaught_exception(services: object, exc: BaseException) -> None:
     from tfx_quant.desktop.composition import ServiceContainer
 
     assert isinstance(services, ServiceContainer)
-    state_machine = services.strategy_state_machine
     # PAUSED_SAFE is only reachable from RUNNING (see `domain/strategy_state.py`'s
     # transition table) — anywhere else, FAULTED is the state machine's actual
     # "stop trading, needs operator attention" terminal for an unexpected failure.
-    if state_machine.can_transition(state_machine.state, StrategyState.PAUSED_SAFE):
-        resulting_state = StrategyState.PAUSED_SAFE
-    elif state_machine.can_transition(state_machine.state, StrategyState.FAULTED):
-        resulting_state = StrategyState.FAULTED
-    else:
-        resulting_state = None
-    if resulting_state is not None:
-        state_machine.transition(resulting_state)
+    resulting_state = attempt_safe_pause(services.strategy_state_machine)
     log_critical(
         _logger,
         "uncaught_exception",

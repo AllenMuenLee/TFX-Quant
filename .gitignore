@@ -8,7 +8,10 @@ dist/
 
 # Virtual environment
 .venv/
+.venv64/
 venv/
+Logs/
+YuantaSparkAPI_win-x64_Python/
 
 # Tooling caches
 .pytest_cache/

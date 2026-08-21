@@ -77,3 +77,21 @@ class StrategyStateMachine:
             from_state=from_state.value,
             to_state=to_state.value,
         )
+
+
+def attempt_safe_pause(state_machine: StrategyStateMachine) -> StrategyState | None:
+    """Best-effort "stop trading now" transition, shared by every safe-pause call site
+    (`desktop.__main__`'s uncaught-exception handler, `application.
+    position_reconciliation`'s position-mismatch pause): `PAUSED_SAFE` when reachable
+    (only from `RUNNING`), else `FAULTED` when that's reachable, else leaves the machine
+    untouched (already `STOPPED`/`STOPPING`/`PAUSED_SAFE`/`FAULTED`). Returns whichever
+    state it actually moved to, or `None` if neither was legal from the current state."""
+    state = state_machine.state
+    if state_machine.can_transition(state, StrategyState.PAUSED_SAFE):
+        resulting = StrategyState.PAUSED_SAFE
+    elif state_machine.can_transition(state, StrategyState.FAULTED):
+        resulting = StrategyState.FAULTED
+    else:
+        return None
+    state_machine.transition(resulting)
+    return resulting

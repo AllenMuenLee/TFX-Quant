@@ -17,30 +17,64 @@ aggregation.md`), `BarRecord`/`BarPeriod`/`MarketSession`/`BarDataSource`/
 `rolling_two_month_start`/`ContinuitySegment`/`continuous_segments` (`bar_record.py` —
 the two-month bar-history extension's persisted-record shape, rolling-window math, and
 gap-detection; see `docs/adr/0007-two-month-bar-history-persistence.md`),
-`StrategySignal`, `Position`, `Order`/`ClientOrderId`, `Fill`, `Pnl`, `StrategyState` +
-`StrategyStateMachine`. All illegal-state construction raises a `DomainError` subclass
-from `domain/errors.py`.
+`StrategySignal`, `Position`, `Order`/`ClientOrderId`, `Fill` (+ `broker_fill_no`/
+`broker_seq_no` — Feature 06), `Pnl`, `StrategyState` + `StrategyStateMachine`,
+`OrderStatus`/`LocalOrderId`/`OrderReport`/`OrderIntent`/`OrderStateMachine`/
+`worst_case_net_position_range` (`order_state_machine.py` — Feature 06's order/fill
+lifecycle state model; see `docs/adr/0008-order-and-fill-state-machine.md`),
+`ReversalWorkflowState`/`ReversalWorkflowId`/`ReversalWorkflowRecord`/
+`ReversalWorkflowStateMachine`/`FlatConfirmationResult`/`reversal_side_for`
+(`reversal_workflow.py` — Feature 07's multi-step reversal lifecycle state model; see
+`docs/adr/0009-safe-reversal-and-scaling.md`; the state machine gained one narrowly-
+scoped extra legal edge, `PAUSED_SAFE -> BLOCKED`, for Feature 08's manual-sync reset —
+see below), `attempt_safe_pause` (`strategy_state.py` — the shared "PAUSED_SAFE when
+reachable, else FAULTED, else leave alone" helper `desktop.__main__`'s uncaught-
+exception handler and Feature 08's `PositionReconciliationService` both use),
+`ReconciliationTrigger`/`DiscrepancyKind`/`classify_discrepancy`/
+`SUSPECTED_CAUSE_HYPOTHESES`/`PositionBaseline`/`ReconciliationRecord`/
+`ManualSyncPreflight`/`ManualSyncRecord` (`position_reconciliation.py` — Feature 08's
+expected-vs-actual-position comparison model and manual-sync gate/audit shapes; see
+`docs/adr/0010-position-reconciliation-and-manual-sync.md`). All illegal-state
+construction raises a `DomainError` subclass from `domain/errors.py`.
 
 ## `application`
 
 - `application/ports/` — `Protocol` interfaces (`Clock`, `IdGenerator`,
   `TradeGatewayPort`, `QuoteGatewayPort`, `IBrokerSession`, `InstrumentMasterRepository`,
-  `BarSignalStateStore`, `TradingCalendarRepository`, `BarRecordRepository`) that
-  infrastructure/persistence implementations satisfy. `IBrokerSession` (Feature 02) is
-  the Yuanta login/session-lifecycle port — richer than, and additive to,
-  `TradeGatewayPort`/`QuoteGatewayPort`; see `docs/adr/0004-broker-session-
+  `BarSignalStateStore`, `TradingCalendarRepository`, `BarRecordRepository`,
+  `OrderRepository`, `ReversalWorkflowRepository`, `PositionBaselineRepository`) that
+  infrastructure/persistence implementations satisfy.
+  `IBrokerSession` (Feature 02) is the Yuanta login/session-lifecycle port — richer than,
+  and additive to, `TradeGatewayPort`/`QuoteGatewayPort`; see `docs/adr/0004-broker-session-
   architecture.md`. `InstrumentMasterRepository`/`BarSignalStateStore` (Feature 03) are
   the 商品主檔 lookup and K棒/訊號 reset seams — see `docs/adr/0005-instrument-master-
   and-selection.md`. `TradingCalendarRepository` (Feature 04) is the controlled 交易日曆
   （休市／提早收盤）lookup seam — see `docs/adr/0006-market-data-and-bar-
   aggregation.md`. `BarRecordRepository` (the two-month bar-history extension) is the
   closed-bar persistence seam `SqliteBarRecordRepository` implements — see
-  `docs/adr/0007-two-month-bar-history-persistence.md`.
+  `docs/adr/0007-two-month-bar-history-persistence.md`. `OrderRepository` (Feature 06) is
+  the order-intent persistence seam `SqliteOrderRepository` implements, plus
+  `TradeGatewayPort`'s new `submit_order`/`cancel_order`/`query_order_reports`/
+  `query_fills` methods — see `docs/adr/0008-order-and-fill-state-machine.md`.
+  `ReversalWorkflowRepository` (Feature 07) is the reversal-workflow persistence seam
+  `SqliteReversalWorkflowRepository` implements — see `docs/adr/0009-safe-reversal-and-
+  scaling.md`. `PositionBaselineRepository` (Feature 08) is the expected-position-
+  baseline persistence seam `SqlitePositionBaselineRepository` implements — see
+  `docs/adr/0010-position-reconciliation-and-manual-sync.md`.
 - `application/events/` — `Event` shapes and `EventCoordinator`, the single
   serialized event-processing queue. Feature 04 adds `MarketDataTickReceived`,
   `BarClosed`, `MarketDataFreshnessChanged`, `MarketDataGapDetected`/
   `MarketDataGapCleared`; the two-month bar-history extension adds
-  `BarPersistenceHealthChanged`/`BarRetentionCleanupCompleted`.
+  `BarPersistenceHealthChanged`/`BarRetentionCleanupCompleted`; Feature 06 reshapes
+  `OrderReportReceived` (now carries `OrderReport`, not `Order`) and adds
+  `OrderStateTransitioned`/`OrderRequiresManualReview`; Feature 07 adds
+  `ReversalWorkflowStarted`/`ReversalFlatConfirmed`/`ReverseEntryBlocked`/
+  `ReversalEntrySubmitted`/`ReversalCompleted`/`ReversalPausedSafe` (no new scaling
+  events — logging-only, see `docs/adr/0009-safe-reversal-and-scaling.md`); Feature 08
+  adds `PositionDiscrepancyDetected`/`ManualPositionSyncCompleted` — the former is the
+  one event in this codebase whose publisher *also* directly enforces the
+  `StrategyState` pause itself, rather than "fires reliably, doesn't enforce" (see
+  `docs/adr/0010-position-reconciliation-and-manual-sync.md`).
 - `application/safety/` — `SafetyChecklist` + `StartupSafetyGate`, the only path into
   `StrategyState.RUNNING`. Nine independent checklist items as of Feature 03.
 - `application/settings/` — `TradingSettings` (pydantic) + `validate_startup()`.
@@ -62,6 +96,37 @@ from `domain/errors.py`.
   retention cleanup; and the `continuous_warm_up_bars`/`recorded_range`/`query_history`/
   `is_persistence_degraded`/`candle_streak` query methods. See `docs/adr/0007-two-month-
   bar-history-persistence.md`.
+- `application/order_management/` (Feature 06) — `OrderManager`, the only component
+  allowed to turn a trading intent into a real Yuanta order, plus its `OrderRequest`
+  input DTO, `validation.validate_exposure_within_cap`, and its own `errors.py`
+  (`ActiveWorkflowInProgressError`/`OrderExposureExceededError`/`OrderNotFoundError`).
+  Subscribes to `OrderReportReceived`/`FillReceived`/`BrokerSessionReady`; persists every
+  transition via `OrderRepository` synchronously (not the async bounded-queue pattern
+  `MarketDataBarService` uses for bars — order volume is low and the point is a
+  *stronger* durability guarantee). See `docs/adr/0008-order-and-fill-state-machine.md`.
+- `application/reversal_scaling/` (Feature 07) — `ReversalWorkflowService` (the
+  persisted, recoverable reversal state machine driver — `start_reversal`/
+  `resume_pending_workflows`, both funneling through the same `_advance` step-dispatcher)
+  and `ScalingService` (single-step ±1→±2 add-on evaluator/submitter, no persisted
+  workflow of its own), `gates.py` (`evaluate_flat_confirmation`/`evaluate_scaling_gate`/
+  `is_too_close_to_eod`), and `errors.py`
+  (`ReversalAlreadyActiveError`/`InvalidSignalKindError`). Both services only ever send
+  an order through `OrderManager` — neither ever calls `TradeGatewayPort.submit_order`
+  directly. See `docs/adr/0009-safe-reversal-and-scaling.md`.
+- `application/position_reconciliation/` (Feature 08) — `PositionReconciliationService`:
+  queries `TradeGatewayPort.query_positions()` at every required trigger (login,
+  reconnect, every fill, the reversal flat-confirmation gate, a timed poll, foreground
+  return, and manual requery), compares against the persisted `PositionBaseline`, and
+  drives `StrategyStateMachine` toward `PAUSED_SAFE`/`FAULTED` itself on any mismatch
+  (the one exception to this codebase's usual "event fires, doesn't enforce" split).
+  `expected_net_lookup` replaces Feature 06's always-flat `OrderManager.position_lookup`
+  placeholder. `confirm_manual_sync()` is the two-step manual-sync flow's second half —
+  re-verifies the broker position fresh, gates on no active/unknown local orders,
+  updates the baseline, resets bar/signal state via `BarSignalStateStore.clear()`, and
+  retires (never resumes) any `PAUSED_SAFE` reversal workflow on that contract — and
+  never itself submits an order or resumes `RUNNING`. `errors.py`
+  (`ManualSyncBlockedError`/`StaleSyncConfirmationError`). See `docs/adr/0010-position-
+  reconciliation-and-manual-sync.md`.
 
 Depends only on `domain`.
 
@@ -94,7 +159,18 @@ previously-stubbed `subscribe`/`unsubscribe`; Feature 04 adds `market_data_parsi
 `docs/adr/0004-broker-session-architecture.md` for the session architecture,
 `docs/adr/0005-instrument-master-and-selection.md` for the instrument master/selection
 design, and `docs/adr/0006-market-data-and-bar-aggregation.md` for the market-data/bar
-design.
+design. Feature 06 extends `mock_trade_gateway.py`'s `MockTradeGateway` with
+`submit_order`/`cancel_order`/`query_order_reports`/`query_fills` and scripted
+`simulate_ack`/`simulate_reject`/`simulate_fill`/`simulate_cancel_confirmed`/
+`replay_last_fill` methods, and adds the same four methods to
+`broker_session_gateway_views.py`'s `BrokerSessionTradeGatewayView` as honest
+`NotImplementedError` stubs — real vendor order-submission wiring is deferred, see
+`docs/adr/0008-order-and-fill-state-machine.md`. Feature 07 adds one more
+`MockTradeGateway` scripting method, `set_positions()`, so tests can simulate the
+broker's position query changing over time independent of any simulated fill. Feature 08
+adds `fail_next_query_positions()`, so tests can script a transient
+`query_positions()` failure (raise once, then resume normal scripted results) without a
+real vendor connection — see `docs/adr/0010-position-reconciliation-and-manual-sync.md`.
 
 ## `persistence`
 
@@ -105,7 +181,26 @@ first real schema/repository: `sqlite_bar_record_repository.py`
 BarRecordRepository` — `bar_records` + `bar_record_revisions` tables, prices/timestamps
 stored as exact-round-trip `TEXT`, a `threading.Lock` serializing access from the
 writer thread/UI thread/event thread). Broader migrations/other repositories remain
-Feature 14's job — see `docs/adr/0007-two-month-bar-history-persistence.md`.
+Feature 14's job — see `docs/adr/0007-two-month-bar-history-persistence.md`. Feature 06
+adds `sqlite_order_repository.py` (`SqliteOrderRepository`, implementing
+`application.ports.order_repository.OrderRepository` — a single `order_intents` table,
+one row per order intent, mutated via `UPDATE` rather than append-only like bar records).
+Deliberately its **own** `sqlite3.Connection`/file (`orders.sqlite3`), never sharing
+`market_data.sqlite3`'s connection — two independently-locked repositories over one
+shared connection would not actually mutually exclude each other. See
+`docs/adr/0008-order-and-fill-state-machine.md`. Feature 07 adds
+`sqlite_reversal_workflow_repository.py` (`SqliteReversalWorkflowRepository`,
+implementing `application.ports.reversal_workflow_repository.
+ReversalWorkflowRepository` — same one-row-per-record/`UPDATE`/own-connection shape,
+its own `reversal_workflows.sqlite3` file). See
+`docs/adr/0009-safe-reversal-and-scaling.md`. Feature 08 adds
+`sqlite_position_baseline_repository.py` (`SqlitePositionBaselineRepository`,
+implementing `application.ports.position_baseline_repository.
+PositionBaselineRepository` — one row per account/instrument/contract, its own
+`position_baselines.sqlite3` file; a plain `INSERT ... ON CONFLICT DO UPDATE` upsert
+rather than the insert/update split the other two repositories use, since a baseline has
+no idempotency/trigger-key dedup concept). See `docs/adr/0010-position-reconciliation-
+and-manual-sync.md`.
 
 ## `desktop`
 
@@ -125,12 +220,35 @@ bars into one list backed by `MarketDataBarService.query_history()` — a date-r
 picker + 查詢 button lets the operator jump to a different day, but every `refresh()`
 re-queries the currently-selected range so today's view keeps updating live without a
 separate "recent bars" data path), `__main__.py` (the `python -m tfx_quant.desktop`
-entrypoint — also starts/stops `MarketDataBarService`'s background timer and bar-record
-writer thread alongside the `EventCoordinator`'s). `composition.py` also resolves
+entrypoint — also starts/stops `MarketDataBarService`'s, (Feature 06) `OrderManager`'s,
+and (Feature 08) `PositionReconciliationService`'s background timers alongside the
+`EventCoordinator`'s; `ReversalWorkflowService`/`ScalingService` (Feature 07) need no
+start/stop of their own — neither owns a background timer; its uncaught-exception
+handler now calls the shared `domain.strategy_state.attempt_safe_pause()` helper rather
+than inlining the PAUSED_SAFE-else-FAULTED fallback logic itself). `app.py`'s
+`TfxQuantApp` (Feature 08) binds `wx.EVT_ACTIVATE_APP` to call
+`PositionReconciliationService.on_foreground_return()` whenever the window becomes
+active — the "回到前景時查詢持倉" trigger. `composition.py` also resolves
 `TradingSettings.market_data_db_path` (defaulting to a per-user
 `%LOCALAPPDATA%/tfx_quant/market_data.sqlite3`) and wires `SqliteBarRecordRepository`
-into `MarketDataBarService`. The only package allowed to depend on everything else;
-nothing depends on it.
+into `MarketDataBarService`, (Feature 06) resolves `TradingSettings.order_db_path`
+(defaulting to `%LOCALAPPDATA%/tfx_quant/orders.sqlite3`) and wires
+`SqliteOrderRepository` into `OrderManager`, (Feature 07) resolves
+`TradingSettings.reversal_workflow_db_path` (defaulting to
+`%LOCALAPPDATA%/tfx_quant/reversal_workflows.sqlite3`) and wires
+`SqliteReversalWorkflowRepository` into `ReversalWorkflowService`, and (Feature 08)
+resolves `TradingSettings.position_baseline_db_path` (defaulting to
+`%LOCALAPPDATA%/tfx_quant/position_baselines.sqlite3`) and wires
+`SqlitePositionBaselineRepository`/`PositionReconciliationService` — whose
+`expected_net_lookup` now replaces Feature 06's always-flat `position_lookup`
+placeholder as `OrderManager`'s real position source. No order-entry UI control exists
+yet, so nothing in this package calls `OrderManager.submit()`/`ReversalWorkflowService.
+start_reversal()`/`ScalingService.evaluate_and_submit()`, and the manual-sync
+confirmation button (`PositionReconciliationService.confirm_manual_sync()`) has no UI
+caller yet either (see `docs/adr/0008-order-and-fill-state-machine.md`,
+`docs/adr/0009-safe-reversal-and-scaling.md`, and `docs/adr/0010-position-
+reconciliation-and-manual-sync.md`). The only package allowed to depend on everything
+else; nothing depends on it.
 
 ## `tests`
 

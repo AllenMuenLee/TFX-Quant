@@ -14,6 +14,14 @@ here instead of raising would silently look like "confirmed no open orders" to
 `StartupSafetyGate`'s "no unknown orders" check — a false safety signal — so these
 still raise.
 
+`submit_order`/`cancel_order`/`query_order_reports`/`query_fills` (Feature 06) raise the
+same way, for the same reason: this codebase's "不得臆測：API 名稱、參數..." rule means
+real 委託/回報 SPARK API method names may only be wired in once someone with real
+credentials has read the live docs (see `implementation prompt/06-order-and-fill-state-
+machine/implementation-prompt.md`'s banner). `application.order_management.OrderManager`
+and its tests are fully built against `MockTradeGateway` instead — see
+`docs/adr/0008-order-and-fill-state-machine.md`.
+
 `subscribe`/`unsubscribe` are Feature 03's job and are implemented for real here: the
 instrument/contract → vendor-symbol translation comes from the controlled
 `InstrumentMasterRepository` (see `instrument_master_repository.py`), and the actual
@@ -29,8 +37,10 @@ from tfx_quant.application.instrument_selection.errors import InstrumentMasterEn
 from tfx_quant.application.ports.broker_session import IBrokerSession
 from tfx_quant.application.ports.instrument_master import InstrumentMasterRepository
 from tfx_quant.domain.contract import ContractMonth
+from tfx_quant.domain.fill import Fill
 from tfx_quant.domain.instrument import Instrument
-from tfx_quant.domain.order import Order
+from tfx_quant.domain.order import ClientOrderId, Order
+from tfx_quant.domain.order_state_machine import OrderReport
 from tfx_quant.domain.position import Position
 
 _NOT_YET_PARSED_MESSAGE = (
@@ -53,6 +63,18 @@ class BrokerSessionTradeGatewayView:
         raise NotImplementedError(_NOT_YET_PARSED_MESSAGE)
 
     def query_positions(self) -> Sequence[Position]:
+        raise NotImplementedError(_NOT_YET_PARSED_MESSAGE)
+
+    def submit_order(self, order: Order, *, client_order_id: ClientOrderId) -> None:
+        raise NotImplementedError(_NOT_YET_PARSED_MESSAGE)
+
+    def cancel_order(self, client_order_id: ClientOrderId) -> None:
+        raise NotImplementedError(_NOT_YET_PARSED_MESSAGE)
+
+    def query_order_reports(self) -> Sequence[OrderReport]:
+        raise NotImplementedError(_NOT_YET_PARSED_MESSAGE)
+
+    def query_fills(self) -> Sequence[Fill]:
         raise NotImplementedError(_NOT_YET_PARSED_MESSAGE)
 
 

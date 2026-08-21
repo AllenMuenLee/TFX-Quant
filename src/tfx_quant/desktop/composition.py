@@ -21,6 +21,7 @@ from tfx_quant.application.market_data.bar_history_backfill_service import (
     BarHistoryBackfillService,
 )
 from tfx_quant.application.market_data.bar_service import MarketDataBarService
+from tfx_quant.application.order_management.order_manager import OrderManager
 from tfx_quant.application.ports.bar_signal_state import BarSignalStateStore
 from tfx_quant.application.ports.broker_session import IBrokerSession
 from tfx_quant.application.ports.clock import Clock
@@ -29,6 +30,11 @@ from tfx_quant.application.ports.identity import IdGenerator
 from tfx_quant.application.ports.instrument_master import InstrumentMasterRepository
 from tfx_quant.application.ports.trading_calendar import TradingCalendarRepository
 from tfx_quant.application.ports.yuanta_gateways import QuoteGatewayPort, TradeGatewayPort
+from tfx_quant.application.position_reconciliation.reconciliation_service import (
+    PositionReconciliationService,
+)
+from tfx_quant.application.reversal_scaling.reversal_service import ReversalWorkflowService
+from tfx_quant.application.reversal_scaling.scaling_service import ScalingService
 from tfx_quant.application.settings.trading_settings import TradingSettings, validate_startup
 from tfx_quant.domain.strategy_state import StrategyStateMachine
 from tfx_quant.infrastructure.clock import SystemClock
@@ -52,6 +58,13 @@ from tfx_quant.infrastructure.yuanta.preflight import raise_if_any_failed, run_p
 from tfx_quant.infrastructure.yuanta.session_orchestrator import BrokerSessionOrchestrator
 from tfx_quant.persistence.sqlite_bar_record_repository import SqliteBarRecordRepository
 from tfx_quant.persistence.sqlite_connection import create_connection
+from tfx_quant.persistence.sqlite_order_repository import SqliteOrderRepository
+from tfx_quant.persistence.sqlite_position_baseline_repository import (
+    SqlitePositionBaselineRepository,
+)
+from tfx_quant.persistence.sqlite_reversal_workflow_repository import (
+    SqliteReversalWorkflowRepository,
+)
 from tfx_quant.telemetry import get_logger, log_error, log_info
 
 _logger = get_logger(__name__)
@@ -84,6 +97,10 @@ class ServiceContainer:
     instrument_selection: InstrumentSelectionService
     market_data_bar_service: MarketDataBarService
     bar_history_backfill_service: BarHistoryBackfillService
+    order_manager: OrderManager
+    reversal_workflow_service: ReversalWorkflowService
+    scaling_service: ScalingService
+    reconciliation_service: PositionReconciliationService
 
 
 def load_settings(path: Path) -> TradingSettings:
@@ -110,6 +127,9 @@ def load_settings(path: Path) -> TradingSettings:
         instrument_master_path_configured=settings.instrument_master_path is not None,
         trading_calendar_path_configured=settings.trading_calendar_path is not None,
         market_data_db_path_configured=settings.market_data_db_path is not None,
+        order_db_path_configured=settings.order_db_path is not None,
+        reversal_workflow_db_path_configured=settings.reversal_workflow_db_path is not None,
+        position_baseline_db_path_configured=settings.position_baseline_db_path is not None,
     )
     return settings
 
@@ -136,6 +156,37 @@ def _resolve_market_data_db_path(settings: TradingSettings) -> Path:
     local_app_data = os.environ.get("LOCALAPPDATA")
     base = Path(local_app_data) if local_app_data else Path.home()
     return base / "tfx_quant" / "market_data.sqlite3"
+
+
+def _resolve_order_db_path(settings: TradingSettings) -> Path:
+    """Mirrors `_resolve_market_data_db_path` — a separate per-user data file, never the
+    same connection (see `docs/adr/0008-order-and-fill-state-machine.md`)."""
+    if settings.order_db_path is not None:
+        return Path(settings.order_db_path)
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    base = Path(local_app_data) if local_app_data else Path.home()
+    return base / "tfx_quant" / "orders.sqlite3"
+
+
+def _resolve_reversal_workflow_db_path(settings: TradingSettings) -> Path:
+    """Mirrors `_resolve_order_db_path` — a separate per-user data file, never the same
+    connection (see `docs/adr/0009-safe-reversal-and-scaling.md`)."""
+    if settings.reversal_workflow_db_path is not None:
+        return Path(settings.reversal_workflow_db_path)
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    base = Path(local_app_data) if local_app_data else Path.home()
+    return base / "tfx_quant" / "reversal_workflows.sqlite3"
+
+
+def _resolve_position_baseline_db_path(settings: TradingSettings) -> Path:
+    """Mirrors `_resolve_order_db_path`/`_resolve_reversal_workflow_db_path` — a
+    separate per-user data file, never the same connection (see
+    `docs/adr/0010-position-reconciliation-and-manual-sync.md`)."""
+    if settings.position_baseline_db_path is not None:
+        return Path(settings.position_baseline_db_path)
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    base = Path(local_app_data) if local_app_data else Path.home()
+    return base / "tfx_quant" / "position_baselines.sqlite3"
 
 
 def build_services(settings: TradingSettings) -> ServiceContainer:
@@ -228,6 +279,87 @@ def build_services(settings: TradingSettings) -> ServiceContainer:
         historical_price_query=historical_price_query,
     )
 
+    order_db_path = _resolve_order_db_path(settings)
+    order_connection = create_connection(order_db_path, check_same_thread=False)
+    log_info(
+        _logger,
+        "module_loaded",
+        module="order_db",
+        path_configured=settings.order_db_path is not None,
+        path_basename=order_db_path.name,
+    )
+    order_repository = SqliteOrderRepository(order_connection)
+
+    reversal_workflow_db_path = _resolve_reversal_workflow_db_path(settings)
+    reversal_workflow_connection = create_connection(
+        reversal_workflow_db_path, check_same_thread=False
+    )
+    log_info(
+        _logger,
+        "module_loaded",
+        module="reversal_workflow_db",
+        path_configured=settings.reversal_workflow_db_path is not None,
+        path_basename=reversal_workflow_db_path.name,
+    )
+    reversal_workflow_repository = SqliteReversalWorkflowRepository(reversal_workflow_connection)
+
+    position_baseline_db_path = _resolve_position_baseline_db_path(settings)
+    position_baseline_connection = create_connection(
+        position_baseline_db_path, check_same_thread=False
+    )
+    log_info(
+        _logger,
+        "module_loaded",
+        module="position_baseline_db",
+        path_configured=settings.position_baseline_db_path is not None,
+        path_basename=position_baseline_db_path.name,
+    )
+    position_baseline_repository = SqlitePositionBaselineRepository(position_baseline_connection)
+    reconciliation_service = PositionReconciliationService(
+        trade_gateway=trade_gateway,
+        order_repository=order_repository,
+        reversal_workflow_repository=reversal_workflow_repository,
+        baseline_repository=position_baseline_repository,
+        bar_signal_state_store=bar_signal_state_store,
+        strategy_state_machine=strategy_state_machine,
+        clock=clock,
+        event_bus=event_coordinator,
+        current_selection=lambda: instrument_selection.current,
+        selected_account=lambda: broker_session.selected_account,
+    )
+
+    # `reconciliation_service.expected_net_lookup` replaces Feature 06's always-flat
+    # `position_lookup` placeholder — see `docs/adr/0010-position-reconciliation-and-
+    # manual-sync.md`.
+    order_manager = OrderManager(
+        trade_gateway=trade_gateway,
+        order_repository=order_repository,
+        clock=clock,
+        id_generator=id_generator,
+        event_bus=event_coordinator,
+        position_lookup=reconciliation_service.expected_net_lookup,
+    )
+
+    reversal_workflow_service = ReversalWorkflowService(
+        order_manager=order_manager,
+        order_repository=order_repository,
+        reversal_workflow_repository=reversal_workflow_repository,
+        trade_gateway=trade_gateway,
+        clock=clock,
+        event_bus=event_coordinator,
+        session_healthy=lambda: broker_session.capabilities.is_session_ready,
+        market_data_healthy=lambda instrument, contract: (
+            not market_data_bar_service.is_stale(instrument, contract)
+            and not market_data_bar_service.has_gap(instrument, contract)
+        ),
+    )
+    scaling_service = ScalingService(
+        order_manager=order_manager,
+        order_repository=order_repository,
+        trade_gateway=trade_gateway,
+        clock=clock,
+    )
+
     log_info(_logger, "module_load_completed")
     return ServiceContainer(
         settings=settings,
@@ -242,6 +374,10 @@ def build_services(settings: TradingSettings) -> ServiceContainer:
         instrument_selection=instrument_selection,
         market_data_bar_service=market_data_bar_service,
         bar_history_backfill_service=bar_history_backfill_service,
+        order_manager=order_manager,
+        reversal_workflow_service=reversal_workflow_service,
+        scaling_service=scaling_service,
+        reconciliation_service=reconciliation_service,
     )
 
 
