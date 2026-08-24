@@ -60,9 +60,9 @@ class EventCoordinator:
     def publish(self, event: Event) -> None:
         """Thread-safe. Callable from the COM callback thread, strategy thread, etc."""
         self._queue.put(event)
-        # DEBUG-only (not INFO): this path also carries `MarketDataTickReceived`, so an
-        # always-on INFO log here would be a per-tick firehose blocking the publishing
-        # callback thread — see Feature 04's "避免逐 tick 的 INFO log 阻塞 callback".
+        # DEBUG-only (not INFO): this path carries every event in the system, including
+        # high-frequency ones — an always-on INFO log here would risk a firehose blocking
+        # the publishing thread — see Feature 04's "避免逐 tick 的 INFO log 阻塞 callback".
         log_debug(
             _logger,
             "event_enqueued",

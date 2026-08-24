@@ -21,7 +21,7 @@ from typing import Any
 from tfx_quant.application.settings.trading_settings import Environment
 from tfx_quant.domain.account import TradingAccount
 from tfx_quant.infrastructure.yuanta.credentials import BrokerCredentials
-from tfx_quant.infrastructure.yuanta.errors import MarketDataSubscriptionError, YuantaSessionError
+from tfx_quant.infrastructure.yuanta.errors import YuantaSessionError
 from tfx_quant.infrastructure.yuanta.session_orchestrator import BrokerSessionOrchestrator
 from tfx_quant.infrastructure.yuanta.spark_client import SparkApiClient
 from tfx_quant.telemetry import get_logger, log_debug, log_error, log_info
@@ -33,8 +33,8 @@ def account_to_spark_string(account: TradingAccount) -> str:
     """Reconstructs SPARK API's `F + 分公司代號(7+3) + 帳號(7)` account string from a
     `TradingAccount` — the inverse of `session_orchestrator._parse_login_accounts`'s
     split. Every SPARK API call that takes an `Account`/`LoginAcno` parameter
-    (`Login`, `GetRealReport`, `GetFutStoreSummary`, `SubscribeStockTick`) needs this
-    exact string, not the split `branch_id`/`account_no` fields."""
+    (`Login`, `GetRealReport`, `GetFutStoreSummary`) needs this exact string, not the
+    split `branch_id`/`account_no` fields."""
     return f"F{account.branch_id}{account.account_no}"
 
 
@@ -103,16 +103,6 @@ class SparkApiSessionAdapter:
         assert self._client is not None
         self._client.get_fut_store_summary(account_to_spark_string(account))
 
-    def subscribe(self, symbol: str, account: TradingAccount) -> None:
-        assert self._client is not None
-        ok = self._client.subscribe_stock_tick(account_to_spark_string(account), [symbol])
-        if not ok:
-            raise MarketDataSubscriptionError(f"商品 {symbol} 行情訂閱呼叫失敗")
-
-    def unsubscribe(self, symbol: str, account: TradingAccount) -> None:
-        assert self._client is not None
-        self._client.unsubscribe_stock_tick(account_to_spark_string(account), [symbol])
-
     # -- OnResponse dispatch --------------------------------------------------------
 
     def _on_response(
@@ -120,9 +110,8 @@ class SparkApiSessionAdapter:
     ) -> None:
         """Every branch below does the minimum possible — pull primitive fields out of
         the `.NET` object and hand straight to the orchestrator. No parsing/business
-        logic lives here (`market_data_parsing.py`/`session_orchestrator.py` own that),
-        matching the implementation prompt's "callback 不阻塞；callback 內容立即複製為
-        內部 DTO"."""
+        logic lives here (`session_orchestrator.py` owns that), matching the
+        implementation prompt's "callback 不阻塞；callback 內容立即複製為內部 DTO"."""
         assert self._orchestrator is not None
         generation = self._generation
         log_debug(
@@ -144,8 +133,6 @@ class SparkApiSessionAdapter:
             return
 
         if int_mark == 2:  # 訂閱回應資訊 (subscription push)
-            if str_index == "SubscribeStockTick":
-                self._handle_stock_tick_push(generation, obj_value)
             # str_index == "RR_RealReport": 即時回報推播 (order/fill push). Feature 02
             # only needs the report *capability* (true as soon as login succeeds, since
             # SPARK API auto-subscribes on login — see session_orchestrator.py's
@@ -173,27 +160,3 @@ class SparkApiSessionAdapter:
         log_debug(_logger, "callback_dto_conversion_succeeded", callback_type="Login")
         assert self._orchestrator is not None
         self._orchestrator.handle_login_result(generation, msg_code, msg_content, entries)
-
-    def _handle_stock_tick_push(self, generation: int, tick_result: Any) -> None:
-        try:
-            time_obj = tick_result.Time
-            stk_code = str(tick_result.StkCode)
-            serial_no = int(tick_result.SerialNo)
-            deal_price = tick_result.DealPrice
-            deal_vol = tick_result.DealVol
-            hour = int(time_obj.bytHour)
-            minute = int(time_obj.bytMin)
-            second = int(time_obj.bytSec)
-            millisecond = int(time_obj.ushtMSec)
-        except AttributeError as exc:
-            log_error(
-                _logger,
-                "callback_dto_conversion_failed",
-                callback_type="SubscribeStockTick",
-                error=str(exc),
-            )
-            raise
-        assert self._orchestrator is not None
-        self._orchestrator.handle_market_data_push(
-            generation, stk_code, serial_no, deal_price, deal_vol, hour, minute, second, millisecond
-        )

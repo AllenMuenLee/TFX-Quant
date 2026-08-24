@@ -209,7 +209,7 @@ def _normalize_dataframe(df: Any, yahoo_ticker: str) -> list[YahooBar]:
             continue
         seen_at.add(at_utc)
 
-        parsed = _parse_row(row, at_utc)
+        parsed = _parse_row(row, at_utc, yahoo_ticker=yahoo_ticker)
         if parsed is None:
             dropped_invalid += 1
             continue
@@ -227,7 +227,7 @@ def _normalize_dataframe(df: Any, yahoo_ticker: str) -> list[YahooBar]:
     return bars
 
 
-def _parse_row(row: Any, at_utc: Any) -> YahooBar | None:
+def _parse_row(row: Any, at_utc: Any, *, yahoo_ticker: str = "") -> YahooBar | None:
     raw_values = {name: row[name] for name in _REQUIRED_COLUMNS}
     for value in raw_values.values():
         if value is None or (isinstance(value, float) and math.isnan(value)):
@@ -248,6 +248,12 @@ def _parse_row(row: Any, at_utc: Any) -> YahooBar | None:
         return None
 
     at_taipei = at_utc.to_pydatetime().astimezone(TAIPEI_TZ)
+    # Yahoo's TAIEX hourly index labels are clock-hour aligned (09:00, 10:00, ...),
+    # while TAIFEX's canonical session begins at 08:45. The runtime explicitly uses
+    # ^TWII as its yfinance-only TXF/MXF proxy, so shift those labels onto the futures
+    # grid. No other Yahoo ticker is altered.
+    if yahoo_ticker == "^TWII":
+        at_taipei -= timedelta(minutes=15)
     return YahooBar(at=at_taipei, open=open_, high=high, low=low, close=close, volume=volume)
 
 

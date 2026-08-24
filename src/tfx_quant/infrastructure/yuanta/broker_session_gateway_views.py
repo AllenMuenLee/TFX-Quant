@@ -1,9 +1,10 @@
-"""Thin `TradeGatewayPort`/`QuoteGatewayPort` views over a real `IBrokerSession`.
+"""Thin `TradeGatewayPort` view over a real `IBrokerSession`.
 
-Feature 01's narrow ports (`is_logged_in`, `query_open_orders`, `query_positions`,
-`is_market_data_valid`, `subscribe`) predate `IBrokerSession` and stay as the surface
-other features query. For the mock branch, `MockBrokerSession` doesn't need this —
-`MockTradeGateway`/`MockQuoteGateway` are used directly (see `composition.py`).
+Feature 01's narrow port (`is_logged_in`, `query_open_orders`, `query_positions`)
+predates `IBrokerSession` and stays as the surface other features query. For the mock
+branch, `MockBrokerSession` doesn't need this — `MockTradeGateway` is used directly (see
+`composition.py`). There is no quote-gateway view here — market data comes entirely from
+`yfinance`, never this session.
 
 `query_open_orders`/`query_positions` still raise rather than fabricating an "always
 empty" answer: SPARK API's `GetRealReport`/`GetFutStoreSummary` results aren't parsed
@@ -21,24 +22,14 @@ credentials has read the live docs (see `implementation prompt/06-order-and-fill
 machine/implementation-prompt.md`'s banner). `application.order_management.OrderManager`
 and its tests are fully built against `MockTradeGateway` instead — see
 `docs/adr/0008-order-and-fill-state-machine.md`.
-
-`subscribe`/`unsubscribe` are Feature 03's job and are implemented for real here: the
-instrument/contract → vendor-symbol translation comes from the controlled
-`InstrumentMasterRepository` (see `instrument_master_repository.py`), and the actual
-`SubscribeStockTick`/`UnSubscribeStockTick` call goes through
-`IBrokerSession.subscribe_market_data`/`unsubscribe_market_data`.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 
-from tfx_quant.application.instrument_selection.errors import InstrumentMasterEntryNotFoundError
 from tfx_quant.application.ports.broker_session import IBrokerSession
-from tfx_quant.application.ports.instrument_master import InstrumentMasterRepository
-from tfx_quant.domain.contract import ContractMonth
 from tfx_quant.domain.fill import Fill
-from tfx_quant.domain.instrument import Instrument
 from tfx_quant.domain.order import ClientOrderId, Order
 from tfx_quant.domain.order_state_machine import OrderReport
 from tfx_quant.domain.position import Position
@@ -76,33 +67,3 @@ class BrokerSessionTradeGatewayView:
 
     def query_fills(self) -> Sequence[Fill]:
         raise NotImplementedError(_NOT_YET_PARSED_MESSAGE)
-
-
-class BrokerSessionQuoteGatewayView:
-    """Implements `QuoteGatewayPort` — delegates the boolean to the real session and
-    translates instrument/contract to a vendor symbol via the controlled master file."""
-
-    def __init__(
-        self, broker_session: IBrokerSession, instrument_master: InstrumentMasterRepository
-    ) -> None:
-        self._broker_session = broker_session
-        self._instrument_master = instrument_master
-
-    def is_market_data_valid(self) -> bool:
-        return self._broker_session.capabilities.market_data
-
-    def subscribe(self, instrument: Instrument, contract: ContractMonth) -> None:
-        entry = self._instrument_master.get(instrument, contract)
-        if entry is None:
-            raise InstrumentMasterEntryNotFoundError(
-                f"商品主檔缺漏：{instrument.value} {contract.code}，無法訂閱行情"
-            )
-        self._broker_session.subscribe_market_data(entry.vendor_symbol)
-
-    def unsubscribe(self, instrument: Instrument, contract: ContractMonth) -> None:
-        entry = self._instrument_master.get(instrument, contract)
-        if entry is None:
-            # Nothing to translate to — if it was never subscribable, it was never
-            # subscribed either, so there's nothing to clean up.
-            return
-        self._broker_session.unsubscribe_market_data(entry.vendor_symbol)

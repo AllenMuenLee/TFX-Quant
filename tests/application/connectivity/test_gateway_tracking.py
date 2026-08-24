@@ -259,13 +259,14 @@ def test_stop_forgets_the_login_request_and_delegates() -> None:
     assert session.capabilities == SessionCapabilities()
 
 
-def test_select_account_and_market_data_subscription_delegate_untouched() -> None:
+def test_select_account_delegates_untouched() -> None:
+    other_account = TradingAccount(branch_id="0002", account_no="7654321")
     observer = _RecordingObserver()
     inner = MockBrokerSession()
     session = ConnectivityTrackingBrokerSession(inner, observer)
     session.start(_login_request())
+    inner.simulate_login_success((_ACCOUNT, other_account))
 
-    session.subscribe_market_data("TXFH6")
-    assert "TXFH6" in inner.subscribed_symbols
-    session.unsubscribe_market_data("TXFH6")
-    assert "TXFH6" not in inner.subscribed_symbols
+    session.select_account(other_account)
+
+    assert inner.selected_account == other_account

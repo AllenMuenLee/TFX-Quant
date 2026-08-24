@@ -41,6 +41,12 @@ def test_save_remembered_account_no_round_trips_independently_of_user_id() -> No
     assert prefs.remembered_account_no == "9808900"
 
 
+def test_certificate_import_state_is_remembered() -> None:
+    login_preferences.save_certificate_imported(True)
+
+    assert login_preferences.load().certificate_imported is True
+
+
 def test_load_tolerates_a_corrupt_prefs_file(tmp_path: Path) -> None:
     prefs_path = tmp_path / "tfx_quant" / "login_prefs.json"
     prefs_path.parent.mkdir(parents=True)

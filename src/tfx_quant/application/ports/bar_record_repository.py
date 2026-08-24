@@ -50,26 +50,39 @@ class RetentionCleanupSummary:
     """Result of one `delete_before()` call — the "audit 摘要" the implementation
     prompt requires retention cleanup to produce."""
 
-    __slots__ = ("cutoff_trading_day", "deleted_count", "ran_at")
+    __slots__ = ("cutoff_trading_day", "candidate_count", "deleted_count", "ran_at", "audit_id")
 
-    def __init__(self, *, cutoff_trading_day: date, deleted_count: int, ran_at: Timestamp) -> None:
+    def __init__(
+        self,
+        *,
+        cutoff_trading_day: date,
+        deleted_count: int,
+        ran_at: Timestamp,
+        candidate_count: int | None = None,
+        audit_id: str | None = None,
+    ) -> None:
         self.cutoff_trading_day = cutoff_trading_day
+        self.candidate_count = deleted_count if candidate_count is None else candidate_count
         self.deleted_count = deleted_count
         self.ran_at = ran_at
+        self.audit_id = audit_id
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, RetentionCleanupSummary):
             return NotImplemented
         return (
             self.cutoff_trading_day == other.cutoff_trading_day
+            and self.candidate_count == other.candidate_count
             and self.deleted_count == other.deleted_count
             and self.ran_at == other.ran_at
+            and self.audit_id == other.audit_id
         )
 
     def __repr__(self) -> str:
         return (
             f"RetentionCleanupSummary(cutoff_trading_day={self.cutoff_trading_day!r}, "
-            f"deleted_count={self.deleted_count!r}, ran_at={self.ran_at!r})"
+            f"candidate_count={self.candidate_count!r}, deleted_count={self.deleted_count!r}, "
+            f"ran_at={self.ran_at!r}, audit_id={self.audit_id!r})"
         )
 
 

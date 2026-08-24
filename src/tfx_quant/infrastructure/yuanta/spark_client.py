@@ -9,26 +9,27 @@ this file (and `spark_api_adapter.py`, which wraps it in the shape
 Deliberately thin: every method is a direct, uncached call into the real
 `YuantaSparkAPITrader` object the official docs describe (基礎/交易/行情/帳務/回報
 pages — see `infrastructure/yuanta/README.md`) — no retry, no parsing, no business
-logic. `session_orchestrator.py` owns sequencing; `market_data_parsing.py` owns parsing.
+logic. `session_orchestrator.py` owns all sequencing.
 
-Only what Features 01–05 need is wired up here: session lifecycle (`Open`/`Login`/
-`LogOut`/`Close`/`Dispose`), the two pre-ready safety queries (`GetRealReport`,
-`GetFutStoreSummary`), and futures tick subscription (`SubscribeStockTick`/
-`UnSubscribeStockTick`). The two-month bar-history extension's historical-bar backfill
-now comes from the third-party `yfinance` package instead of a vendor query — see
-`docs/adr/0007-two-month-bar-history-persistence.md`'s 2026-08-21 extension — so no
-`GetKLine` method lives here (a first implementation of that path did wrap `GetKLine`;
-it was removed once the prompt was rewritten around `yfinance`, not left in place unused).
-`SendFutureOrder` (order placement) is Feature 06's job and deliberately has no
-method here yet — adding it without a real order/fill state machine to drive it would be
-exactly the kind of forward-scope creep the project's conventions warn against.
+Only what Features 01–02 need is wired up here: session lifecycle (`Open`/`Login`/
+`LogOut`/`Close`/`Dispose`) and the two pre-ready safety queries (`GetRealReport`,
+`GetFutStoreSummary`). There is no market-data method here at all — market data comes
+entirely from the third-party `yfinance` package (`infrastructure.market_data.
+yfinance_history_adapter`), never this vendor client; a `SubscribeStockTick`/
+`UnSubscribeStockTick` wrapper existed here in an earlier revision and was removed once
+the implementation prompt was rewritten to forbid any Yuanta/SPARK market-data path, not
+left in place unused (see `implementation prompt/00-spark-to-futures-api-migration/
+implementation-prompt.md`). `SendFutureOrder` (order placement) is Feature 06's job and
+deliberately has no method here yet — adding it without a real order/fill state machine
+to drive it would be exactly the kind of forward-scope creep the project's conventions
+warn against.
 """
 
 from __future__ import annotations
 
 import os
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -131,36 +132,4 @@ class SparkApiClient:
         undocumented `RA003` mechanism with a fully documented one. Result arrives via
         `OnResponse` with `strIndex == 'GetFutStoreSummary'`."""
         result: bool = self._trader.GetFutStoreSummary(account)
-        return result
-
-    # -- Market data (行情) -----------------------------------------------------------
-
-    def subscribe_stock_tick(self, account: str, symbols: Sequence[str]) -> bool:
-        """分時明細訂閱 — per-trade tick subscription. `MarketType` is hardcoded to
-        `TAIFEX` since this codebase only ever trades domestic futures (TXF/MXF).
-        Ongoing ticks arrive via `OnResponse` with `intMark == 2`,
-        `strIndex == 'SubscribeStockTick'`, one `StockTickResult` per push."""
-        from System.Collections.Generic import List
-        from YuantaOneAPI import StockTick, enumMarketType
-
-        lst = List[StockTick]()
-        for symbol in symbols:
-            tick = StockTick()
-            tick.MarketType = enumMarketType.TAIFEX
-            tick.StockCode = symbol
-            lst.Add(tick)
-        result: bool = self._trader.SubscribeStockTick(account, lst)
-        return result
-
-    def unsubscribe_stock_tick(self, account: str, symbols: Sequence[str]) -> bool:
-        from System.Collections.Generic import List
-        from YuantaOneAPI import StockTick, enumMarketType
-
-        lst = List[StockTick]()
-        for symbol in symbols:
-            tick = StockTick()
-            tick.MarketType = enumMarketType.TAIFEX
-            tick.StockCode = symbol
-            lst.Add(tick)
-        result: bool = self._trader.UnSubscribeStockTick(account, lst)
         return result

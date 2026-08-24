@@ -21,7 +21,6 @@ from tfx_quant.application.events.events import (
     Event,
     FillReceived,
     MarketDataFreshnessChanged,
-    MarketDataTickReceived,
     OrderReportReceived,
     SafePauseTriggered,
 )
@@ -216,7 +215,7 @@ def test_trade_channel_alone_invalidated_triggers_pause() -> None:
         BrokerCapabilitiesChanged(
             at=Timestamp.now(),
             capabilities=SessionCapabilities(
-                login=True, market_data=True, trading=True, order_reports=True, queries=True
+                login=True, trading=True, order_reports=True, queries=True
             ),
         )
     )
@@ -226,7 +225,7 @@ def test_trade_channel_alone_invalidated_triggers_pause() -> None:
         BrokerCapabilitiesChanged(
             at=Timestamp.now(),
             capabilities=SessionCapabilities(
-                login=True, market_data=True, trading=False, order_reports=True, queries=True
+                login=True, trading=False, order_reports=True, queries=True
             ),
         )
     )
@@ -245,7 +244,7 @@ def test_order_reports_alone_interrupted_triggers_its_own_reason() -> None:
         BrokerCapabilitiesChanged(
             at=Timestamp.now(),
             capabilities=SessionCapabilities(
-                login=True, market_data=True, trading=True, order_reports=True, queries=True
+                login=True, trading=True, order_reports=True, queries=True
             ),
         )
     )
@@ -253,7 +252,7 @@ def test_order_reports_alone_interrupted_triggers_its_own_reason() -> None:
         BrokerCapabilitiesChanged(
             at=Timestamp.now(),
             capabilities=SessionCapabilities(
-                login=True, market_data=True, trading=True, order_reports=False, queries=True
+                login=True, trading=True, order_reports=False, queries=True
             ),
         )
     )
@@ -433,9 +432,7 @@ def test_heartbeat_tick_publishes_no_channel_health_changed_event() -> None:
 def test_record_query_result_failure_triggers_query_failed_pause() -> None:
     monitor, _session, _event_bus, _clock, _scheduler, state_machine = _setup()
 
-    monitor.record_query_result(
-        call="query_positions", ok=False, latency_ms=12.0, error="連線逾時"
-    )
+    monitor.record_query_result(call="query_positions", ok=False, latency_ms=12.0, error="連線逾時")
 
     record = monitor.current_pause()
     assert record is not None
@@ -662,25 +659,6 @@ def test_login_failed_outside_a_reconnect_episode_is_ignored() -> None:
 
     assert monitor.is_reconnecting is False
     assert scheduler.scheduled == []
-
-
-def test_market_data_tick_marks_channel_connected_without_a_freshness_event() -> None:
-    monitor, _session, event_bus, _clock, _scheduler, _state_machine = _setup()
-
-    event_bus.publish(
-        MarketDataTickReceived(
-            at=Timestamp.now(),
-            vendor_symbol="TXFH6",
-            price=Decimal("18500"),
-            size=1,
-            serial_no=1,
-            exchange_time=Timestamp.now().value.time(),
-        )
-    )
-
-    health = monitor.channel_health(ChannelId.MARKET_DATA)
-    assert health.connected is True
-    assert health.last_message_at is not None
 
 
 @pytest.mark.parametrize("channel", list(ChannelId))

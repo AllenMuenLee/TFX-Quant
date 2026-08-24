@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time as _real_time
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any
@@ -16,7 +16,6 @@ from tfx_quant.application.events.events import (
     MarketDataFreshnessChanged,
     MarketDataGapCleared,
     MarketDataGapDetected,
-    MarketDataTickReceived,
 )
 from tfx_quant.application.market_data.bar_service import MarketDataBarService
 from tfx_quant.application.ports.bar_record_repository import (
@@ -25,6 +24,7 @@ from tfx_quant.application.ports.bar_record_repository import (
     BarUpsertRepositoryError,
     RetentionCleanupSummary,
 )
+from tfx_quant.application.ports.yahoo_history_query import YahooBar, YahooHistoryQueryError
 from tfx_quant.domain.account import TradingAccount
 from tfx_quant.domain.bar import Bar, CandleColor
 from tfx_quant.domain.bar_record import (
@@ -43,7 +43,7 @@ from tfx_quant.domain.timestamp import TAIPEI_TZ, Timestamp
 _INSTRUMENT = Instrument.TXF
 _CONTRACT = ContractMonth(year=2026, month=9)
 _WEDNESDAY = date(2026, 9, 16)
-_VENDOR_SYMBOL = "TXFU6"
+_TICKER = "TXF=F"
 _ACCOUNT = TradingAccount(branch_id="F00", account_no="9808900")
 
 
@@ -106,11 +106,34 @@ class FakeInstrumentMasterRepository:
         return [e for (i, _c), e in self._entries.items() if i == instrument]
 
 
+class FakeYahooTickerMappingRepository:
+    def __init__(self, mapping: dict[tuple[Instrument, ContractMonth], str] | None = None) -> None:
+        self._mapping = mapping or {}
+
+    def get(self, instrument: Instrument, contract: ContractMonth) -> str | None:
+        return self._mapping.get((instrument, contract))
+
+
+class FakeYahooHistoryQuery:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, date, date]] = []
+        self._responder: Callable[[str, date, date], Sequence[YahooBar]] = lambda *_: ()
+
+    def script(self, responder: Callable[[str, date, date], Sequence[YahooBar]]) -> None:
+        self._responder = responder
+
+    def query_1h_bars(
+        self, *, yahoo_ticker: str, start_date: date, end_date: date
+    ) -> Sequence[YahooBar]:
+        self.calls.append((yahoo_ticker, start_date, end_date))
+        return self._responder(yahoo_ticker, start_date, end_date)
+
+
 def _entry() -> InstrumentMasterEntry:
     return InstrumentMasterEntry(
         instrument=_INSTRUMENT,
         contract=_CONTRACT,
-        vendor_symbol=_VENDOR_SYMBOL,
+        vendor_symbol="TXFU6",
         broker_product_code="TXF",
         tick_size=Decimal("1"),
         multiplier=Decimal("200"),
@@ -125,6 +148,18 @@ def _entry() -> InstrumentMasterEntry:
 
 def _ts(hour: int, minute: int, second: int = 0, d: date = _WEDNESDAY) -> Timestamp:
     return Timestamp(datetime(d.year, d.month, d.day, hour, minute, second, tzinfo=TAIPEI_TZ))
+
+
+def _yahoo_bar(hour: int, minute: int, *, price: str, d: date = _WEDNESDAY) -> YahooBar:
+    at = datetime(d.year, d.month, d.day, hour, minute, tzinfo=TAIPEI_TZ)
+    return YahooBar(
+        at=at,
+        open=Decimal(price),
+        high=Decimal(price),
+        low=Decimal(price),
+        close=Decimal(price),
+        volume=7,
+    )
 
 
 def _bar_ohlcv_matches(a: Bar, b: Bar) -> bool:
@@ -292,7 +327,7 @@ def _insert_record(
         period=BarPeriod.SIXTY_MINUTE,
         trading_day=start.value.date(),
         session=MarketSession.DAY,
-        source=BarDataSource.AGGREGATED_FROM_YUANTA_REALTIME,
+        source=BarDataSource.POLLED_FROM_YFINANCE,
         is_gap_recovery=False,
         created_at=start,
         updated_at=start,
@@ -315,44 +350,34 @@ def _build(
     now: Timestamp | None = None,
     stale_after_seconds: float = 10.0,
     bar_record_repository: FakeBarRecordRepository | None = None,
+    yahoo_ticker_mapping: FakeYahooTickerMappingRepository | None = None,
+    yahoo_history_query: FakeYahooHistoryQuery | None = None,
     write_queue_maxsize: int = 500,
     max_write_retries: int = 5,
-) -> tuple[MarketDataBarService, FakeEventBus, FakeClock]:
+) -> tuple[MarketDataBarService, FakeEventBus, FakeClock, FakeBarRecordRepository]:
     bus = FakeEventBus()
     clock = FakeClock(now or _ts(8, 40))
+    repo = bar_record_repository or FakeBarRecordRepository()
     service = MarketDataBarService(
         event_bus=bus,
         clock=clock,
         trading_calendar_repository=FakeTradingCalendarRepository(),
         instrument_master=FakeInstrumentMasterRepository({(_INSTRUMENT, _CONTRACT): _entry()}),
-        bar_record_repository=bar_record_repository or FakeBarRecordRepository(),
+        bar_record_repository=repo,
+        yahoo_ticker_mapping=yahoo_ticker_mapping or FakeYahooTickerMappingRepository(),
+        yahoo_history_query=yahoo_history_query or FakeYahooHistoryQuery(),
         stale_after_seconds=stale_after_seconds,
         write_queue_maxsize=write_queue_maxsize,
         max_write_retries=max_write_retries,
     )
-    return service, bus, clock
+    return service, bus, clock, repo
 
 
-def _push(
-    service: MarketDataBarService,
-    bus: FakeEventBus,
-    at: Timestamp,
-    exchange_time: time,
-    price: str,
-    serial_no: int,
-    size: int = 1,
-    vendor_symbol: str = _VENDOR_SYMBOL,
-) -> None:
-    bus.publish(
-        MarketDataTickReceived(
-            at=at,
-            vendor_symbol=vendor_symbol,
-            price=Decimal(price),
-            size=size,
-            serial_no=serial_no,
-            exchange_time=exchange_time,
-        )
-    )
+def _mapping() -> FakeYahooTickerMappingRepository:
+    return FakeYahooTickerMappingRepository({(_INSTRUMENT, _CONTRACT): _TICKER})
+
+
+# -- Selection lifecycle --------------------------------------------------------------
 
 
 def test_clear_with_no_master_entry_leaves_inactive() -> None:
@@ -364,6 +389,8 @@ def test_clear_with_no_master_entry_leaves_inactive() -> None:
         trading_calendar_repository=FakeTradingCalendarRepository(),
         instrument_master=FakeInstrumentMasterRepository({}),
         bar_record_repository=FakeBarRecordRepository(),
+        yahoo_ticker_mapping=FakeYahooTickerMappingRepository(),
+        yahoo_history_query=FakeYahooHistoryQuery(),
     )
     service.clear(_INSTRUMENT, _CONTRACT)
     assert service.forming_bar(_INSTRUMENT, _CONTRACT) is None
@@ -371,123 +398,166 @@ def test_clear_with_no_master_entry_leaves_inactive() -> None:
 
 
 def test_clear_activates_contract_with_empty_forming_bar() -> None:
-    service, _bus, _clock = _build()
+    service, _bus, _clock, _repo = _build()
     service.clear(_INSTRUMENT, _CONTRACT)
     assert service.forming_bar(_INSTRUMENT, _CONTRACT) is None
     assert service.recent_closed_bars(_INSTRUMENT, _CONTRACT) == ()
     assert service.has_gap(_INSTRUMENT, _CONTRACT) is False
 
 
-def test_tick_for_inactive_contract_is_ignored() -> None:
-    service, bus, clock = _build()
-    _push(service, bus, clock.now(), time(9, 0), "17500", serial_no=1)
+def test_poll_with_no_active_contract_is_a_no_op() -> None:
+    service, _bus, _clock, _repo = _build(yahoo_ticker_mapping=_mapping())
+    service.poll_once()  # nothing selected — must not raise
+
+
+# -- Polling: forming bar, closed bars, staleness --------------------------------------
+
+
+def test_poll_with_missing_ticker_mapping_marks_polling_degraded() -> None:
+    service, _bus, _clock, _repo = _build()  # no ticker mapping configured
+    service.clear(_INSTRUMENT, _CONTRACT)
+    service.poll_once()
+    assert service.is_polling_degraded() is True
     assert service.forming_bar(_INSTRUMENT, _CONTRACT) is None
 
 
-def test_tick_with_symbol_mismatch_is_ignored() -> None:
-    service, bus, clock = _build()
-    service.clear(_INSTRUMENT, _CONTRACT)
-    _push(
-        service,
-        bus,
-        clock.now(),
-        time(9, 0),
-        "17500",
-        serial_no=1,
-        vendor_symbol="SOMETHING-ELSE",
+def test_poll_updates_forming_bar_and_clears_staleness() -> None:
+    query = FakeYahooHistoryQuery()
+    query.script(lambda *_: [_yahoo_bar(8, 45, price="17500")])
+    service, bus, _clock, _repo = _build(
+        now=_ts(9, 0), yahoo_ticker_mapping=_mapping(), yahoo_history_query=query
     )
-    assert service.forming_bar(_INSTRUMENT, _CONTRACT) is None
-
-
-def test_tick_updates_forming_bar_and_clears_staleness() -> None:
-    service, bus, clock = _build(now=_ts(9, 0))
     service.clear(_INSTRUMENT, _CONTRACT)
-    assert service.is_stale(_INSTRUMENT, _CONTRACT) is True  # nothing received yet
+    assert service.is_stale(_INSTRUMENT, _CONTRACT) is True  # nothing synced yet
 
-    _push(service, bus, clock.now(), time(9, 0), "17500", serial_no=1)
+    service.poll_once()
 
     forming = service.forming_bar(_INSTRUMENT, _CONTRACT)
     assert forming is not None
     assert forming.open.amount == Decimal("17500")
     assert service.is_stale(_INSTRUMENT, _CONTRACT) is False
+    assert service.is_polling_degraded() is False
     freshness_events = [e for e in bus.published if isinstance(e, MarketDataFreshnessChanged)]
     assert freshness_events[-1].is_stale is False
 
 
-def test_bar_closed_published_when_boundary_crossed() -> None:
-    service, bus, clock = _build(now=_ts(8, 50))
+def test_poll_publishes_bar_closed_for_newly_closed_bar() -> None:
+    query = FakeYahooHistoryQuery()
+    query.script(lambda *_: [_yahoo_bar(8, 45, price="17500")])
+    service, bus, _clock, _repo = _build(
+        now=_ts(9, 50), yahoo_ticker_mapping=_mapping(), yahoo_history_query=query
+    )
     service.clear(_INSTRUMENT, _CONTRACT)
-    _push(service, bus, clock.now(), time(8, 50), "17500", serial_no=1)
 
-    clock.advance(60 * 60)  # 09:50
-    _push(service, bus, clock.now(), time(9, 50), "17600", serial_no=2)
+    service.poll_once()
 
     closed_events = [e for e in bus.published if isinstance(e, BarClosed)]
     assert len(closed_events) == 1
     assert closed_events[0].bar.start.value.time() == time(8, 45)
     assert list(service.recent_closed_bars(_INSTRUMENT, _CONTRACT)) == [closed_events[0].bar]
+    assert service.forming_bar(_INSTRUMENT, _CONTRACT) is None  # 09:45 hasn't opened yet
 
 
-def test_on_clock_tick_marks_stale_after_threshold_with_no_new_ticks() -> None:
-    service, bus, clock = _build(now=_ts(9, 0), stale_after_seconds=5.0)
+def test_poll_does_not_reprocess_an_already_synced_closed_bar() -> None:
+    query = FakeYahooHistoryQuery()
+    query.script(lambda *_: [_yahoo_bar(8, 45, price="17500")])
+    service, bus, _clock, _repo = _build(
+        now=_ts(9, 50), yahoo_ticker_mapping=_mapping(), yahoo_history_query=query
+    )
     service.clear(_INSTRUMENT, _CONTRACT)
-    _push(service, bus, clock.now(), time(9, 0), "17500", serial_no=1)
+
+    service.poll_once()
+    service.poll_once()  # same yfinance row returned again — must not re-publish
+
+    closed_events = [e for e in bus.published if isinstance(e, BarClosed)]
+    assert len(closed_events) == 1
+
+
+def test_query_error_marks_polling_degraded_without_crashing() -> None:
+    query = FakeYahooHistoryQuery()
+
+    def responder(ticker: str, start: date, end: date) -> Sequence[YahooBar]:
+        raise YahooHistoryQueryError("simulated rate limit exhaustion")
+
+    query.script(responder)
+    service, _bus, _clock, _repo = _build(
+        yahoo_ticker_mapping=_mapping(), yahoo_history_query=query
+    )
+    service.clear(_INSTRUMENT, _CONTRACT)
+
+    service.poll_once()  # must not raise
+
+    assert service.is_polling_degraded() is True
+    assert service.forming_bar(_INSTRUMENT, _CONTRACT) is None
+
+
+def test_repeated_poll_failures_eventually_mark_stale() -> None:
+    query = FakeYahooHistoryQuery()
+    query.script(lambda *_: [_yahoo_bar(8, 45, price="17500")])
+    service, bus, clock, _repo = _build(
+        now=_ts(9, 0),
+        stale_after_seconds=5.0,
+        yahoo_ticker_mapping=_mapping(),
+        yahoo_history_query=query,
+    )
+    service.clear(_INSTRUMENT, _CONTRACT)
+    service.poll_once()
     assert service.is_stale(_INSTRUMENT, _CONTRACT) is False
 
-    clock.advance(10.0)
-    service.on_clock_tick()
+    def failing(ticker: str, start: date, end: date) -> Sequence[YahooBar]:
+        raise YahooHistoryQueryError("simulated outage")
 
+    query.script(failing)
+    clock.advance(10.0)
+    service.poll_once()
+
+    assert service.is_polling_degraded() is True
     assert service.is_stale(_INSTRUMENT, _CONTRACT) is True
     freshness_events = [e for e in bus.published if isinstance(e, MarketDataFreshnessChanged)]
     assert freshness_events[-1].is_stale is True
 
 
-def test_on_clock_tick_closes_forming_bar_with_no_new_tick() -> None:
-    service, bus, clock = _build(now=_ts(8, 50))
-    service.clear(_INSTRUMENT, _CONTRACT)
-    _push(service, bus, clock.now(), time(8, 50), "17500", serial_no=1)
+# -- Gap detection ----------------------------------------------------------------------
 
-    clock.advance(60 * 60)  # past the 09:45 boundary, no new tick arrives
-    service.on_clock_tick()
+
+def test_gap_detected_when_a_boundary_is_missing_then_cleared_by_next_bar() -> None:
+    repo = FakeBarRecordRepository()
+    _insert_record(repo, _ts(8, 45), _ts(9, 45), open_="17500", close="17600")
+    query = FakeYahooHistoryQuery()
+    # 09:45-10:45 was never observed — the next row jumps straight to 10:45-11:45.
+    query.script(lambda *_: [_yahoo_bar(10, 45, price="17700")])
+    service, bus, _clock, _repo = _build(
+        now=_ts(11, 50),
+        bar_record_repository=repo,
+        yahoo_ticker_mapping=_mapping(),
+        yahoo_history_query=query,
+    )
+    service.clear(_INSTRUMENT, _CONTRACT)  # warm-up loads last_closed_end = 09:45
+
+    service.poll_once()
+
+    gap_events = [e for e in bus.published if isinstance(e, MarketDataGapDetected)]
+    cleared_events = [e for e in bus.published if isinstance(e, MarketDataGapCleared)]
+    assert len(gap_events) == 1
+    assert len(cleared_events) == 1  # the 10:45 bar itself closes the gap it revealed
+    assert service.has_gap(_INSTRUMENT, _CONTRACT) is False
 
     closed_events = [e for e in bus.published if isinstance(e, BarClosed)]
     assert len(closed_events) == 1
-    assert service.forming_bar(_INSTRUMENT, _CONTRACT) is None
 
 
-def test_broker_session_ready_flags_gap_until_next_bar_closes_cleanly() -> None:
-    service, bus, clock = _build(now=_ts(8, 50))
-    service.clear(_INSTRUMENT, _CONTRACT)
+def test_first_ever_closed_bar_is_never_flagged_as_a_gap() -> None:
+    query = FakeYahooHistoryQuery()
+    query.script(lambda *_: [_yahoo_bar(8, 45, price="17500")])
+    service, bus, _clock, _repo = _build(
+        now=_ts(9, 50), yahoo_ticker_mapping=_mapping(), yahoo_history_query=query
+    )
+    service.clear(_INSTRUMENT, _CONTRACT)  # nothing persisted yet — no continuity baseline
 
-    bus.publish(BrokerSessionReady(at=clock.now(), account=_ACCOUNT))
-    assert service.has_gap(_INSTRUMENT, _CONTRACT) is True
-    gap_events = [e for e in bus.published if isinstance(e, MarketDataGapDetected)]
-    assert len(gap_events) == 1
+    service.poll_once()
 
-    _push(service, bus, clock.now(), time(8, 50), "17500", serial_no=1)
-    clock.advance(60 * 60)
-    _push(service, bus, clock.now(), time(9, 50), "17600", serial_no=2)
-
+    assert [e for e in bus.published if isinstance(e, MarketDataGapDetected)] == []
     assert service.has_gap(_INSTRUMENT, _CONTRACT) is False
-    cleared_events = [e for e in bus.published if isinstance(e, MarketDataGapCleared)]
-    assert len(cleared_events) == 1
-
-
-def test_broker_session_ready_with_no_active_contract_is_a_no_op() -> None:
-    service, bus, clock = _build()
-    bus.publish(BrokerSessionReady(at=clock.now(), account=_ACCOUNT))
-    gap_events = [e for e in bus.published if isinstance(e, MarketDataGapDetected)]
-    assert gap_events == []
-
-
-def test_clear_resets_previous_forming_bar_state() -> None:
-    service, bus, clock = _build(now=_ts(8, 50))
-    service.clear(_INSTRUMENT, _CONTRACT)
-    _push(service, bus, clock.now(), time(8, 50), "17500", serial_no=1)
-    assert service.forming_bar(_INSTRUMENT, _CONTRACT) is not None
-
-    service.clear(_INSTRUMENT, _CONTRACT)
-    assert service.forming_bar(_INSTRUMENT, _CONTRACT) is None
 
 
 # -- Two-month bar-history persistence (implementation prompt extension) -------------
@@ -495,13 +565,18 @@ def test_clear_resets_previous_forming_bar_state() -> None:
 
 def test_bar_closed_is_persisted_via_background_writer() -> None:
     repo = FakeBarRecordRepository()
-    service, bus, clock = _build(now=_ts(8, 50), bar_record_repository=repo)
+    query = FakeYahooHistoryQuery()
+    query.script(lambda *_: [_yahoo_bar(8, 45, price="17500")])
+    service, _bus, _clock, _repo = _build(
+        now=_ts(9, 50),
+        bar_record_repository=repo,
+        yahoo_ticker_mapping=_mapping(),
+        yahoo_history_query=query,
+    )
     service.clear(_INSTRUMENT, _CONTRACT)
     service.start()
     try:
-        _push(service, bus, clock.now(), time(8, 50), "17500", serial_no=1)
-        clock.advance(60 * 60)
-        _push(service, bus, clock.now(), time(9, 50), "17600", serial_no=2)
+        service.poll_once()
         _wait_until(lambda: len(repo.all_records()) == 1)
     finally:
         service.stop()
@@ -511,42 +586,58 @@ def test_bar_closed_is_persisted_via_background_writer() -> None:
     assert records[0].period is BarPeriod.SIXTY_MINUTE
     assert records[0].session is MarketSession.DAY
     assert records[0].trading_day == _WEDNESDAY
-    assert records[0].source is BarDataSource.AGGREGATED_FROM_YUANTA_REALTIME
+    assert records[0].source is BarDataSource.POLLED_FROM_YFINANCE
     assert records[0].is_gap_recovery is False
 
 
 def test_bar_closed_after_gap_is_flagged_is_gap_recovery() -> None:
     repo = FakeBarRecordRepository()
-    service, bus, clock = _build(now=_ts(8, 50), bar_record_repository=repo)
+    _insert_record(repo, _ts(8, 45), _ts(9, 45), open_="17500", close="17600")
+    query = FakeYahooHistoryQuery()
+    query.script(lambda *_: [_yahoo_bar(10, 45, price="17700")])
+    service, _bus, _clock, _repo = _build(
+        now=_ts(11, 50),
+        bar_record_repository=repo,
+        yahoo_ticker_mapping=_mapping(),
+        yahoo_history_query=query,
+    )
     service.clear(_INSTRUMENT, _CONTRACT)
     service.start()
     try:
-        bus.publish(BrokerSessionReady(at=clock.now(), account=_ACCOUNT))
-        _push(service, bus, clock.now(), time(8, 50), "17500", serial_no=1)
-        clock.advance(60 * 60)
-        _push(service, bus, clock.now(), time(9, 50), "17600", serial_no=2)
-        _wait_until(lambda: len(repo.all_records()) == 1)
+        service.poll_once()
+        _wait_until(lambda: len(repo.all_records()) == 2)
     finally:
         service.stop()
 
-    assert repo.all_records()[0].is_gap_recovery is True
+    newest = repo.all_records()[-1]
+    assert newest.is_gap_recovery is True
 
 
-def test_write_queue_full_marks_degraded_without_blocking_tick_processing() -> None:
+def test_write_queue_full_marks_degraded_without_blocking_polling() -> None:
     repo = FakeBarRecordRepository()
-    service, bus, clock = _build(now=_ts(8, 50), bar_record_repository=repo, write_queue_maxsize=1)
+    query = FakeYahooHistoryQuery()
+    query.script(
+        lambda *_: [
+            _yahoo_bar(8, 45, price="17500"),
+            _yahoo_bar(9, 45, price="17600"),
+            _yahoo_bar(10, 45, price="17700"),
+        ]
+    )
+    service, bus, _clock, _repo = _build(
+        now=_ts(11, 50),
+        bar_record_repository=repo,
+        yahoo_ticker_mapping=_mapping(),
+        yahoo_history_query=query,
+        write_queue_maxsize=1,
+    )
     service.clear(_INSTRUMENT, _CONTRACT)
-    # Deliberately never start() the writer thread — nothing drains the queue, so a
-    # second bar close overflows a maxsize=1 queue without any real I/O involved.
-    _push(service, bus, clock.now(), time(8, 50), "17500", serial_no=1)
-    clock.advance(60 * 60)
-    _push(service, bus, clock.now(), time(9, 50), "17600", serial_no=2)
-    clock.advance(60 * 60)
-    _push(service, bus, clock.now(), time(10, 50), "17700", serial_no=3)
+    # Deliberately never start() the writer thread — nothing drains the queue, so
+    # three closed bars in one poll overflow a maxsize=1 queue with no real I/O.
+    service.poll_once()
 
     assert service.is_persistence_degraded() is True
-    # The tick pipeline itself never raised or blocked — bars still closed normally.
-    assert len(service.recent_closed_bars(_INSTRUMENT, _CONTRACT)) == 2
+    # Polling itself never raised or blocked — bars still closed normally.
+    assert len(service.recent_closed_bars(_INSTRUMENT, _CONTRACT)) == 3
     health_events = [e for e in bus.published if isinstance(e, BarPersistenceHealthChanged)]
     assert health_events[-1].is_degraded is True
 
@@ -554,17 +645,26 @@ def test_write_queue_full_marks_degraded_without_blocking_tick_processing() -> N
 def test_persistent_write_failure_marks_degraded_then_recovers() -> None:
     repo = FakeBarRecordRepository()
     repo.fail_writes_remaining = 1
-    service, bus, clock = _build(now=_ts(8, 50), bar_record_repository=repo, max_write_retries=1)
+    query = FakeYahooHistoryQuery()
+    query.script(lambda *_: [_yahoo_bar(8, 45, price="17500")])
+    service, bus, clock, _repo = _build(
+        now=_ts(9, 50),
+        bar_record_repository=repo,
+        yahoo_ticker_mapping=_mapping(),
+        yahoo_history_query=query,
+        max_write_retries=1,
+    )
     service.clear(_INSTRUMENT, _CONTRACT)
     service.start()
     try:
-        _push(service, bus, clock.now(), time(8, 50), "17500", serial_no=1)
-        clock.advance(60 * 60)
-        _push(service, bus, clock.now(), time(9, 50), "17600", serial_no=2)
+        service.poll_once()
         _wait_until(lambda: service.is_persistence_degraded() is True)
 
         clock.advance(60 * 60)
-        _push(service, bus, clock.now(), time(10, 50), "17700", serial_no=3)
+        query.script(
+            lambda *_: [_yahoo_bar(8, 45, price="17500"), _yahoo_bar(9, 45, price="17650")]
+        )
+        service.poll_once()
         _wait_until(lambda: service.is_persistence_degraded() is False)
     finally:
         service.stop()
@@ -577,7 +677,7 @@ def test_clear_restores_streak_and_recent_bars_from_persisted_history() -> None:
     repo = FakeBarRecordRepository()
     bar1 = _insert_record(repo, _ts(8, 45), _ts(9, 45), open_="17500", close="17600")
     bar2 = _insert_record(repo, _ts(9, 45), _ts(10, 45), open_="17600", close="17700")
-    service, _bus, _clock = _build(now=_ts(11, 0), bar_record_repository=repo)
+    service, _bus, _clock, _repo = _build(now=_ts(11, 0), bar_record_repository=repo)
 
     service.clear(_INSTRUMENT, _CONTRACT)
 
@@ -587,9 +687,9 @@ def test_clear_restores_streak_and_recent_bars_from_persisted_history() -> None:
     assert length == 2
 
 
-def test_broker_session_ready_reloads_persisted_history_on_reconnect() -> None:
+def test_broker_session_ready_reloads_persisted_history() -> None:
     repo = FakeBarRecordRepository()
-    service, bus, clock = _build(now=_ts(9, 0), bar_record_repository=repo)
+    service, bus, clock, _repo = _build(now=_ts(9, 0), bar_record_repository=repo)
     service.clear(_INSTRUMENT, _CONTRACT)
     assert service.recent_closed_bars(_INSTRUMENT, _CONTRACT) == ()
 
@@ -599,9 +699,14 @@ def test_broker_session_ready_reloads_persisted_history_on_reconnect() -> None:
     assert list(service.recent_closed_bars(_INSTRUMENT, _CONTRACT)) == [bar]
 
 
-def test_first_activation_has_empty_history_and_never_queries_a_vendor() -> None:
+def test_broker_session_ready_with_no_active_contract_is_a_no_op() -> None:
+    service, bus, clock, _repo = _build()
+    bus.publish(BrokerSessionReady(at=clock.now(), account=_ACCOUNT))  # must not raise
+
+
+def test_first_activation_has_empty_history() -> None:
     repo = FakeBarRecordRepository()
-    service, _bus, _clock = _build(now=_ts(9, 0), bar_record_repository=repo)
+    service, _bus, _clock, _repo = _build(now=_ts(9, 0), bar_record_repository=repo)
     service.clear(_INSTRUMENT, _CONTRACT)
 
     assert service.recent_closed_bars(_INSTRUMENT, _CONTRACT) == ()
@@ -615,7 +720,7 @@ def test_continuous_warm_up_bars_returns_only_the_tail_gap_free_segment() -> Non
     # 09:45-10:45 is missing entirely — a genuine gap in the persisted history.
     bar1 = _insert_record(repo, _ts(10, 45), _ts(11, 45), open_="17500", close="17550")
     bar2 = _insert_record(repo, _ts(11, 45), _ts(12, 45), open_="17550", close="17600")
-    service, _bus, _clock = _build(now=_ts(13, 0), bar_record_repository=repo)
+    service, _bus, _clock, _repo = _build(now=_ts(13, 0), bar_record_repository=repo)
 
     tail = service.continuous_warm_up_bars(_INSTRUMENT, _CONTRACT)
     assert list(tail) == [bar1, bar2]
@@ -628,7 +733,7 @@ def test_continuous_warm_up_bars_excludes_a_conflicted_trading_day() -> None:
     repo = FakeBarRecordRepository()
     bar1 = _insert_record(repo, _ts(8, 45), _ts(9, 45), open_="17400", close="17450")
     _insert_record(repo, _ts(9, 45), _ts(10, 45), open_="17450", close="17500")
-    service, _bus, _clock = _build(now=_ts(11, 0), bar_record_repository=repo)
+    service, _bus, _clock, _repo = _build(now=_ts(11, 0), bar_record_repository=repo)
 
     existing_record = next(r for r in repo.all_records() if r.bar.start == bar1.start)
     conflicting_bar = Bar(
@@ -664,14 +769,14 @@ def test_continuous_warm_up_bars_excludes_a_conflicted_trading_day() -> None:
 
 def test_recorded_range_none_when_nothing_persisted() -> None:
     repo = FakeBarRecordRepository()
-    service, _bus, _clock = _build(now=_ts(9, 0), bar_record_repository=repo)
+    service, _bus, _clock, _repo = _build(now=_ts(9, 0), bar_record_repository=repo)
     assert service.recorded_range(_INSTRUMENT, _CONTRACT) is None
 
 
 def test_recorded_range_reports_incomplete_window_on_first_activation() -> None:
     repo = FakeBarRecordRepository()
     _insert_record(repo, _ts(8, 45), _ts(9, 45), open_="17500", close="17600")
-    service, _bus, _clock = _build(now=_ts(9, 0), bar_record_repository=repo)
+    service, _bus, _clock, _repo = _build(now=_ts(9, 0), bar_record_repository=repo)
 
     recorded_range = service.recorded_range(_INSTRUMENT, _CONTRACT)
     assert recorded_range is not None
@@ -681,7 +786,7 @@ def test_recorded_range_reports_incomplete_window_on_first_activation() -> None:
 def test_query_history_delegates_to_repository_range() -> None:
     repo = FakeBarRecordRepository()
     bar = _insert_record(repo, _ts(8, 45), _ts(9, 45), open_="17500", close="17600")
-    service, _bus, _clock = _build(now=_ts(9, 0), bar_record_repository=repo)
+    service, _bus, _clock, _repo = _build(now=_ts(9, 0), bar_record_repository=repo)
 
     records = service.query_history(
         _INSTRUMENT, _CONTRACT, start_date=_WEDNESDAY, end_date=_WEDNESDAY
@@ -699,7 +804,7 @@ def test_start_runs_retention_cleanup_and_purges_bars_older_than_two_months() ->
         close="17050",
     )
     recent = _insert_record(repo, _ts(8, 45), _ts(9, 45), open_="17500", close="17600")
-    service, _bus, _clock = _build(now=_ts(9, 0), bar_record_repository=repo)
+    service, _bus, _clock, _repo = _build(now=_ts(9, 0), bar_record_repository=repo)
 
     service.start()
     try:
@@ -712,26 +817,26 @@ def test_start_runs_retention_cleanup_and_purges_bars_older_than_two_months() ->
     assert old.start not in [r.bar.start for r in remaining]
 
 
-def test_daily_rollover_triggers_retention_cleanup_via_on_clock_tick() -> None:
+def test_daily_rollover_triggers_retention_cleanup_via_poll_once() -> None:
     repo = FakeBarRecordRepository()
-    service, _bus, clock = _build(now=_ts(9, 0), bar_record_repository=repo)
+    service, _bus, clock, _repo = _build(now=_ts(9, 0), bar_record_repository=repo)
 
-    service.on_clock_tick()
+    service.poll_once()
     assert len(repo.delete_before_calls) == 1
 
-    service.on_clock_tick()  # same day — no additional sweep
+    service.poll_once()  # same day — no additional sweep
     assert len(repo.delete_before_calls) == 1
 
     clock.advance(24 * 60 * 60)
-    service.on_clock_tick()
+    service.poll_once()
     assert len(repo.delete_before_calls) == 2
 
 
 def test_retention_cleanup_publishes_a_completed_summary_event() -> None:
     repo = FakeBarRecordRepository()
-    service, bus, _clock = _build(now=_ts(9, 0), bar_record_repository=repo)
+    service, bus, _clock, _repo = _build(now=_ts(9, 0), bar_record_repository=repo)
 
-    service.on_clock_tick()
+    service.poll_once()
 
     events = [e for e in bus.published if isinstance(e, BarRetentionCleanupCompleted)]
     assert len(events) == 1

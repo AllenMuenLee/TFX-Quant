@@ -1,10 +1,9 @@
 """`python -m tfx_quant.desktop` — launches the startup diagnostics screen.
 
-`OrderManager` (Feature 06) is wired up and running, but nothing in this desktop shell
-calls `OrderManager.submit()` yet — there is still no UI order-entry control and no
-strategy engine driving it automatically. See
-`application.order_management.order_manager.OrderManager` and
-`docs/adr/0008-order-and-fill-state-machine.md`.
+`OrderManager` (Feature 06) is wired up and running; `StrategySignalEngineService`
+(Feature 05) is its only automatic driver — see `application.strategy_signal.
+signal_engine_service.StrategySignalEngineService`. There is still no UI order-entry
+control for a human to submit a manual order directly.
 """
 
 from __future__ import annotations
@@ -17,15 +16,18 @@ from pathlib import Path
 
 from tfx_quant import __version__
 from tfx_quant.desktop.app import TfxQuantApp
-from tfx_quant.desktop.composition import build_services, load_settings, log_startup_readiness
+from tfx_quant.desktop.composition import (
+    auto_select_startup_instrument,
+    build_services,
+    load_settings,
+    log_startup_readiness,
+)
 from tfx_quant.domain.strategy_state import attempt_safe_pause
 from tfx_quant.telemetry import get_logger, log_critical, log_info
 from tfx_quant.telemetry.setup import configure_logging
 
 _DEFAULT_SETTINGS_PATH = Path(__file__).parent / "settings.example.json"
-_DEFAULT_LOG_DIR = Path(
-    os.environ.get("LOCALAPPDATA", str(Path.home()))
-) / "tfx_quant" / "logs"
+_DEFAULT_LOG_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "tfx_quant" / "logs"
 
 _logger = get_logger(__name__)
 
@@ -42,11 +44,13 @@ def main() -> int:
     settings = load_settings(settings_path)
     services = build_services(settings)
     services.event_coordinator.start()
+    auto_select_startup_instrument(services)
     services.market_data_bar_service.start()
     services.bar_history_backfill_service.start()
     services.order_manager.start()
     services.reconciliation_service.start()
     services.connectivity_monitor.start()
+    services.signal_engine_service.start()
     log_startup_readiness(services)
     try:
         app = TfxQuantApp(services)
@@ -55,6 +59,7 @@ def main() -> int:
         _handle_uncaught_exception(services, exc)
         raise
     finally:
+        services.signal_engine_service.stop()
         services.connectivity_monitor.stop()
         services.reconciliation_service.stop()
         services.order_manager.stop()

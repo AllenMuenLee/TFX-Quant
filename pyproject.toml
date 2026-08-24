@@ -12,9 +12,8 @@ dependencies = [
     "pydantic>=2.6,<3",
     "tzdata>=2024.1; sys_platform == 'win32'",
     "wxPython>=4.2,<5",
-    "pythonnet>=3,<4; sys_platform == 'win32'",
+    "comtypes>=1.1,<2; sys_platform == 'win32'",
     "keyring>=25,<26; sys_platform == 'win32'",
-    "yfinance>=1.2,<2",
 ]
 
 [project.optional-dependencies]
@@ -61,11 +60,7 @@ module = "wx.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = "clr"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
-module = "pythonnet"
+module = "comtypes.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
@@ -73,11 +68,11 @@ module = "YuantaOneAPI.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = "System.*"
+module = "YuantaOrdLibX64.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = "yfinance.*"
+module = "YuantaOrdLib.*"
 ignore_missing_imports = true
 
 [tool.importlinter]

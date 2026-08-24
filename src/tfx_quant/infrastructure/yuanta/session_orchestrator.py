@@ -9,14 +9,15 @@ the login sequencing, retry/backoff, capability tracking, and duplicate/out-of-o
 callback guarding fully unit-testable without any real vendor DLL — see
 `docs/adr/0004-broker-session-architecture.md`.
 
-SPARK API collapses the legacy OCX API's five-step sequence (trade login -> order
-query -> fill query -> position query -> quote login -> subscribe) into one login
-covering trading, market data, and reports together — see ADR 0004. This orchestrator
-still runs two safety queries (`GetRealReport`, `GetFutStoreSummary`) before declaring
-`READY`, preserving the "no unknown orders/positions before startup" safety property
-the implementation prompt's global rules require — just against the new, single-session
-API shape: 登入 -> (帳號選擇，若回傳超過一組) -> 回報查詢 -> 庫存查詢 -> 行情訂閱 ->
-session-ready.
+SPARK API collapses the legacy OCX API's multi-step trading login sequence into one login
+covering trading and reports together — see ADR 0004. This orchestrator still runs two
+safety queries (`GetRealReport`, `GetFutStoreSummary`) before declaring `READY`,
+preserving the "no unknown orders/positions before startup" safety property the
+implementation prompt's global rules require — just against the new, single-session API
+shape: 登入 -> (帳號選擇，若回傳超過一組) -> 回報查詢 -> 庫存查詢 -> session-ready. Market
+data has no place in this sequence at all — it comes from `yfinance`, entirely
+independent of this session (see `application.market_data.bar_service.
+MarketDataBarService` and Feature 00's SPARK-to-futures-API migration prompt).
 
 Every `handle_*` callback carries the `generation` the adapter captured when it issued
 the underlying request. `generation` bumps on every `start()`/retry attempt; a callback
@@ -31,7 +32,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import StrEnum, auto
 from typing import Protocol
 
@@ -44,7 +45,6 @@ from tfx_quant.application.events.events import (
     BrokerSessionInvalidated,
     BrokerSessionReady,
     Event,
-    MarketDataTickReceived,
 )
 from tfx_quant.application.ports.broker_session import (
     LoginRequest,
@@ -57,12 +57,7 @@ from tfx_quant.domain.errors import DomainError
 from tfx_quant.domain.timestamp import Timestamp
 from tfx_quant.infrastructure.yuanta.backoff import BackoffPolicy
 from tfx_quant.infrastructure.yuanta.credentials import BrokerCredentials
-from tfx_quant.infrastructure.yuanta.errors import (
-    AccountSelectionError,
-    MarketDataParseError,
-    MarketDataSubscriptionError,
-)
-from tfx_quant.infrastructure.yuanta.market_data_parsing import parse_stock_tick_push
+from tfx_quant.infrastructure.yuanta.errors import AccountSelectionError
 from tfx_quant.telemetry import (
     get_logger,
     log_debug,
@@ -104,14 +99,6 @@ class SparkAdapterPort(Protocol):
     def disconnect(self) -> None: ...
     def query_real_report(self, account: TradingAccount) -> None: ...
     def query_positions(self, account: TradingAccount) -> None: ...
-    def subscribe(self, symbol: str, account: TradingAccount) -> None:
-        """`account` is required — SPARK API's `SubscribeStockTick(LoginAcno, ...)`
-        takes the account explicitly, unlike the legacy quote OCX's session-implicit
-        `AddMktReg`. Raises `MarketDataSubscriptionError` if the vendor synchronously
-        rejects the call (`SubscribeStockTick` returning `False`)."""
-        ...
-
-    def unsubscribe(self, symbol: str, account: TradingAccount) -> None: ...
 
 
 class _Cancellable(Protocol):
@@ -149,7 +136,6 @@ class _Phase(StrEnum):
     AWAITING_ACCOUNT_SELECTION = auto()
     QUERYING_REPORTS = auto()
     QUERYING_POSITIONS = auto()
-    SUBSCRIBING_MARKET_DATA = auto()
     READY = auto()
     FAILED = auto()
     LOGGED_OUT = auto()
@@ -162,12 +148,6 @@ class _SessionState:
     login_done: bool = False
     reports_query_done: bool = False
     positions_query_done: bool = False
-    market_data_subscription_attempted: bool = False
-    """Set once `_begin_market_data_subscription` has run (after both safety queries
-    complete), regardless of whether `market_data_symbols` is empty — this is what
-    keeps `market_data` from vacuously becoming `True` the instant login succeeds when
-    no startup symbols are configured (an empty-set subset check is trivially true)."""
-    subscribed_symbols: set[str] = field(default_factory=set)
 
 
 class BrokerSessionOrchestrator:
@@ -178,19 +158,12 @@ class BrokerSessionOrchestrator:
         *,
         adapter: SparkAdapterPort,
         event_coordinator: EventPublisher,
-        market_data_symbols: Sequence[str] = (),
         account_no_hint: str | None = None,
         login_timeout_seconds: float = 15.0,
         backoff_factory: Callable[[], BackoffPolicy] | None = None,
         scheduler: Scheduler | None = None,
     ) -> None:
-        """`market_data_symbols` are already-resolved SPARK API quote symbols (e.g.
-        `domain.instrument_master.futures_quote_symbol`'s output) — this orchestrator
-        deliberately does not translate an `Instrument`/`ContractMonth` into a vendor
-        symbol string itself. An empty sequence means the market-data step is
-        vacuously satisfied as soon as the safety queries finish.
-
-        `account_no_hint` — when more than one account is returned and one of them
+        """`account_no_hint` — when more than one account is returned and one of them
         matches this account number, it's auto-selected; otherwise `select_account()`
         must be called externally before the session can complete. Sourced by the
         caller from `infrastructure.yuanta.login_preferences` (the previously-selected
@@ -198,7 +171,6 @@ class BrokerSessionOrchestrator:
         """
         self._adapter = adapter
         self._event_coordinator = event_coordinator
-        self._market_data_symbols = tuple(market_data_symbols)
         self._account_no_hint = account_no_hint
         self._login_timeout_seconds = login_timeout_seconds
         self._backoff = (backoff_factory or BackoffPolicy)()
@@ -285,29 +257,6 @@ class BrokerSessionOrchestrator:
                 self._set_phase(_Phase.FAILED)
                 self._collapse_and_publish_capabilities()
 
-    def subscribe_market_data(self, symbol: str) -> None:
-        """Runtime (post-ready) subscribe, distinct from the fixed `market_data_symbols`
-        list used during the startup sequence — this is what Feature 03's instrument
-        switch flow calls. Only valid while `READY`; deliberately does not touch
-        `_market_data_symbols` (the startup-capability comparison set), so this never
-        perturbs `_current_capabilities()`'s `market_data` flag."""
-        with self._lock:
-            if self._phase != _Phase.READY:
-                raise MarketDataSubscriptionError("尚未完成登入與初始行情訂閱，無法訂閱新商品行情")
-            assert self._state.selected_account is not None
-            self._adapter.subscribe(symbol, self._state.selected_account)
-            self._state.subscribed_symbols.add(symbol)
-
-    def unsubscribe_market_data(self, symbol: str) -> None:
-        """Safe to call for a symbol that was never subscribed — a no-op, matching
-        `IBrokerSession.unsubscribe_market_data`'s documented contract."""
-        with self._lock:
-            if self._phase != _Phase.READY:
-                return
-            assert self._state.selected_account is not None
-            self._adapter.unsubscribe(symbol, self._state.selected_account)
-            self._state.subscribed_symbols.discard(symbol)
-
     def stop(self) -> None:
         with self._lock:
             self._cancel_pending_timer()
@@ -317,17 +266,12 @@ class BrokerSessionOrchestrator:
                 _Phase.READY,
                 _Phase.QUERYING_REPORTS,
                 _Phase.QUERYING_POSITIONS,
-                _Phase.SUBSCRIBING_MARKET_DATA,
             ):
                 # Best-effort final order-status check. Feature 02 has no order
                 # cancellation/resend capability (that's Feature 06+), so this can
                 # only surface an ambiguous state, not resolve it — it deliberately
                 # does not claim a clean shutdown by skipping the check.
                 self._adapter.query_real_report(self._state.selected_account)
-
-            if self._state.selected_account is not None:
-                for symbol in list(self._state.subscribed_symbols):
-                    self._adapter.unsubscribe(symbol, self._state.selected_account)
 
             self._adapter.disconnect()
 
@@ -503,86 +447,7 @@ class BrokerSessionOrchestrator:
             )
             self._state.positions_query_done = True
             self._publish_capabilities_if_changed()
-            self._begin_market_data_subscription()
-
-    # -- Market data subscription + push --------------------------------------------
-
-    def _begin_market_data_subscription(self) -> None:
-        self._set_phase(_Phase.SUBSCRIBING_MARKET_DATA)
-        log_info(
-            _logger,
-            "query_step_started",
-            correlation_id=self._correlation_id,
-            step="market_data_subscription",
-            symbol_count=len(self._market_data_symbols),
-        )
-        if not self._market_data_symbols:
-            self._state.market_data_subscription_attempted = True
             self._complete_session()
-            return
-        assert self._state.selected_account is not None
-        for symbol in self._market_data_symbols:
-            try:
-                self._adapter.subscribe(symbol, self._state.selected_account)
-            except MarketDataSubscriptionError as exc:
-                self._handle_startup_failure(f"商品 {symbol} 行情訂閱失敗：{exc}", retriable=False)
-                return
-            self._state.subscribed_symbols.add(symbol)
-        self._state.market_data_subscription_attempted = True
-        self._complete_session()
-
-    def handle_market_data_push(
-        self,
-        generation: int,
-        vendor_symbol: str,
-        serial_no: object,
-        deal_price: object,
-        deal_vol: object,
-        hour: object,
-        minute: object,
-        second: object,
-        millisecond: object,
-    ) -> None:
-        """`SubscribeStockTick`'s ongoing `StockTickResult` push (`OnResponse` with
-        `intMark == 2`), forwarded via `spark_api_adapter.py`. Only accepted while
-        `READY` — a stale-generation or pre-subscription push is ignored, the same
-        guard every other `handle_*` callback here applies. Deliberately does not
-        translate `vendor_symbol` into `Instrument`/`ContractMonth` itself — same
-        boundary this orchestrator already keeps for `market_data_symbols` (see
-        `__init__`'s docstring); `MarketDataBarService` (which already knows the active
-        selection) does that translation."""
-        with self._lock:
-            if generation != self._generation or self._phase != _Phase.READY:
-                # DEBUG only — this guard also sees every stale tick during a
-                # reconnect window, not just genuinely rare duplicate/out-of-order
-                # session callbacks.
-                self._log_stale_callback("handle_market_data_push", generation)
-                return
-        try:
-            parsed = parse_stock_tick_push(
-                stk_code=vendor_symbol,
-                serial_no=serial_no,
-                deal_price=deal_price,
-                deal_vol=deal_vol,
-                hour=hour,
-                minute=minute,
-                second=second,
-                millisecond=millisecond,
-            )
-        except MarketDataParseError:
-            return  # malformed push — dropped rather than raised into the dispatch loop
-        if parsed is None:
-            return  # 商品清盤 (settlement) sentinel — nothing to feed downstream
-        self._publish(
-            MarketDataTickReceived(
-                at=Timestamp.now(),
-                vendor_symbol=parsed.vendor_symbol,
-                price=parsed.price,
-                size=parsed.size,
-                serial_no=parsed.serial_no,
-                exchange_time=parsed.exchange_time,
-            )
-        )
 
     def _complete_session(self) -> None:
         assert self._state.selected_account is not None
@@ -609,7 +474,6 @@ class BrokerSessionOrchestrator:
             reason=reason,
             retriable=retriable,
             login_ready=capabilities.login,
-            market_data_ready=capabilities.market_data,
             trading_ready=capabilities.trading,
             order_reports_ready=capabilities.order_reports,
             queries_ready=capabilities.queries,
@@ -689,17 +553,12 @@ class BrokerSessionOrchestrator:
 
     def _current_capabilities(self) -> SessionCapabilities:
         queries_done = self._state.reports_query_done and self._state.positions_query_done
-        # Subset, not equality: `subscribe_market_data()` (Feature 03's runtime
-        # instrument-switch path) may add symbols beyond this fixed startup set —
-        # that must not retroactively invalidate the market_data capability.
-        symbols_subscribed = set(self._market_data_symbols) <= self._state.subscribed_symbols
         return SessionCapabilities(
             login=self._state.login_done,
             # SPARK API auto-subscribes 即時回報 (RR_RealReport) on login — no
             # separate opt-in call exists (見 回報 > 即時回報訂閱：「登入即訂閱」) — so
             # this capability tracks login itself, not a distinct step.
             order_reports=self._state.login_done,
-            market_data=self._state.market_data_subscription_attempted and symbols_subscribed,
             trading=(
                 self._state.login_done and self._state.selected_account is not None and queries_done
             ),
@@ -716,8 +575,6 @@ class BrokerSessionOrchestrator:
         self._state.login_done = False
         self._state.reports_query_done = False
         self._state.positions_query_done = False
-        self._state.market_data_subscription_attempted = False
-        self._state.subscribed_symbols = set()
         self._publish_capabilities_if_changed()
 
     def _publish(self, event: Event) -> None:

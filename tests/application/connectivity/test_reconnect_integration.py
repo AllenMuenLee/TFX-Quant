@@ -91,9 +91,7 @@ class _InertScheduler:
     `threading.Timer` here would just be a stray background thread with nothing to
     verify."""
 
-    def schedule(
-        self, delay_seconds: float, callback: Callable[[], None]
-    ) -> _InertCancellable:
+    def schedule(self, delay_seconds: float, callback: Callable[[], None]) -> _InertCancellable:
         return _InertCancellable()
 
 

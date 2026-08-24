@@ -53,12 +53,10 @@ class TradingSettings(BaseModel):
     timezone_id: str = REQUIRED_TIMEZONE_ID
     eod_flatten_local_time: time = REQUIRED_EOD_FLATTEN_TIME
     max_net_lots: int = MAX_LOTS
-    use_mock: bool = True
-    """Selects mock vs. real Yuanta gateways in the desktop composition root."""
     instrument_master_path: str | None = None
     """Path to the controlled 商品主檔 JSON file (see `application.ports.
     instrument_master`). `None` falls back to the bundled example/seed file — fine for
-    `use_mock: true`, but production use requires a real, Yuanta-confirmed file (see
+    the bundled sample, but live use requires a real, Yuanta-confirmed file (see
     `infrastructure/yuanta/instrument_master.example.json`'s own warning)."""
     trading_calendar_path: str | None = None
     """Path to the controlled 交易日曆 JSON file (see `application.ports.

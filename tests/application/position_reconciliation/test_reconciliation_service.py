@@ -336,7 +336,7 @@ def test_repeated_reconcile_of_the_same_unresolved_mismatch_does_not_escalate_to
 
 
 def test_reconcile_never_auto_corrects_the_baseline_on_mismatch() -> None:
-    """"不得把持倉差異自動解釋成策略成交" — a mismatch must never silently adopt the
+    """ "不得把持倉差異自動解釋成策略成交" — a mismatch must never silently adopt the
     broker's number as the new expected baseline."""
     h = _setup(positions=(_position(1),))
     h.service.reconcile(trigger=ReconciliationTrigger.TIMED_POLL)

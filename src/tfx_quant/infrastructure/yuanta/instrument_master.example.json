@@ -1,5 +1,5 @@
 {
-  "_comment": "範例／種子商品主檔 — 對照 desktop/settings.example.json 的用途。vendor_symbol（SPARK API 即時行情代碼，SubscribeStockTick/UnSubscribeStockTick 用的字串）現已依元大 SPARK API 官方文件『期貨報價代碼7xxx變更規則』頁面公開的公式（root+月份代碼+西元年末1碼）計算，見 domain/instrument_master.py 的 futures_quote_symbol()——不再是未經確認的猜測值。order_commodity_code（SendFutureOrder 的 CommodityID1）則是另一組獨立代碼：TXF 的 'FITX' 取自官方文件『國內期貨下單』頁面的完整範例程式（已確認），MXF 尚未有官方文件範例可對照，暫留空字串，正式環境使用前必須向元大 FunctionList.xls（股名檔對照表）覆核後才能填入、標記 tradable。expiry_date 採 TAIFEX 台指選擇權/期貨結算日慣例（契約月份第三個星期三）計算，但正式環境仍須以交易所公告日曆為準，必要時人工覆核調整（見 domain/instrument_master.py 的說明：expiry_date 不在程式中以公式重算）。",
+  "_comment": "範例／種子商品主檔 — 對照 desktop/settings.example.json 的用途。vendor_symbol（SPARK API 即時行情代碼——現為歷史／參考用途，本系統市場資料改由 yfinance 提供，已無任何程式呼叫 SubscribeStockTick/UnSubscribeStockTick）現已依元大 SPARK API 官方文件『期貨報價代碼7xxx變更規則』頁面公開的公式（root+月份代碼+西元年末1碼）計算，見 domain/instrument_master.py 的 futures_quote_symbol()——不再是未經確認的猜測值。order_commodity_code（SendFutureOrder 的 CommodityID1）則是另一組獨立代碼：TXF 的 'FITX' 取自官方文件『國內期貨下單』頁面的完整範例程式（已確認），MXF 尚未有官方文件範例可對照，暫留空字串，正式環境使用前必須向元大 FunctionList.xls（股名檔對照表）覆核後才能填入、標記 tradable。expiry_date 採 TAIFEX 台指選擇權/期貨結算日慣例（契約月份第三個星期三）計算，但正式環境仍須以交易所公告日曆為準，必要時人工覆核調整（見 domain/instrument_master.py 的說明：expiry_date 不在程式中以公式重算）。",
   "entries": [
     {
       "instrument": "TXF",

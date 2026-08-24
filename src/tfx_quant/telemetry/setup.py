@@ -10,13 +10,10 @@ meantime, instead of vanishing when nothing has configured a handler.
 from __future__ import annotations
 
 import logging
-import logging.handlers
 import os
 from pathlib import Path
 
 _LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
-_DEFAULT_MAX_BYTES = 10 * 1024 * 1024
-_DEFAULT_BACKUP_COUNT = 5
 _LEVEL_ENV_VAR = "TFX_QUANT_LOG_LEVEL"
 
 
@@ -41,14 +38,6 @@ def configure_logging(log_dir: Path) -> None:
     stream_handler.setFormatter(formatter)
     stream_handler._tfx_quant_managed = True  # type: ignore[attr-defined]
     root.addHandler(stream_handler)
-
-    log_dir.mkdir(parents=True, exist_ok=True)
-    file_handler = logging.handlers.RotatingFileHandler(
-        log_dir / "tfx_quant.log",
-        maxBytes=_DEFAULT_MAX_BYTES,
-        backupCount=_DEFAULT_BACKUP_COUNT,
-        encoding="utf-8",
-    )
-    file_handler.setFormatter(formatter)
-    file_handler._tfx_quant_managed = True  # type: ignore[attr-defined]
-    root.addHandler(file_handler)
+    # Intentionally terminal-only. The desktop contains no log console and this
+    # launcher no longer creates or appends a log file behind the user's back.
+    _ = log_dir  # kept in the public signature for compatibility with launchers/tests

@@ -1,22 +1,31 @@
-"""MarketDataBarService — the real `BarSignalStateStore`, and the tick -> bar pipeline.
+"""MarketDataBarService — the real `BarSignalStateStore`, and the `yfinance`-poll ->
+persisted-bar pipeline.
 
-Closes both forward gaps ADR 0005 left open: `NullBarSignalStateStore` was always a
-placeholder ("real bar/signal state is Feature 04/05's job"), and nothing has ever
-consumed the vendor's price pushes despite `QuoteGatewayPort.subscribe()` registering
-for them since Feature 03.
+Polls `yfinance` (via `YahooHistoryQueryPort`) on a short, fixed interval for the active
+(instrument, contract)'s `interval="1h"` bars, resolves each row onto this codebase's own
+canonical 60-minute grid (`application.market_data.yahoo_bar_resolution.resolve_yahoo_bar`),
+and treats any row whose boundary hasn't closed yet as the currently-forming bar (display
+only, never persisted) and any newly-observed closed row as ready to persist/publish. This
+is the "近即時" (near-real-time) writer; `application.market_data.
+bar_history_backfill_service.BarHistoryBackfillService` is the coarser, less frequent
+gap-fill sweep over the full rolling two-month window — the two are deliberately separate
+services (different trigger cadence, different `BarDataSource` value) even though both
+ultimately call the same `YahooHistoryQueryPort`.
+
+There is no Yuanta/SPARK quote adapter anywhere in this pipeline — market data has never
+come from the futures trading API in this codebase's current design (see `implementation
+prompt/04-market-data-and-60m-bars/implementation-prompt.md`'s banner), and the Yuanta
+broker session is not required for this service to run.
 
 `clear(instrument, contract)` (the `BarSignalStateStore` method) is the primary hook for
 learning which (instrument, contract) is currently active — `InstrumentSelectionService.
 switch_to()` calls it synchronously, with the *new* selection, right before publishing
 `InstrumentSwitchCompleted` (see `instrument_selection_service.py`). Since this service
-already holds an `InstrumentMasterRepository`, `clear()` alone is enough to resolve the
-new contract's session times and vendor symbol — no separate `InstrumentSwitchCompleted`
-subscription is needed, and using the synchronous contract call instead of the
-asynchronous event avoids a race between "state cleared" and "first tick arrives".
+already holds an `InstrumentMasterRepository`, `clear()` alone is enough to resolve the new
+contract's session times.
 
-Every `_ActiveContract` field is protected by `_lock` — ticks arrive on the
-`EventCoordinator` consumer thread, the staleness/no-trade-interval sweep fires on this
-service's own internal timer thread, and UI query methods are called from the wx thread.
+Every `_ActiveContract` field is protected by `_lock` — the poll timer, the retention sweep,
+and UI query methods are all called from different threads.
 """
 
 from __future__ import annotations
@@ -27,10 +36,11 @@ import time as _time
 from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Protocol
 
 from tfx_quant.application.events.events import (
+    BarBackfillCompleted,
     BarClosed,
     BarPersistenceHealthChanged,
     BarRetentionCleanupCompleted,
@@ -39,8 +49,8 @@ from tfx_quant.application.events.events import (
     MarketDataFreshnessChanged,
     MarketDataGapCleared,
     MarketDataGapDetected,
-    MarketDataTickReceived,
 )
+from tfx_quant.application.market_data.yahoo_bar_resolution import resolve_yahoo_bar
 from tfx_quant.application.ports.bar_record_repository import (
     BarRecordRepository,
     BarUpsertRepositoryError,
@@ -49,8 +59,14 @@ from tfx_quant.application.ports.bar_record_repository import (
 from tfx_quant.application.ports.clock import Clock
 from tfx_quant.application.ports.instrument_master import InstrumentMasterRepository
 from tfx_quant.application.ports.trading_calendar import TradingCalendarRepository
+from tfx_quant.application.ports.yahoo_history_query import (
+    YahooBar,
+    YahooHistoryQueryError,
+    YahooHistoryQueryPort,
+)
+from tfx_quant.application.ports.yahoo_ticker_mapping import YahooTickerMappingRepository
 from tfx_quant.domain.bar import Bar, CandleColor
-from tfx_quant.domain.bar_aggregator import BarAggregator, CandleStreakCounter
+from tfx_quant.domain.bar_aggregator import CandleStreakCounter
 from tfx_quant.domain.bar_record import (
     BarDataSource,
     BarPeriod,
@@ -59,19 +75,23 @@ from tfx_quant.domain.bar_record import (
     rolling_two_month_start,
 )
 from tfx_quant.domain.contract import ContractMonth
-from tfx_quant.domain.errors import DomainError
 from tfx_quant.domain.instrument import Instrument
 from tfx_quant.domain.instrument_master import InstrumentMasterEntry
-from tfx_quant.domain.money import Price
-from tfx_quant.domain.tick import Tick
 from tfx_quant.domain.timestamp import Timestamp
 from tfx_quant.domain.trading_calendar import TradingCalendar
 from tfx_quant.telemetry import get_logger, log_debug, log_error, log_info, log_warning
 
 _logger = get_logger(__name__)
 
-_DEFAULT_STALE_AFTER_SECONDS = 10.0
-_DEFAULT_CLOCK_INTERVAL_SECONDS = 1.0
+_DEFAULT_POLL_INTERVAL_SECONDS = 30.0
+"""How often this service queries `yfinance` for the active contract — an HTTP call, so
+this must never be as tight as the old tick-driven sweep's 1-second cadence."""
+_DEFAULT_STALE_AFTER_SECONDS = 90.0
+"""A small multiple of `_DEFAULT_POLL_INTERVAL_SECONDS` — "no successful poll observed
+fresh data in the last ~3 poll cycles"."""
+_QUERY_LOOKBACK_DAYS = 1
+"""Each poll asks `yfinance` for `[today - 1, today]`, not just `[today, today]`, so a
+night session that has already crossed midnight is still covered."""
 _RECENT_BARS_LIMIT = 20
 _DEFAULT_WRITE_QUEUE_MAXSIZE = 500
 _DEFAULT_MAX_WRITE_RETRIES = 5
@@ -100,7 +120,7 @@ class RecordedRange:
 class EventBus(Protocol):
     """Structural stand-in for `EventCoordinator` — same seam as
     `session_orchestrator.EventPublisher`, extended with `subscribe` since this service
-    needs to react to `MarketDataTickReceived`/`BrokerSessionReady`, not just publish."""
+    needs to react to `BrokerSessionReady` for its warm-up re-sync, not just publish."""
 
     def subscribe(
         self, event_type: type[Event], handler: Callable[[Any], None]
@@ -114,11 +134,21 @@ class _ActiveContract:
     instrument: Instrument
     contract: ContractMonth
     entry: InstrumentMasterEntry
-    vendor_symbol: str
-    aggregator: BarAggregator
     streak: CandleStreakCounter
     recent_closed: deque[Bar] = field(default_factory=lambda: deque(maxlen=_RECENT_BARS_LIMIT))
-    last_tick_at: Timestamp | None = None
+    forming: Bar | None = None
+    last_synced_open: Timestamp | None = None
+    """The most recent closed bar's open-label timestamp this service has already
+    handled (persisted or found as a `DUPLICATE_IGNORED` in an earlier poll) — a poll
+    only needs to act on rows strictly after this."""
+    last_closed_end: Timestamp | None = None
+    """The most recent closed bar's close timestamp — the continuity baseline
+    `_handle_closed_bars` checks each newly-observed bar's `start` against to detect a
+    real gap. Restored from persisted history on `clear()`/reconnect, same as
+    `BarAggregator._last_closed_end` used to be restored implicitly via the tick stream."""
+    last_synced_at: Timestamp | None = None
+    """Wall-clock time of the most recent poll that completed without error — the
+    freshness/staleness signal, replacing "time of the most recent tick"."""
     is_stale: bool = True
     has_gap: bool = False
 
@@ -134,8 +164,10 @@ class MarketDataBarService:
         trading_calendar_repository: TradingCalendarRepository,
         instrument_master: InstrumentMasterRepository,
         bar_record_repository: BarRecordRepository,
+        yahoo_ticker_mapping: YahooTickerMappingRepository,
+        yahoo_history_query: YahooHistoryQueryPort,
         stale_after_seconds: float = _DEFAULT_STALE_AFTER_SECONDS,
-        clock_interval_seconds: float = _DEFAULT_CLOCK_INTERVAL_SECONDS,
+        poll_interval_seconds: float = _DEFAULT_POLL_INTERVAL_SECONDS,
         write_queue_maxsize: int = _DEFAULT_WRITE_QUEUE_MAXSIZE,
         max_write_retries: int = _DEFAULT_MAX_WRITE_RETRIES,
     ) -> None:
@@ -143,8 +175,10 @@ class MarketDataBarService:
         self._clock = clock
         self._instrument_master = instrument_master
         self._bar_record_repository = bar_record_repository
+        self._yahoo_ticker_mapping = yahoo_ticker_mapping
+        self._yahoo_history_query = yahoo_history_query
         self._stale_after_seconds = stale_after_seconds
-        self._clock_interval_seconds = clock_interval_seconds
+        self._poll_interval_seconds = poll_interval_seconds
         self._max_write_retries = max_write_retries
         self._calendar = TradingCalendar(
             holidays=trading_calendar_repository.get_holidays(),
@@ -160,11 +194,13 @@ class MarketDataBarService:
         self._write_thread: threading.Thread | None = None
         self._degraded_lock = threading.Lock()
         self._is_degraded = False
+        self._polling_degraded_lock = threading.Lock()
+        self._is_polling_degraded = False
         self._last_retention_check_date: date | None = None
         self._last_retention_summary: RetentionCleanupSummary | None = None
 
-        event_bus.subscribe(MarketDataTickReceived, self._on_tick_received)
         event_bus.subscribe(BrokerSessionReady, self._on_session_ready)
+        event_bus.subscribe(BarBackfillCompleted, self._on_backfill_completed)
 
     # -- BarSignalStateStore --------------------------------------------------------
 
@@ -182,39 +218,37 @@ class MarketDataBarService:
                 )
                 self._active = None
                 return
+            ticker = self._yahoo_ticker_mapping.get(instrument, contract)
             log_info(
                 _logger,
                 "bar_signal_state_cleared",
                 instrument=instrument.value,
                 contract=contract.code,
-                vendor_symbol=entry.vendor_symbol,
+                yahoo_ticker=ticker,
             )
             active = _ActiveContract(
-                instrument=instrument,
-                contract=contract,
-                entry=entry,
-                vendor_symbol=entry.vendor_symbol,
-                aggregator=BarAggregator(
-                    instrument=instrument, contract=contract, entry=entry, calendar=self._calendar
-                ),
-                streak=CandleStreakCounter(),
+                instrument=instrument, contract=contract, entry=entry, streak=CandleStreakCounter()
             )
             self._load_warm_up(active, self._clock.now())
             self._active = active
 
-    # -- Lifecycle (the periodic no-tick-required sweep) -----------------------------
+    # -- Lifecycle (the periodic yfinance poll) ---------------------------------------
 
     def start(self) -> None:
         with self._lock:
             if self._running:
                 return
             self._running = True
-            self._schedule_next_tick()
+            self._schedule_next_poll()
             self._write_thread = threading.Thread(
                 target=self._run_writer, name="BarRecordWriter", daemon=True
             )
             self._write_thread.start()
         self._run_retention_cleanup(self._clock.now())
+        # Do not make a newly-opened application wait for the first timer interval
+        # before it asks for bars.  Keep the potentially blocking HTTP request off the
+        # wx startup thread, just like the coarse history backfill worker does.
+        threading.Thread(target=self.poll_once, name="MarketDataInitialPoll", daemon=True).start()
 
     def stop(self) -> None:
         with self._lock:
@@ -228,108 +262,113 @@ class MarketDataBarService:
             self._write_queue.put(_WRITE_STOP)
             write_thread.join(timeout=5.0)
 
-    def _schedule_next_tick(self) -> None:
-        timer = threading.Timer(self._clock_interval_seconds, self._on_timer_fire)
+    def _schedule_next_poll(self) -> None:
+        timer = threading.Timer(self._poll_interval_seconds, self._on_timer_fire)
         timer.daemon = True
         self._timer = timer
         timer.start()
 
     def _on_timer_fire(self) -> None:
-        self.on_clock_tick()
+        self.poll_once()
         with self._lock:
             if self._running:
-                self._schedule_next_tick()
+                self._schedule_next_poll()
 
-    def on_clock_tick(self) -> None:
-        """Advances the active aggregator with no tick required, so a forming bar with
-        trades still closes promptly and staleness is detected even during a lull.
-        Public so tests can drive it directly with a fake `Clock`, without starting the
-        real background timer."""
+    def poll_once(self) -> None:
+        """Queries `yfinance` for the active contract's recent `1h` bars, persists any
+        newly-closed ones, and refreshes the forming-bar/staleness view. Public so tests
+        can drive it directly without the real background timer. A no-op when nothing
+        is currently selected."""
         now = self._clock.now()
         self._maybe_run_daily_retention_cleanup(now)
         with self._lock:
             active = self._active
             if active is None:
                 return
-            closed_bars = active.aggregator.on_clock(now)
-            self._handle_closed_bars(active, closed_bars, now)
-            self._update_staleness(active, now)
+            instrument, contract, entry = active.instrument, active.contract, active.entry
 
-    # -- Event handlers ---------------------------------------------------------------
+        ticker = self._yahoo_ticker_mapping.get(instrument, contract)
+        if ticker is None:
+            log_warning(
+                _logger,
+                "market_data_poll_skipped_no_ticker_mapping",
+                instrument=instrument.value,
+                contract=contract.code,
+            )
+            self._set_polling_degraded(True)
+            self._touch_staleness(instrument, contract, now)
+            return
 
-    def _on_tick_received(self, event: MarketDataTickReceived) -> None:
+        start_date = now.value.date() - timedelta(days=_QUERY_LOOKBACK_DAYS)
+        end_date = now.value.date()
+        log_debug(
+            _logger,
+            "market_data_poll_requested",
+            instrument=instrument.value,
+            contract=contract.code,
+            yahoo_ticker=ticker,
+            start_date=start_date.isoformat(),
+            end_date=end_date.isoformat(),
+        )
+        try:
+            yahoo_bars = self._yahoo_history_query.query_1h_bars(
+                yahoo_ticker=ticker, start_date=start_date, end_date=end_date
+            )
+        except YahooHistoryQueryError as exc:
+            log_warning(
+                _logger,
+                "market_data_poll_query_failed",
+                instrument=instrument.value,
+                contract=contract.code,
+                yahoo_ticker=ticker,
+                error=str(exc),
+            )
+            self._set_polling_degraded(True)
+            self._touch_staleness(instrument, contract, now)
+            return
+
         with self._lock:
             active = self._active
-            if active is None or event.vendor_symbol != active.vendor_symbol:
-                return  # not currently tracking this symbol — the "驗證商品" criterion
-            now = self._clock.now()
-            resolved_at = self._calendar.resolve_tick_timestamp(
-                event.exchange_time, now, active.entry
-            )
-            if resolved_at is None:
-                return  # exchange time matches no active session near now — reject
-            try:
-                tick = Tick(
-                    instrument=active.instrument,
-                    contract=active.contract,
-                    at=resolved_at,
-                    price=Price(event.price),
-                    size=event.size,
-                    serial_no=event.serial_no,
-                )
-            except DomainError as exc:
-                log_debug(
-                    _logger,
-                    "tick_dropped_malformed_push",
-                    vendor_symbol=event.vendor_symbol,
-                    error=str(exc),
-                )
-                return  # malformed push — reject rather than raise into the dispatch loop
-            if active.last_tick_at is None:
-                log_info(
-                    _logger,
-                    "market_data_first_tick_received",
-                    instrument=active.instrument.value,
-                    contract=active.contract.code,
-                    vendor_symbol=active.vendor_symbol,
-                    serial_no=tick.serial_no,
-                )
-            closed_bars = active.aggregator.on_tick(tick)
-            active.last_tick_at = now
+            if active is None or active.instrument != instrument or active.contract != contract:
+                # The active selection changed while this poll's HTTP call was in
+                # flight — this result no longer applies to anything.
+                return
+            self._set_polling_degraded(False)
+            self._apply_poll_result(active, entry, yahoo_bars, now)
             self._update_staleness(active, now)
-            self._handle_closed_bars(active, closed_bars, now)
+
+    def _touch_staleness(
+        self, instrument: Instrument, contract: ContractMonth, now: Timestamp
+    ) -> None:
+        """Re-evaluates staleness against `now` even when this poll itself failed (no
+        ticker mapping, or the query errored out) — repeated failures must still
+        eventually surface as stale, not just as `is_polling_degraded()`, since a
+        degraded-but-not-yet-stale poll loop still has recent enough data to trust."""
+        with self._lock:
+            active = self._matching_active(instrument, contract)
+            if active is not None:
+                self._update_staleness(active, now)
+
+    # -- Event handlers ---------------------------------------------------------------
 
     def _on_session_ready(self, _event: BrokerSessionReady) -> None:
         with self._lock:
             active = self._active
             if active is None:
                 return
-            # Reconnect: re-sync the in-memory streak/recent-bars view from whatever
-            # this process (or an earlier one) has actually persisted, same as clear()
-            # does on a fresh switch — see the implementation prompt's "啟動、重連或
-            # 切換契約時...載入" requirement.
+            # Re-sync the in-memory streak/recent-bars/continuity-baseline view from
+            # whatever this process (or an earlier one) has actually persisted — same
+            # as clear() does on a fresh switch. Market-data polling doesn't depend on
+            # the Yuanta broker session at all, so this is a defensive re-sync, not a
+            # response to a market-data-specific outage.
             self._load_warm_up(active, self._clock.now())
-            if not active.has_gap:
-                active.has_gap = True
-                log_warning(
-                    _logger,
-                    "market_data_gap_detected",
-                    instrument=active.instrument.value,
-                    contract=active.contract.code,
-                    reason="reconnect: no confirmed historical/tick-replay mechanism",
-                )
-                self._publish(
-                    MarketDataGapDetected(
-                        at=Timestamp.now(),
-                        instrument=active.instrument,
-                        contract=active.contract,
-                        reason=(
-                            "連線建立後尚無足夠歷史資料可重建目前 K 棒"
-                            "（本系統無已確認之歷史/tick 補洞機制），"
-                            "需等待下一根 K 棒完整收盤後才會解除"
-                        ),
-                    )
-                )
+
+    def _on_backfill_completed(self, event: BarBackfillCompleted) -> None:
+        """Rehydrate in-memory bar/streak state after the backfill writer finishes."""
+        with self._lock:
+            active = self._matching_active(event.instrument, event.contract)
+            if active is not None:
+                self._load_warm_up(active, self._clock.now())
 
     # -- Internal helpers ---------------------------------------------------------
 
@@ -352,6 +391,8 @@ class MarketDataBarService:
         active.streak = streak
         tail = records[-_RECENT_BARS_LIMIT:]
         active.recent_closed = deque((r.bar for r in tail), maxlen=_RECENT_BARS_LIMIT)
+        active.last_closed_end = records[-1].bar.end if records else None
+        active.last_synced_open = records[-1].bar.start if records else None
         log_info(
             _logger,
             "bar_history_warm_up_loaded",
@@ -362,10 +403,84 @@ class MarketDataBarService:
             record_count=len(records),
         )
 
+    def _apply_poll_result(
+        self,
+        active: _ActiveContract,
+        entry: InstrumentMasterEntry,
+        yahoo_bars: Sequence[YahooBar],
+        now: Timestamp,
+    ) -> None:
+        resolved = sorted(
+            (
+                r
+                for r in (
+                    resolve_yahoo_bar(
+                        instrument=active.instrument,
+                        contract=active.contract,
+                        entry=entry,
+                        calendar=self._calendar,
+                        yahoo_bar=yahoo_bar,
+                        now=now,
+                    )
+                    for yahoo_bar in yahoo_bars
+                )
+                if r is not None
+            ),
+            key=lambda r: r.bar.start.value,
+        )
+
+        forming = next((r.bar for r in reversed(resolved) if r.is_forming), None)
+        active.forming = forming
+
+        last_synced_value = active.last_synced_open.value if active.last_synced_open else None
+        new_closed = [
+            r.bar
+            for r in resolved
+            if not r.is_forming
+            and (last_synced_value is None or r.bar.start.value > last_synced_value)
+        ]
+        if new_closed:
+            self._handle_closed_bars(active, new_closed, now)
+            active.last_synced_open = new_closed[-1].start
+        active.last_synced_at = now
+
     def _handle_closed_bars(
         self, active: _ActiveContract, closed_bars: list[Bar], now: Timestamp
     ) -> None:
         for bar in closed_bars:
+            last_closed_end = active.last_closed_end
+            is_discontinuous = (
+                last_closed_end is not None and bar.start.value != last_closed_end.value
+            )
+            if is_discontinuous and not active.has_gap:
+                # A boundary this codebase expected is missing between the last known
+                # bar and this one — a real data hole (process was down, yfinance had
+                # no data for that hour, etc.), not just "nothing traded" (a no-trade
+                # slot is skipped by yfinance too, but that's a normal, non-gap outcome
+                # this codebase has no way to distinguish from a genuine hole — both
+                # are treated the same conservative way here).
+                assert last_closed_end is not None  # implied by is_discontinuous
+                active.has_gap = True
+                log_warning(
+                    _logger,
+                    "market_data_gap_detected",
+                    instrument=active.instrument.value,
+                    contract=active.contract.code,
+                    last_closed_end=last_closed_end.value.isoformat(),
+                    next_bar_start=bar.start.value.isoformat(),
+                )
+                self._publish(
+                    MarketDataGapDetected(
+                        at=now,
+                        instrument=active.instrument,
+                        contract=active.contract,
+                        reason=(
+                            f"{last_closed_end.value.isoformat()} 之後、"
+                            f"{bar.start.value.isoformat()} 之前有未收錄的 K 棒區間"
+                        ),
+                    )
+                )
+
             active.recent_closed.append(bar)
             active.streak.on_bar_closed(bar)
             is_gap_recovery = active.has_gap
@@ -396,6 +511,7 @@ class MarketDataBarService:
                         at=now, instrument=active.instrument, contract=active.contract
                     )
                 )
+            active.last_closed_end = bar.end
             self._enqueue_for_persistence(active, bar, is_gap_recovery=is_gap_recovery, now=now)
 
     def _enqueue_for_persistence(
@@ -404,8 +520,9 @@ class MarketDataBarService:
         context = self._calendar.session_context_for(bar.start, active.entry)
         if context is None:
             # Never expected — bar.start is always one of the calendar's own boundary
-            # outputs — but a persistence-layer surprise must never crash tick
-            # processing; flag degraded and drop this one write.
+            # outputs (resolve_yahoo_bar already validated this) — but a persistence-
+            # layer surprise must never crash poll processing; flag degraded and drop
+            # this one write.
             log_error(
                 _logger,
                 "bar_persist_requested_no_session_context",
@@ -421,15 +538,14 @@ class MarketDataBarService:
             period=BarPeriod.SIXTY_MINUTE,
             trading_day=trading_day,
             session=session,
-            source=BarDataSource.AGGREGATED_FROM_YUANTA_REALTIME,
+            source=BarDataSource.POLLED_FROM_YFINANCE,
             is_gap_recovery=is_gap_recovery,
             created_at=now,
             updated_at=now,
         )
-        # DEBUG only: called on the tick/clock-processing thread, never the
-        # EventCoordinator dispatch thread's own callback — but still kept to a
-        # compact identity, not the full bar payload, per "不得在行情 callback 內
-        # 同步輸出大量 payload".
+        # DEBUG only: called from poll_once(), never a hot per-tick callback — but
+        # still kept to a compact identity, not the full bar payload, per "不得在
+        # yfinance 查詢排程內同步輸出大量 payload".
         log_debug(
             _logger,
             "bar_persist_requested",
@@ -455,8 +571,8 @@ class MarketDataBarService:
             self._set_degraded(True)
 
     def _run_writer(self) -> None:
-        """Runs on its own daemon thread — never the `EventCoordinator` consumer
-        thread — so a slow or failing database never blocks tick processing."""
+        """Runs on its own daemon thread — never the poll thread — so a slow or
+        failing database never blocks polling."""
         while True:
             item = self._write_queue.get()
             if item is _WRITE_STOP:
@@ -527,6 +643,10 @@ class MarketDataBarService:
                 log_info(_logger, "bar_persistence_recovered")
             self._publish(BarPersistenceHealthChanged(at=Timestamp.now(), is_degraded=degraded))
 
+    def _set_polling_degraded(self, degraded: bool) -> None:
+        with self._polling_degraded_lock:
+            self._is_polling_degraded = degraded
+
     def _run_retention_cleanup(self, now: Timestamp) -> None:
         cutoff = rolling_two_month_start(now.value.date())
         log_debug(_logger, "bar_retention_cleanup_started", cutoff_trading_day=cutoff.isoformat())
@@ -566,10 +686,10 @@ class MarketDataBarService:
         self._run_retention_cleanup(now)
 
     def _update_staleness(self, active: _ActiveContract, now: Timestamp) -> None:
-        if active.last_tick_at is None:
+        if active.last_synced_at is None:
             is_stale_now = True
         else:
-            age = (now.value - active.last_tick_at.value).total_seconds()
+            age = (now.value - active.last_synced_at.value).total_seconds()
             is_stale_now = age > self._stale_after_seconds
         if is_stale_now != active.is_stale:
             active.is_stale = is_stale_now
@@ -579,9 +699,9 @@ class MarketDataBarService:
                 instrument=active.instrument.value,
                 contract=active.contract.code,
                 is_stale=is_stale_now,
-                last_tick_at=(
-                    active.last_tick_at.value.isoformat()
-                    if active.last_tick_at is not None
+                last_synced_at=(
+                    active.last_synced_at.value.isoformat()
+                    if active.last_synced_at is not None
                     else None
                 ),
             )
@@ -602,7 +722,7 @@ class MarketDataBarService:
     def forming_bar(self, instrument: Instrument, contract: ContractMonth) -> Bar | None:
         with self._lock:
             active = self._matching_active(instrument, contract)
-            return active.aggregator.forming_bar_snapshot() if active is not None else None
+            return active.forming if active is not None else None
 
     def recent_closed_bars(
         self, instrument: Instrument, contract: ContractMonth, limit: int = _RECENT_BARS_LIMIT
@@ -626,7 +746,7 @@ class MarketDataBarService:
     def last_update_at(self, instrument: Instrument, contract: ContractMonth) -> Timestamp | None:
         with self._lock:
             active = self._matching_active(instrument, contract)
-            return active.last_tick_at if active is not None else None
+            return active.last_synced_at if active is not None else None
 
     def candle_streak(
         self, instrument: Instrument, contract: ContractMonth
@@ -708,6 +828,15 @@ class MarketDataBarService:
         stronger guarantee to offer before a first failure is observed."""
         with self._degraded_lock:
             return self._is_degraded
+
+    def is_polling_degraded(self) -> bool:
+        """Surfaced on the startup diagnostics readiness screen alongside
+        `is_persistence_degraded()`/`BarHistoryBackfillService.is_degraded()` — `True`
+        when the active contract has no confirmed Yahoo ticker mapping, or the most
+        recent poll's `yfinance` query failed outright (after the adapter's own bounded
+        retry). Cleared by the very next successful poll."""
+        with self._polling_degraded_lock:
+            return self._is_polling_degraded
 
     def last_retention_summary(self) -> RetentionCleanupSummary | None:
         with self._lock:

@@ -1,4 +1,4 @@
-"""Yuanta broker gateway ports.
+"""Yuanta broker trade gateway port.
 
 Feature 01 defined the readiness/query surface needed by the `StartupSafetyGate`
 checklist (login state, order/position sync). Feature 06 adds order submission —
@@ -9,7 +9,9 @@ the `OrderReportReceived`/`FillReceived` events an implementation publishes late
 `application.order_management.order_manager.OrderManager`.
 
 Only `infrastructure.yuanta` may ever import vendor (`pythonnet`/`YuantaOneAPI`) types;
-everything else, including the desktop composition root, depends on these Protocols.
+everything else, including the desktop composition root, depends on this Protocol. There
+is no quote/market-data gateway here — market data comes entirely from `yfinance` (see
+`application.ports.yahoo_history_query.YahooHistoryQueryPort`), never this vendor.
 """
 
 from __future__ import annotations
@@ -17,9 +19,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Protocol
 
-from tfx_quant.domain.contract import ContractMonth
 from tfx_quant.domain.fill import Fill
-from tfx_quant.domain.instrument import Instrument
 from tfx_quant.domain.order import ClientOrderId, Order
 from tfx_quant.domain.order_state_machine import OrderReport
 from tfx_quant.domain.position import Position
@@ -57,16 +57,4 @@ class TradeGatewayPort(Protocol):
     def query_fills(self) -> Sequence[Fill]:
         """The broker's current queryable fill set, same reconciliation purpose as
         `query_order_reports`."""
-        ...
-
-
-class QuoteGatewayPort(Protocol):
-    def is_market_data_valid(self) -> bool: ...
-
-    def subscribe(self, instrument: Instrument, contract: ContractMonth) -> None: ...
-
-    def unsubscribe(self, instrument: Instrument, contract: ContractMonth) -> None:
-        """Cancel a previous `subscribe()` — used by Feature 03's instrument/contract
-        switch flow to drop the old contract's quote registration before subscribing
-        to the new one. Safe to call for a contract that was never subscribed."""
         ...

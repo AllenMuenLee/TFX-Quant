@@ -41,14 +41,3 @@ class InstrumentMasterFileError(YuantaSessionError):
     inconsistent (duplicate entries, bad field types) — raised at load time so a bad
     file fails loudly at startup rather than surfacing as a confusing lookup miss
     later."""
-
-
-class MarketDataSubscriptionError(YuantaSessionError):
-    """A `SubscribeStockTick`/`UnSubscribeStockTick` call was attempted while the
-    broker session isn't `READY`, or the vendor synchronously rejected the call."""
-
-
-class MarketDataParseError(YuantaSessionError):
-    """A `StockTickResult` push's fields couldn't be parsed into typed values (blank
-    symbol, non-numeric price/quantity, out-of-range time) — see
-    `market_data_parsing.py`."""

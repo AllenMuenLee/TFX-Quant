@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -13,7 +15,11 @@ from tfx_quant.application.connectivity.gateway_tracking import (
     ConnectivityTrackingBrokerSession,
     ConnectivityTrackingTradeGateway,
 )
-from tfx_quant.application.events.events import BrokerSessionInvalidated, FillReceived
+from tfx_quant.application.events.events import (
+    BarBackfillCompleted,
+    BrokerSessionInvalidated,
+    FillReceived,
+)
 from tfx_quant.application.market_data.bar_history_backfill_service import (
     BarHistoryBackfillService,
 )
@@ -26,7 +32,12 @@ from tfx_quant.application.position_reconciliation.reconciliation_service import
 from tfx_quant.application.reversal_scaling.reversal_service import ReversalWorkflowService
 from tfx_quant.application.reversal_scaling.scaling_service import ScalingService
 from tfx_quant.application.settings.trading_settings import Environment, validate_startup
-from tfx_quant.desktop.composition import build_services, compute_readiness, load_settings
+from tfx_quant.desktop.composition import (
+    auto_select_startup_instrument,
+    build_services,
+    compute_readiness,
+    load_settings,
+)
 from tfx_quant.domain.account import TradingAccount
 from tfx_quant.domain.fill import Fill
 from tfx_quant.domain.instrument import Instrument
@@ -63,34 +74,30 @@ def test_example_settings_file_is_itself_valid() -> None:
         Path(__file__).parents[2] / "src" / "tfx_quant" / "desktop" / "settings.example.json"
     )
     settings = load_settings(example_path)
-    assert settings.use_mock is True
+    assert not hasattr(settings, "use_mock")
 
 
-def test_build_services_wires_mock_gateways_when_use_mock_true(
+def test_build_services_wires_logged_out_real_gateway(
     valid_settings_raw: dict[str, Any],
 ) -> None:
     settings = validate_startup(valid_settings_raw)
     services = build_services(settings)
     assert services.trade_gateway.is_logged_in() is False
-    assert services.quote_gateway.is_market_data_valid() is False
 
 
-def test_build_services_wires_a_broker_session_when_use_mock_true(
+def test_build_services_wires_a_real_broker_session_without_connecting(
     valid_settings_raw: dict[str, Any],
 ) -> None:
     settings = validate_startup(valid_settings_raw)
     services = build_services(settings)
     assert services.broker_session.capabilities.login is False
 
-    services.broker_session.start(_login_request())
-
-    assert services.broker_session.capabilities.is_session_ready is True
     readiness = dict(compute_readiness(services))
-    assert readiness["Broker session: login"] is True
-    assert readiness["Broker session: market data"] is True
-    assert readiness["Broker session: trading"] is True
-    assert readiness["Broker session: order reports"] is True
-    assert readiness["Broker session: queries"] is True
+    assert readiness["Broker session: login"] is False
+    assert readiness["Broker session: trading"] is False
+    assert readiness["Broker session: order reports"] is False
+    assert readiness["Broker session: queries"] is False
+    assert readiness["Market data: yfinance polling"] is True
 
 
 def test_build_services_raises_actionable_preflight_error_when_use_mock_false(
@@ -105,9 +112,8 @@ def test_build_services_raises_actionable_preflight_error_when_use_mock_false(
     available until then — see docs/secrets-management.md)."""
     import tfx_quant.infrastructure.yuanta.preflight as preflight
 
-    monkeypatch.setattr(preflight, "default_dll_directory", lambda: tmp_path)
+    monkeypatch.setattr(preflight, "default_api_directory", lambda: tmp_path)
 
-    valid_settings_raw["use_mock"] = False
     settings = validate_startup(valid_settings_raw)
 
     with pytest.raises(PreflightCheckFailed) as exc_info:
@@ -295,6 +301,52 @@ def test_yfinance_backfill_readiness_row_is_healthy_with_no_active_selection(
     assert readiness["Market data: yfinance backfill"] is True
 
 
+def test_default_runtime_has_an_active_yfinance_market_data_mapping(
+    valid_settings_raw: dict[str, Any],
+) -> None:
+    """The desktop's default selection can start yfinance before broker login."""
+    settings = validate_startup(valid_settings_raw)
+    services = build_services(settings)
+
+    auto_select_startup_instrument(services)
+    services.event_coordinator.start()
+    services.event_coordinator.stop(timeout=2)
+
+    assert services.instrument_selection.current is not None
+    assert services.bar_history_backfill_service.is_degraded() is False
+
+
+def test_default_runtime_persists_only_yfinance_bars(
+    valid_settings_raw: dict[str, Any],
+) -> None:
+    settings = validate_startup(valid_settings_raw)
+    services = build_services(settings)
+    completed = threading.Event()
+    services.event_coordinator.subscribe(BarBackfillCompleted, lambda _event: completed.set())
+    services.event_coordinator.start()
+    try:
+        auto_select_startup_instrument(services)
+        services.market_data_bar_service.start()
+        services.bar_history_backfill_service.start()
+        assert completed.wait(timeout=15)
+
+        selected = services.instrument_selection.current
+        assert selected is not None
+        today = services.clock.now().value.date()
+        records = services.market_data_bar_service.query_history(
+            selected.instrument,
+            selected.contract,
+            start_date=today - timedelta(days=7),
+            end_date=today,
+        )
+        assert records
+        assert all("YFINANCE" in record.source.value for record in records)
+    finally:
+        services.bar_history_backfill_service.stop()
+        services.market_data_bar_service.stop()
+        services.event_coordinator.stop(timeout=2)
+
+
 def test_yahoo_ticker_mapping_path_is_honored(
     valid_settings_raw: dict[str, Any], tmp_path: Path
 ) -> None:
@@ -361,8 +413,6 @@ def test_full_disconnect_after_login_drives_a_connectivity_safe_pause_via_compos
 ) -> None:
     settings = validate_startup(valid_settings_raw)
     services = build_services(settings)
-    services.broker_session.start(_login_request())
-    assert services.broker_session.capabilities.is_session_ready is True
     services.strategy_state_machine.transition(StrategyState.STARTING)
     services.strategy_state_machine.transition(StrategyState.RUNNING)
 

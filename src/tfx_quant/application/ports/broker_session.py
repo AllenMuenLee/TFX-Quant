@@ -1,16 +1,19 @@
 """IBrokerSession — the Yuanta login/session-lifecycle port.
 
-Distinct from `TradeGatewayPort`/`QuoteGatewayPort` (Feature 01's narrow query/
-subscribe surface, which stay as-is): this is the richer session-management surface
-Feature 02 adds — login, account discovery/selection, capability tracking, and
-graceful shutdown. A concrete adapter may satisfy all three Protocols at once, but
-callers that only need query/subscribe access should keep depending on the narrower
-ports.
+Distinct from `TradeGatewayPort` (Feature 01's narrow query surface, which stays as-is):
+this is the richer session-management surface Feature 02 adds — login, account
+discovery/selection, capability tracking, and graceful shutdown. A concrete adapter may
+satisfy both Protocols at once, but callers that only need query access should keep
+depending on the narrower port.
 
-`SessionCapabilities` deliberately keeps "logged in", "can receive market data", "can
-trade", "can receive order/fill reports", and "can query" as five independent
-booleans — the implementation prompt explicitly forbids collapsing "logged in" into
-"can trade".
+There is no market-data capability here at all: market data comes from `yfinance`
+(`application.market_data.bar_service.MarketDataBarService`), entirely independent of
+this session — see `implementation prompt/00-spark-to-futures-api-migration/
+implementation-prompt.md`'s "讀取 readiness 拆成 broker trading、order reports、queries
+與 yfinance market data" mandate. `SessionCapabilities` deliberately keeps "logged in",
+"can trade", "can receive order/fill reports", and "can query" as four independent
+booleans — the implementation prompt explicitly forbids collapsing "logged in" into "can
+trade".
 """
 
 from __future__ import annotations
@@ -60,7 +63,6 @@ class SessionCapabilities:
     """Independent readiness flags. See module docstring — never collapse these."""
 
     login: bool = False
-    market_data: bool = False
     trading: bool = False
     order_reports: bool = False
     queries: bool = False
@@ -112,13 +114,13 @@ class IBrokerSession(Protocol):
         ...
 
     def start(self, request: LoginRequest) -> None:
-        """Begin the login → query → subscribe sequence (async; publishes events).
+        """Begin the login → safety-query sequence (async; publishes events).
 
-        `request` carries the operator-entered environment, quote session, and
-        credentials — built by the login UI, never guessed/defaulted by this layer
-        (see `desktop/login_dialog.py`). Safe to call again after a terminal failure
-        to retry manually; while a login or capped-backoff retry is already in
-        progress, calling this again is a no-op.
+        `request` carries the operator-entered environment and credentials — built by
+        the login UI, never guessed/defaulted by this layer (see
+        `desktop/login_dialog.py`). Safe to call again after a terminal failure to
+        retry manually; while a login or capped-backoff retry is already in progress,
+        calling this again is a no-op.
         """
         ...
 
@@ -135,24 +137,9 @@ class IBrokerSession(Protocol):
         """Cancel an in-progress login attempt or backoff wait. Idempotent."""
         ...
 
-    def subscribe_market_data(self, symbol: str) -> None:
-        """Register for a SPARK API real-time quote symbol (e.g. "TXFH6", per 期貨報價
-        代碼7xxx變更規則 — see `domain.instrument_master.futures_quote_symbol`) while
-        the session is `READY`. `symbol` is already resolved (Feature 03's job — see
-        `application.ports.instrument_master`); this port never translates an
-        `Instrument`/`ContractMonth` itself. Raises if the session isn't ready or the
-        vendor synchronously rejects the registration."""
-        ...
-
-    def unsubscribe_market_data(self, symbol: str) -> None:
-        """Cancel a previous `subscribe_market_data()` registration. Safe to call for
-        a symbol that was never subscribed (a no-op) — callers use this defensively
-        when tearing down an old selection before switching to a new one."""
-        ...
-
     def stop(self) -> None:
-        """Orderly shutdown: verify no order is left in an unknown state, unregister
-        market data, log out (`Logout()`), and tear down the underlying session/client.
-        Blocks until complete. See `docs/adr/0004-broker-session-architecture.md` for
-        the exact ordering."""
+        """Orderly shutdown: verify no order is left in an unknown state, log out
+        (`Logout()`), and tear down the underlying session/client. Blocks until
+        complete. See `docs/adr/0004-broker-session-architecture.md` for the exact
+        ordering."""
         ...

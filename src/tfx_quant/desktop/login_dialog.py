@@ -151,12 +151,16 @@ class LoginDialog(wx.Dialog):
 
         sizer.Add(wx.StaticLine(panel), 0, wx.EXPAND | wx.ALL, 6)
 
-        cert_label = wx.StaticText(
+        cert_state = "✓ 已匯入憑證" if prefs.certificate_imported else "尚未匯入憑證"
+        self._certificate_state_label = wx.StaticText(
             panel,
-            label="正式環境需先將憑證匯入本機（一次性設定，與每次登入無關）：",
+            label=cert_state,
         )
-        cert_label.Wrap(360)
-        sizer.Add(cert_label, 0, wx.ALL, 6)
+        self._certificate_state_label.SetForegroundColour(
+            wx.Colour(22, 163, 74) if prefs.certificate_imported else wx.Colour(220, 38, 38)
+        )
+        self._certificate_state_label.SetFont(self._certificate_state_label.GetFont().Bold())
+        sizer.Add(self._certificate_state_label, 0, wx.ALL, 6)
 
         cert_path_row = wx.BoxSizer(wx.HORIZONTAL)
         cert_path_row.Add(
@@ -265,6 +269,9 @@ class LoginDialog(wx.Dialog):
         except CertificateImportError as exc:
             self._status_label.SetLabel(f"憑證匯入失敗：{exc}")
             return
+        login_preferences.save_certificate_imported(True)
+        self._certificate_state_label.SetLabel("✓ 已匯入憑證")
+        self._certificate_state_label.SetForegroundColour(wx.Colour(22, 163, 74))
         self._status_label.SetLabel("憑證已匯入本機憑證存放區。")
 
     # -- Form state -------------------------------------------------------------

@@ -47,7 +47,7 @@ class DiscrepancyKind(StrEnum):
 
 
 def classify_discrepancy(expected: NetPosition, actual: NetPosition) -> DiscrepancyKind:
-    """"實際持倉與 expected position 在方向或口數上不同" as a pure, directly-testable
+    """ "實際持倉與 expected position 在方向或口數上不同" as a pure, directly-testable
     classification rather than a single collapsed boolean."""
     if expected.lots == actual.lots:
         return DiscrepancyKind.NONE

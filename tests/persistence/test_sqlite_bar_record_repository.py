@@ -62,7 +62,7 @@ def _record(
         period=BarPeriod.SIXTY_MINUTE,
         trading_day=start.value.date(),
         session=MarketSession.DAY,
-        source=BarDataSource.AGGREGATED_FROM_YUANTA_REALTIME,
+        source=BarDataSource.POLLED_FROM_YFINANCE,
         is_gap_recovery=is_gap_recovery,
         created_at=start,
         updated_at=start,
@@ -87,7 +87,7 @@ def test_upsert_new_bar_is_inserted(repo: SqliteBarRecordRepository) -> None:
     assert found[0].bar.open.amount == Decimal("17500")
     assert found[0].bar.start == record.bar.start
     assert found[0].session is MarketSession.DAY
-    assert found[0].source is BarDataSource.AGGREGATED_FROM_YUANTA_REALTIME
+    assert found[0].source is BarDataSource.POLLED_FROM_YFINANCE
 
 
 def test_upsert_identical_duplicate_is_ignored(repo: SqliteBarRecordRepository) -> None:
@@ -127,7 +127,7 @@ def test_apply_correction_bumps_revision_and_writes_audit(repo: SqliteBarRecordR
         period=BarPeriod.SIXTY_MINUTE,
         trading_day=start.value.date(),
         session=MarketSession.DAY,
-        source=BarDataSource.AGGREGATED_FROM_YUANTA_REALTIME,
+        source=BarDataSource.POLLED_FROM_YFINANCE,
         is_gap_recovery=False,
         created_at=start,
         updated_at=_ts(2026, 9, 16, 10, 0),
@@ -297,7 +297,7 @@ def test_record_conflict_and_list_conflicted_trading_days(
         "FROM bar_backfill_conflicts"
     ).fetchone()
     assert row == (
-        BarDataSource.AGGREGATED_FROM_YUANTA_REALTIME.value,
+        BarDataSource.POLLED_FROM_YFINANCE.value,
         "17500",
         BarDataSource.BACKFILLED_FROM_YFINANCE.value,
         "17999",

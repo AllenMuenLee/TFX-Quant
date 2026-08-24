@@ -1,199 +1,309 @@
-"""MarketDataPanel — Feature 04's forming/closed-bar and staleness display.
-
-Embedded in `ReadinessFrame`, mirroring `InstrumentSelectionPanel`'s embedding: purely a
-display surface (no order-sending control, matching this codebase's existing UI
-constraint) with a `refresh()` the parent frame calls. `ReadinessFrame` — not this panel
-— owns the market-data event subscriptions (`BarClosed`/`MarketDataTickReceived`/
-`MarketDataFreshnessChanged`/`MarketDataGapDetected`/`MarketDataGapCleared`) and their
-`wx.CallAfter` hop off the `EventCoordinator` consumer thread, same as it already does
-for broker session events — keeping subscription lifecycle in one place (the frame's
-existing `_on_close` teardown) rather than duplicating it per embedded panel.
-
-The closed-bar list is a single view backed by `MarketDataBarService.query_history()`
-(persisted history, up to the rolling two-month window) rather than two separate
-"recent" vs "historical" lists — a bar that closed moments ago and a bar from three
-weeks ago are the same kind of record once persisted, so they share one list and one
-date-range query. The date pickers/查詢 button are for quickly jumping to a different
-day; every `_refresh()` (i.e. every market-data event) re-runs the *current* date range
-so today's view keeps updating live without the user needing to press 查詢 again.
-"""
+"""Graphical yfinance candlestick view with history and live modes."""
 
 from __future__ import annotations
 
 from datetime import date, timedelta
+from decimal import Decimal
 
 import wx
 import wx.adv
 
 from tfx_quant.desktop.composition import ServiceContainer
-from tfx_quant.domain.bar import Bar, CandleColor
-from tfx_quant.domain.bar_record import BarDataSource, BarRecord
-from tfx_quant.telemetry import get_logger, log_info
+from tfx_quant.domain.bar import Bar
 
-_logger = get_logger(__name__)
-
-_CANDLE_LABEL_ZH = {
-    CandleColor.RED: "紅",
-    CandleColor.BLACK: "黑",
-    CandleColor.DOJI: "十字",
-}
-_SOURCE_LABEL_ZH = {
-    BarDataSource.AGGREGATED_FROM_YUANTA_REALTIME: (
-        "本軟體自行聚合（元大即時行情，非官方歷史 K 棒）"
-    ),
-    BarDataSource.BACKFILLED_FROM_YFINANCE: (
-        "yfinance 回補（第三方資料，非元大／期交所官方紀錄）"
-    ),
-}
-_BAR_ROWS_SHOWN = 200
-_DEFAULT_QUERY_DAYS = 7
+_BG = wx.Colour(15, 23, 42)
+_CARD = wx.Colour(24, 34, 55)
+_GRID = wx.Colour(51, 65, 85)
+_TEXT = wx.Colour(203, 213, 225)
+_UP = wx.Colour(239, 68, 68)
+_DOWN = wx.Colour(34, 197, 94)
+_LIVE_LIMIT = 80
+_MIN_VISIBLE_BARS = 8
 
 
-def _format_bar(bar: Bar) -> str:
-    label = bar.start.value.strftime("%m/%d %H:%M")
-    color = _CANDLE_LABEL_ZH[bar.candle_color]
-    return (
-        f"{label}｜開 {bar.open.amount} 高 {bar.high.amount} 低 {bar.low.amount} "
-        f"收 {bar.close.amount}｜量 {bar.volume}｜{color}"
-    )
+def _wx_date(value: date) -> wx.DateTime:
+    result = wx.DateTime()
+    result.Set(value.day, value.month - 1, value.year)
+    return result
 
 
-def _format_record(record: BarRecord) -> str:
-    completeness = "缺口後首根，前段資料可能不完整" if record.is_gap_recovery else "完整"
-    source = _SOURCE_LABEL_ZH[record.source]
-    return f"{_format_bar(record.bar)}｜來源：{source}｜完整性：{completeness}"
-
-
-def _wx_date_to_date(value: wx.DateTime) -> date:
+def _date(value: wx.DateTime) -> date:
     return date(value.GetYear(), value.GetMonth() + 1, value.GetDay())
 
 
-def _date_to_wx_date(value: date) -> wx.DateTime:
-    wx_date = wx.DateTime()
-    wx_date.Set(value.day, value.month - 1, value.year)
-    return wx_date
+class CandlestickCanvas(wx.Panel):
+    def __init__(self, parent: wx.Window) -> None:
+        super().__init__(parent, style=wx.BORDER_NONE)
+        self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
+        self.SetBackgroundColour(_CARD)
+        self.SetMinSize((-1, 390))
+        self._bars: list[Bar] = []
+        self._zoom = 1.0
+        self._right_index = 0
+        self._drag_x: int | None = None
+        self._empty_message = "等待 yfinance 資料…"
+        self.Bind(wx.EVT_PAINT, self._paint)
+        self.Bind(wx.EVT_SIZE, self._on_size)
+        self.Bind(wx.EVT_MOUSEWHEEL, self._on_mouse_wheel)
+        self.Bind(wx.EVT_LEFT_DOWN, self._on_left_down)
+        self.Bind(wx.EVT_LEFT_UP, self._on_left_up)
+        self.Bind(wx.EVT_MOTION, self._on_motion)
+        self.Bind(wx.EVT_MOUSE_CAPTURE_LOST, self._on_capture_lost)
+
+    def _on_size(self, event: wx.SizeEvent) -> None:
+        self.Refresh()
+        event.Skip()
+
+    def set_bars(self, bars: list[Bar], empty_message: str = "此區間沒有 K 線") -> None:
+        was_at_latest = self._right_index >= len(self._bars)
+        self._bars = bars
+        self._empty_message = empty_message
+        if was_at_latest or not self._right_index:
+            self._right_index = len(bars)
+        else:
+            self._right_index = min(self._right_index, len(bars))
+        self.Refresh()
+
+    def zoom_in(self) -> None:
+        self._set_zoom(self._zoom * 1.25)
+
+    def zoom_out(self) -> None:
+        self._set_zoom(self._zoom / 1.25)
+
+    def reset_view(self) -> None:
+        self._zoom = 1.0
+        self._right_index = len(self._bars)
+        self.Refresh()
+
+    def _set_zoom(self, zoom: float) -> None:
+        self._zoom = min(10.0, max(0.25, zoom))
+        self.Refresh()
+
+    def _visible_range(self, plot_width: int) -> tuple[int, int]:
+        count = len(self._bars)
+        base_visible = max(_MIN_VISIBLE_BARS, plot_width // 10)
+        visible = min(count, max(_MIN_VISIBLE_BARS, round(base_visible / self._zoom)))
+        right = min(count, max(visible, self._right_index))
+        return right - visible, right
+
+    def _scroll(self, bars: int, plot_width: int | None = None) -> None:
+        width = plot_width if plot_width is not None else max(1, self.GetClientSize().width - 86)
+        start, end = self._visible_range(width)
+        visible = end - start
+        self._right_index = min(len(self._bars), max(visible, self._right_index + bars))
+        self.Refresh()
+
+    def _on_mouse_wheel(self, event: wx.MouseEvent) -> None:
+        direction = 1 if event.GetWheelRotation() > 0 else -1
+        if event.ControlDown():
+            self._set_zoom(self._zoom * (1.2 if direction > 0 else 1 / 1.2))
+        else:
+            width = max(1, self.GetClientSize().width - 86)
+            start, end = self._visible_range(width)
+            step = max(1, (end - start) // 8)
+            self._scroll(-direction * step, width)
+
+    def _on_left_down(self, event: wx.MouseEvent) -> None:
+        self._drag_x = event.GetX()
+        self.CaptureMouse()
+
+    def _on_left_up(self, _event: wx.MouseEvent) -> None:
+        self._drag_x = None
+        if self.HasCapture():
+            self.ReleaseMouse()
+
+    def _on_capture_lost(self, _event: wx.MouseCaptureLostEvent) -> None:
+        self._drag_x = None
+
+    def _on_motion(self, event: wx.MouseEvent) -> None:
+        if self._drag_x is None or not event.Dragging() or not event.LeftIsDown():
+            return
+        width = max(1, self.GetClientSize().width - 86)
+        start, end = self._visible_range(width)
+        pixels_per_bar = width / max(1, end - start)
+        delta = event.GetX() - self._drag_x
+        bars = round(-delta / max(1.0, pixels_per_bar))
+        if bars:
+            self._scroll(bars, width)
+            self._drag_x = event.GetX()
+
+    def _paint(self, _event: wx.PaintEvent) -> None:
+        dc = wx.AutoBufferedPaintDC(self)
+        dc.SetBackground(wx.Brush(_CARD))
+        dc.Clear()
+        width, height = self.GetClientSize()
+        if not self._bars or width < 120 or height < 100:
+            dc.SetTextForeground(_TEXT)
+            dc.DrawLabel(self._empty_message, wx.Rect(0, 0, width, height), wx.ALIGN_CENTER)
+            return
+
+        left, top, right, bottom = 68, 22, 18, 38
+        plot_w, plot_h = max(1, width - left - right), max(1, height - top - bottom)
+        start_index, end_index = self._visible_range(plot_w)
+        visible_bars = self._bars[start_index:end_index]
+        low = min(float(bar.low.amount) for bar in visible_bars)
+        high = max(float(bar.high.amount) for bar in visible_bars)
+        padding = max((high - low) * 0.06, 1.0)
+        low, high = low - padding, high + padding
+
+        dc.SetPen(wx.Pen(_GRID, 1))
+        dc.SetTextForeground(wx.Colour(148, 163, 184))
+        for i in range(5):
+            y = top + round(plot_h * i / 4)
+            price = high - (high - low) * i / 4
+            dc.DrawLine(left, y, left + plot_w, y)
+            dc.DrawText(f"{price:,.0f}", 8, y - 8)
+
+        count = len(visible_bars)
+        step = plot_w / max(count, 1)
+        body_w = max(2, min(12, int(step * 0.62)))
+
+        def y_of(value: Decimal) -> int:
+            return top + round((high - float(value)) / (high - low) * plot_h)
+
+        for index, bar in enumerate(visible_bars):
+            x = left + round((index + 0.5) * step)
+            color = _UP if bar.close.amount >= bar.open.amount else _DOWN
+            dc.SetPen(wx.Pen(color, 1))
+            dc.DrawLine(x, y_of(bar.high.amount), x, y_of(bar.low.amount))
+            y_open, y_close = y_of(bar.open.amount), y_of(bar.close.amount)
+            y_body, body_h = min(y_open, y_close), max(2, abs(y_close - y_open))
+            dc.SetBrush(wx.Brush(color))
+            dc.DrawRectangle(x - body_w // 2, y_body, body_w, body_h)
+
+        label_count = min(6, count)
+        for i in range(label_count):
+            index = round(i * (count - 1) / max(label_count - 1, 1))
+            bar = visible_bars[index]
+            x = left + round((index + 0.5) * step)
+            dc.DrawText(bar.start.value.strftime("%m/%d %H:%M"), x - 35, top + plot_h + 10)
 
 
 class MarketDataPanel(wx.Panel):
     def __init__(self, parent: wx.Window, services: ServiceContainer) -> None:
         super().__init__(parent)
         self._services = services
+        self._live_mode = True
+        self.SetBackgroundColour(_BG)
+        self._canvas = CandlestickCanvas(self)
 
-        sizer = wx.BoxSizer(wx.VERTICAL)
+        root = wx.BoxSizer(wx.VERTICAL)
+        header = wx.BoxSizer(wx.HORIZONTAL)
+        title = wx.StaticText(self, label="市場行情")
+        title.SetForegroundColour(wx.WHITE)
+        title.SetFont(title.GetFont().Bold().Scale(1.35))
+        header.Add(title, 0, wx.ALIGN_CENTER_VERTICAL)
+        header.AddStretchSpacer()
+        self._source = wx.StaticText(self, label="● yfinance 公開資料 · 不需券商登入")
+        self._source.SetForegroundColour(wx.Colour(96, 165, 250))
+        header.Add(self._source, 0, wx.ALIGN_CENTER_VERTICAL)
+        root.Add(header, 0, wx.EXPAND | wx.BOTTOM, 12)
 
-        status_row = wx.BoxSizer(wx.HORIZONTAL)
-        status_row.Add(
-            wx.StaticText(self, label="行情狀態："), 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 6
-        )
-        self._status_label = wx.StaticText(self, label="（尚未選擇契約）")
-        status_row.Add(self._status_label, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 6)
-        sizer.Add(status_row, 0)
+        mode_row = wx.BoxSizer(wx.HORIZONTAL)
+        self._live_button = wx.Button(self, label="即時監看")
+        self._history_button = wx.Button(self, label="歷史查詢")
+        self._live_button.Bind(wx.EVT_BUTTON, lambda _e: self._set_mode(True))
+        self._history_button.Bind(wx.EVT_BUTTON, lambda _e: self._set_mode(False))
+        mode_row.Add(self._live_button, 0, wx.RIGHT, 8)
+        mode_row.Add(self._history_button, 0)
+        mode_row.AddStretchSpacer()
+        navigation_hint = wx.StaticText(self, label="滾輪平移 · Ctrl+滾輪縮放 · 拖曳平移")
+        navigation_hint.SetForegroundColour(_TEXT)
+        mode_row.Add(navigation_hint, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 8)
+        zoom_out = wx.Button(self, label="−", style=wx.BU_EXACTFIT)
+        zoom_out.SetToolTip("縮小 K 線")
+        zoom_out.Bind(wx.EVT_BUTTON, lambda _e: self._canvas.zoom_out())
+        mode_row.Add(zoom_out, 0, wx.RIGHT, 4)
+        zoom_in = wx.Button(self, label="+", style=wx.BU_EXACTFIT)
+        zoom_in.SetToolTip("放大 K 線")
+        zoom_in.Bind(wx.EVT_BUTTON, lambda _e: self._canvas.zoom_in())
+        mode_row.Add(zoom_in, 0, wx.RIGHT, 4)
+        reset_view = wx.Button(self, label="重設", style=wx.BU_EXACTFIT)
+        reset_view.Bind(wx.EVT_BUTTON, lambda _e: self._canvas.reset_view())
+        mode_row.Add(reset_view, 0)
+        root.Add(mode_row, 0, wx.BOTTOM, 10)
 
-        forming_row = wx.BoxSizer(wx.HORIZONTAL)
-        forming_row.Add(
-            wx.StaticText(self, label="目前 K 棒："), 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 6
-        )
-        self._forming_label = wx.StaticText(self, label="（尚無資料）")
-        forming_row.Add(self._forming_label, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 6)
-        sizer.Add(forming_row, 0)
-
-        self._range_label = wx.StaticText(self, label="（尚未收錄任何資料）")
-        sizer.Add(self._range_label, 0, wx.ALL, 6)
-
-        sizer.Add(wx.StaticLine(self), 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
-
-        nav_row = wx.BoxSizer(wx.HORIZONTAL)
-        nav_row.Add(
-            wx.StaticText(self, label="收盤 K 棒（本機自行收錄）　查詢日期 起："),
+        self._history_controls = wx.Panel(self)
+        self._history_controls.SetBackgroundColour(_BG)
+        range_row = wx.BoxSizer(wx.HORIZONTAL)
+        self._start = wx.adv.DatePickerCtrl(self._history_controls)
+        self._start.SetValue(_wx_date(date.today() - timedelta(days=7)))
+        self._end = wx.adv.DatePickerCtrl(self._history_controls)
+        self._end.SetValue(_wx_date(date.today()))
+        query = wx.Button(self._history_controls, label="查詢")
+        query.Bind(wx.EVT_BUTTON, lambda _e: self.refresh())
+        range_row.Add(
+            wx.StaticText(self._history_controls, label="日期"),
             0,
-            wx.ALL | wx.ALIGN_CENTER_VERTICAL,
-            6,
+            wx.ALIGN_CENTER_VERTICAL | wx.RIGHT,
+            8,
         )
-        default_end = wx.DateTime.Now()
-        default_start_date = date.today() - timedelta(days=_DEFAULT_QUERY_DAYS)
-        default_start = _date_to_wx_date(default_start_date)
-        self._start_picker = wx.adv.DatePickerCtrl(self)
-        self._start_picker.SetValue(default_start)
-        nav_row.Add(self._start_picker, 0, wx.ALL, 6)
-        nav_row.Add(wx.StaticText(self, label="迄："), 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 6)
-        self._end_picker = wx.adv.DatePickerCtrl(self)
-        self._end_picker.SetValue(default_end)
-        nav_row.Add(self._end_picker, 0, wx.ALL, 6)
-        self._query_button = wx.Button(self, label="查詢 (Query)")
-        self._query_button.Bind(wx.EVT_BUTTON, self._on_query)
-        nav_row.Add(self._query_button, 0, wx.ALL, 6)
-        sizer.Add(nav_row, 0)
+        range_row.Add(self._start, 0, wx.RIGHT, 8)
+        range_row.Add(
+            wx.StaticText(self._history_controls, label="至"),
+            0,
+            wx.ALIGN_CENTER_VERTICAL | wx.RIGHT,
+            8,
+        )
+        range_row.Add(self._end, 0, wx.RIGHT, 8)
+        range_row.Add(query, 0)
+        self._history_controls.SetSizer(range_row)
+        root.Add(self._history_controls, 0, wx.BOTTOM, 10)
 
-        self._bar_list = wx.ListBox(self, size=(-1, 220))
-        sizer.Add(self._bar_list, 0, wx.EXPAND | wx.ALL, 6)
+        self._status = wx.StaticText(self, label="正在連接 yfinance…")
+        self._status.SetForegroundColour(_TEXT)
+        root.Add(self._status, 0, wx.BOTTOM, 8)
+        root.Add(self._canvas, 1, wx.EXPAND)
+        self.SetSizer(root)
 
-        self.SetSizer(sizer)
-        self._refresh()
+        self._timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, lambda _e: self.refresh(), self._timer)
+        self.Bind(wx.EVT_WINDOW_DESTROY, self._on_destroy)
+        self._timer.Start(5000)
+        self._set_mode(True)
+
+    def _on_destroy(self, event: wx.WindowDestroyEvent) -> None:
+        if event.GetEventObject() is self:
+            self._timer.Stop()
+        event.Skip()
+
+    def _set_mode(self, live: bool) -> None:
+        self._live_mode = live
+        self._history_controls.Show(not live)
+        self._live_button.Enable(not live)
+        self._history_button.Enable(live)
+        self.Layout()
+        self.refresh()
 
     def refresh(self) -> None:
-        """Called by `ReadinessFrame` on every broker/instrument-selection/market-data
-        event — see module docstring for why the subscriptions live there."""
-        self._refresh()
-
-    def _on_query(self, _event: wx.CommandEvent) -> None:
-        start_date, end_date = self._selected_date_range()
-        log_info(
-            _logger,
-            "bar_history_browse_query_requested",
-            start_date=start_date.isoformat(),
-            end_date=end_date.isoformat(),
-        )
-        self._refresh()
-
-    def _selected_date_range(self) -> tuple[date, date]:
-        return (
-            _wx_date_to_date(self._start_picker.GetValue()),
-            _wx_date_to_date(self._end_picker.GetValue()),
-        )
-
-    def _refresh(self) -> None:
         current = self._services.instrument_selection.current
         if current is None:
-            self._status_label.SetLabel("（尚未選擇契約）")
-            self._forming_label.SetLabel("（尚無資料）")
-            self._range_label.SetLabel("（尚未收錄任何資料）")
-            self._bar_list.Set([])
+            self._status.SetLabel("請選擇要監看的商品")
+            self._canvas.set_bars([], "尚未選擇商品")
             return
-
         service = self._services.market_data_bar_service
         instrument, contract = current.instrument, current.contract
-
-        recorded_range = service.recorded_range(instrument, contract)
-        if recorded_range is None:
-            self._range_label.SetLabel(
-                "尚無收錄資料 — 本軟體僅在運行期間自行聚合行情，首次啟用時歷史為空"
+        if self._live_mode:
+            end = date.today()
+            records = service.query_history(
+                instrument, contract, start_date=end - timedelta(days=10), end_date=end
+            )
+            bars = [record.bar for record in records[-_LIVE_LIMIT:]]
+            forming = service.forming_bar(instrument, contract)
+            if forming is not None and (not bars or bars[-1].start != forming.start):
+                bars.append(forming)
+            update = service.last_update_at(instrument, contract)
+            updated = "等待首次更新" if update is None else f"更新 {update.value:%H:%M:%S}"
+            health = "連線異常" if service.is_polling_degraded() else "自動更新中"
+            self._status.SetLabel(
+                f"{instrument.display_name_zh} · 自動近月 {contract.code}  |  {health} · {updated}"
             )
         else:
-            since_str = recorded_range.earliest_at.value.strftime("%Y-%m-%d %H:%M")
-            latest_str = recorded_range.latest_at.value.strftime("%Y-%m-%d %H:%M")
-            note = "" if recorded_range.covers_full_window else "（尚未滿兩個月，屬正常狀態）"
-            self._range_label.SetLabel(f"自 {since_str} 起開始收錄，最新至 {latest_str}{note}")
-
-        is_stale = service.is_stale(instrument, contract)
-        has_gap = service.has_gap(instrument, contract)
-        last_update = service.last_update_at(instrument, contract)
-        last_update_str = "無" if last_update is None else last_update.value.strftime("%H:%M:%S")
-        status_parts = [
-            "STALE" if is_stale else "FRESH",
-            f"最後更新 {last_update_str}",
-        ]
-        if has_gap:
-            status_parts.append("GAP — 資料缺口，暫無法確認 K 棒完整性")
-        streak_color, streak_length = service.candle_streak(instrument, contract)
-        if streak_color is not None:
-            status_parts.append(f"連續 {_CANDLE_LABEL_ZH[streak_color]}K x{streak_length}")
-        self._status_label.SetLabel("｜".join(status_parts))
-
-        forming = service.forming_bar(instrument, contract)
-        self._forming_label.SetLabel("（尚無資料）" if forming is None else _format_bar(forming))
-
-        start_date, end_date = self._selected_date_range()
-        records = service.query_history(
-            instrument, contract, start_date=start_date, end_date=end_date
-        )
-        self._bar_list.Set([_format_record(r) for r in reversed(records[-_BAR_ROWS_SHOWN:])])
+            start, end = _date(self._start.GetValue()), _date(self._end.GetValue())
+            records = service.query_history(instrument, contract, start_date=start, end_date=end)
+            bars = [record.bar for record in records]
+            summary = f"{start} — {end} · {len(bars)} 根"
+            self._status.SetLabel(
+                f"{instrument.display_name_zh} · {contract.code}  |  {summary}"
+            )
+        self._canvas.set_bars(bars)

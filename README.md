@@ -107,7 +107,7 @@ which has neither the vendor files nor real credentials):
 
 `src/tfx_quant/desktop/settings.example.json` is the sample, non-secret configuration
 (`account_alias`, `environment`, `selected_instrument`, `contract_selection_mode`,
-`timezone_id`, `eod_flatten_local_time`, `max_net_lots`, `use_mock`). It is validated
+`timezone_id`, `eod_flatten_local_time`, `max_net_lots`). It is validated
 on load (`TradingSettings` + `validate_startup()`) — a misconfigured value (wrong time
 zone, wrong flatten time, lot cap above 2, undefined instrument, incomplete manual
 contract selection) fails immediately with a clear message instead of letting the

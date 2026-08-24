@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from decimal import Decimal
 
 import pytest
 from pydantic import SecretStr
@@ -15,17 +14,13 @@ from tfx_quant.application.events.events import (
     BrokerSessionInvalidated,
     BrokerSessionReady,
     Event,
-    MarketDataTickReceived,
 )
 from tfx_quant.application.ports.broker_session import LoginRequest
 from tfx_quant.application.settings.trading_settings import Environment
 from tfx_quant.domain.account import TradingAccount
 from tfx_quant.infrastructure.yuanta.backoff import BackoffPolicy
 from tfx_quant.infrastructure.yuanta.credentials import BrokerCredentials
-from tfx_quant.infrastructure.yuanta.errors import (
-    AccountSelectionError,
-    MarketDataSubscriptionError,
-)
+from tfx_quant.infrastructure.yuanta.errors import AccountSelectionError
 from tfx_quant.infrastructure.yuanta.session_orchestrator import BrokerSessionOrchestrator
 
 _ACCOUNT_1 = TradingAccount(branch_id="0000000001", account_no="2345678", sub_account="")
@@ -40,9 +35,8 @@ _ENTRIES_TWO = (
 
 
 class FakeAdapter:
-    def __init__(self, *, subscribe_ok: dict[str, bool] | None = None) -> None:
+    def __init__(self) -> None:
         self.calls: list[tuple[object, ...]] = []
-        self._subscribe_ok = subscribe_ok or {}
 
     def open_and_login(
         self, credentials: BrokerCredentials, *, generation: int, environment: Environment
@@ -57,14 +51,6 @@ class FakeAdapter:
 
     def query_positions(self, account: TradingAccount) -> None:
         self.calls.append(("query_positions", account))
-
-    def subscribe(self, symbol: str, account: TradingAccount) -> None:
-        self.calls.append(("subscribe", symbol, account))
-        if not self._subscribe_ok.get(symbol, True):
-            raise MarketDataSubscriptionError(f"商品 {symbol} 行情訂閱呼叫失敗")
-
-    def unsubscribe(self, symbol: str, account: TradingAccount) -> None:
-        self.calls.append(("unsubscribe", symbol, account))
 
 
 class _FakeCancellable:
@@ -115,18 +101,15 @@ def _login_request(*, environment: Environment = Environment.TEST) -> LoginReque
 
 def make_orchestrator(
     *,
-    market_data_symbols: tuple[str, ...] = (),
     account_no_hint: str | None = None,
     max_attempts: int = 3,
-    subscribe_ok: dict[str, bool] | None = None,
 ) -> tuple[BrokerSessionOrchestrator, FakeAdapter, RecordingEventPublisher, FakeScheduler]:
-    adapter = FakeAdapter(subscribe_ok=subscribe_ok)
+    adapter = FakeAdapter()
     events = RecordingEventPublisher()
     scheduler = FakeScheduler()
     orchestrator = BrokerSessionOrchestrator(
         adapter=adapter,
         event_coordinator=events,
-        market_data_symbols=market_data_symbols,
         account_no_hint=account_no_hint,
         login_timeout_seconds=5.0,
         backoff_factory=lambda: BackoffPolicy(
@@ -151,11 +134,6 @@ def _drive_to_ready(
     orchestrator.handle_position_query_result(generation)
 
 
-def _drive_login_and_report_query_only(orchestrator: BrokerSessionOrchestrator) -> None:
-    orchestrator.handle_login_result(1, "0001", "執行成功!", _ENTRIES_ONE)
-    orchestrator.handle_real_report_query_result(1)
-
-
 # -- Success ----------------------------------------------------------------------
 
 
@@ -177,18 +155,6 @@ def test_full_success_sequence_reaches_session_ready() -> None:
         ("query_real_report", _ACCOUNT_1),
         ("query_positions", _ACCOUNT_1),
     ]
-
-
-def test_success_with_market_data_symbols_subscribes_each_before_ready() -> None:
-    orchestrator, adapter, _events, _scheduler = make_orchestrator(
-        market_data_symbols=("TXFH6", "MXFH6")
-    )
-    orchestrator.start(_login_request())
-    _drive_to_ready(orchestrator)
-
-    assert orchestrator.capabilities.is_session_ready
-    assert ("subscribe", "TXFH6", _ACCOUNT_1) in adapter.calls
-    assert ("subscribe", "MXFH6", _ACCOUNT_1) in adapter.calls
 
 
 def test_multiple_accounts_require_explicit_selection() -> None:
@@ -379,25 +345,11 @@ def test_session_invalidated_after_ready_collapses_capabilities() -> None:
     assert len(events.of_type(BrokerSessionInvalidated)) == 1
 
 
-def test_subscription_failure_during_startup_is_a_login_failure() -> None:
-    orchestrator, _adapter, events, _scheduler = make_orchestrator(
-        market_data_symbols=("BAD",), subscribe_ok={"BAD": False}
-    )
-    orchestrator.start(_login_request())
-    _drive_login_and_report_query_only(orchestrator)
-
-    orchestrator.handle_position_query_result(1)
-
-    failures = events.of_type(BrokerLoginFailed)
-    assert len(failures) == 1
-    assert not orchestrator.capabilities.is_session_ready
-
-
 # -- stop() sequencing ------------------------------------------------------------
 
 
 def test_stop_sequencing_order_when_ready() -> None:
-    orchestrator, adapter, events, _scheduler = make_orchestrator(market_data_symbols=("TXFH6",))
+    orchestrator, adapter, events, _scheduler = make_orchestrator()
     orchestrator.start(_login_request())
     _drive_to_ready(orchestrator)
     adapter.calls.clear()
@@ -406,7 +358,6 @@ def test_stop_sequencing_order_when_ready() -> None:
 
     assert adapter.calls == [
         ("query_real_report", _ACCOUNT_1),
-        ("unsubscribe", "TXFH6", _ACCOUNT_1),
         ("disconnect",),
     ]
     assert len(events.of_type(BrokerLoggedOut)) == 1
@@ -436,7 +387,6 @@ def test_capabilities_independent_before_queries_complete() -> None:
     assert capabilities.order_reports is True
     assert capabilities.trading is False  # queries not done yet
     assert capabilities.queries is False
-    assert capabilities.market_data is False
     assert capabilities.is_session_ready is False
 
 
@@ -447,148 +397,3 @@ def test_capabilities_changed_event_published_on_change() -> None:
 
     changes = events.of_type(BrokerCapabilitiesChanged)
     assert len(changes) >= 1
-
-
-# -- Runtime subscribe/unsubscribe (Feature 03's instrument switch flow) --------------
-
-
-def test_subscribe_market_data_calls_adapter_once_ready() -> None:
-    orchestrator, adapter, _events, _scheduler = make_orchestrator()
-    orchestrator.start(_login_request())
-    _drive_to_ready(orchestrator)
-    adapter.calls.clear()
-
-    orchestrator.subscribe_market_data("MXFI6")
-
-    assert adapter.calls == [("subscribe", "MXFI6", _ACCOUNT_1)]
-
-
-def test_subscribe_market_data_before_ready_raises() -> None:
-    orchestrator, _adapter, _events, _scheduler = make_orchestrator()
-    with pytest.raises(MarketDataSubscriptionError):
-        orchestrator.subscribe_market_data("MXFI6")
-
-
-def test_subscribe_market_data_propagates_registration_failure() -> None:
-    orchestrator, _adapter, _events, _scheduler = make_orchestrator(subscribe_ok={"BAD": False})
-    orchestrator.start(_login_request())
-    _drive_to_ready(orchestrator)
-
-    with pytest.raises(MarketDataSubscriptionError):
-        orchestrator.subscribe_market_data("BAD")
-
-
-def test_subscribe_market_data_does_not_perturb_startup_capability_set() -> None:
-    orchestrator, _adapter, _events, _scheduler = make_orchestrator(market_data_symbols=("TXFH6",))
-    orchestrator.start(_login_request())
-    _drive_to_ready(orchestrator)
-    assert orchestrator.capabilities.market_data is True
-
-    orchestrator.subscribe_market_data("MXFI6")
-
-    assert orchestrator.capabilities.market_data is True
-
-
-def test_unsubscribe_market_data_calls_adapter_once_ready() -> None:
-    orchestrator, adapter, _events, _scheduler = make_orchestrator()
-    orchestrator.start(_login_request())
-    _drive_to_ready(orchestrator)
-    orchestrator.subscribe_market_data("MXFI6")
-    adapter.calls.clear()
-
-    orchestrator.unsubscribe_market_data("MXFI6")
-
-    assert adapter.calls == [("unsubscribe", "MXFI6", _ACCOUNT_1)]
-
-
-def test_unsubscribe_market_data_before_ready_is_a_safe_no_op() -> None:
-    orchestrator, adapter, _events, _scheduler = make_orchestrator()
-    orchestrator.unsubscribe_market_data("MXFI6")  # should not raise
-    assert adapter.calls == []
-
-
-def test_unsubscribe_market_data_included_in_stop_teardown() -> None:
-    orchestrator, adapter, _events, _scheduler = make_orchestrator()
-    orchestrator.start(_login_request())
-    _drive_to_ready(orchestrator)
-    orchestrator.subscribe_market_data("MXFI6")
-    adapter.calls.clear()
-
-    orchestrator.stop()
-
-    assert ("unsubscribe", "MXFI6", _ACCOUNT_1) in adapter.calls
-
-
-# -- Market data push (Feature 04's SubscribeStockTick wiring) -----------------------
-
-
-def _push(
-    orchestrator: BrokerSessionOrchestrator,
-    *,
-    generation: int = 1,
-    symbol: str = "TXFI6",
-    serial_no: object = 42,
-    deal_price: object = "17500",
-    deal_vol: object = "1",
-    hour: object = 9,
-    minute: object = 30,
-    second: object = 15,
-    millisecond: object = 0,
-) -> None:
-    orchestrator.handle_market_data_push(
-        generation, symbol, serial_no, deal_price, deal_vol, hour, minute, second, millisecond
-    )
-
-
-def test_market_data_push_publishes_tick_once_ready() -> None:
-    orchestrator, _adapter, events, _scheduler = make_orchestrator()
-    orchestrator.start(_login_request())
-    _drive_to_ready(orchestrator)
-
-    _push(orchestrator)
-
-    ticks = events.of_type(MarketDataTickReceived)
-    assert len(ticks) == 1
-    tick = ticks[0]
-    assert tick.vendor_symbol == "TXFI6"  # type: ignore[attr-defined]
-    assert tick.price == Decimal("17500")  # type: ignore[attr-defined]
-    assert tick.serial_no == 42  # type: ignore[attr-defined]
-
-
-def test_market_data_push_before_ready_is_ignored() -> None:
-    orchestrator, _adapter, events, _scheduler = make_orchestrator()
-    orchestrator.start(_login_request())
-
-    _push(orchestrator)
-
-    assert events.of_type(MarketDataTickReceived) == []
-
-
-def test_market_data_push_with_stale_generation_is_ignored() -> None:
-    orchestrator, _adapter, events, _scheduler = make_orchestrator()
-    orchestrator.start(_login_request())
-    _drive_to_ready(orchestrator)
-
-    _push(orchestrator, generation=0)  # a superseded attempt's stale generation
-
-    assert events.of_type(MarketDataTickReceived) == []
-
-
-def test_market_data_push_settlement_sentinel_publishes_nothing() -> None:
-    orchestrator, _adapter, events, _scheduler = make_orchestrator()
-    orchestrator.start(_login_request())
-    _drive_to_ready(orchestrator)
-
-    _push(orchestrator, serial_no=-1)
-
-    assert events.of_type(MarketDataTickReceived) == []
-
-
-def test_market_data_push_malformed_field_is_dropped_not_raised() -> None:
-    orchestrator, _adapter, events, _scheduler = make_orchestrator()
-    orchestrator.start(_login_request())
-    _drive_to_ready(orchestrator)
-
-    _push(orchestrator, deal_price="not-a-number")  # should not raise
-
-    assert events.of_type(MarketDataTickReceived) == []

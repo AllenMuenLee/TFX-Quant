@@ -50,7 +50,7 @@ def _record(start: Timestamp, end: Timestamp, **overrides: object) -> BarRecord:
         "period": BarPeriod.SIXTY_MINUTE,
         "trading_day": start.value.date(),
         "session": MarketSession.DAY,
-        "source": BarDataSource.AGGREGATED_FROM_YUANTA_REALTIME,
+        "source": BarDataSource.POLLED_FROM_YFINANCE,
         "is_gap_recovery": False,
         "created_at": start,
         "updated_at": start,

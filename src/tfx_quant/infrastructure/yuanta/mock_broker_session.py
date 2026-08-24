@@ -8,9 +8,10 @@ generation/phase machinery (that machinery has its own dedicated test suite agai
 test_broker_session_orchestrator.py`).
 
 `start()` defaults to an immediate, synchronous happy path (single mock futures
-account, all five capabilities become true) so the readiness screen and composition
+account, all four capabilities become true) so the readiness screen and composition
 tests work out of the box; call one of the `simulate_*` methods instead of `start()`
-to script a specific failure/edge-case scenario.
+to script a specific failure/edge-case scenario. No market-data capability lives here —
+market data comes from `yfinance`, entirely independent of this session.
 """
 
 from __future__ import annotations
@@ -54,9 +55,6 @@ class MockBrokerSession:
         self._capabilities = SessionCapabilities()
         self._accounts: tuple[TradingAccount, ...] = ()
         self._selected_account: TradingAccount | None = None
-        self.subscribed_symbols: set[str] = set()
-        """Exposed for test assertions — see `subscribe_market_data`/
-        `unsubscribe_market_data`."""
         self._scripted_start_failures = 0
         self._scripted_start_failure_reason = "模擬重連失敗"
         self._scripted_start_failure_retriable = True
@@ -100,24 +98,15 @@ class MockBrokerSession:
             )
         self._selected_account = account
         self._set_capabilities(
-            SessionCapabilities(
-                login=True, market_data=True, trading=True, order_reports=True, queries=True
-            )
+            SessionCapabilities(login=True, trading=True, order_reports=True, queries=True)
         )
         self._publish(BrokerSessionReady(at=Timestamp.now(), account=account))
 
     def cancel_start(self) -> None:
         self._set_capabilities(SessionCapabilities())
 
-    def subscribe_market_data(self, symbol: str) -> None:
-        self.subscribed_symbols.add(symbol)
-
-    def unsubscribe_market_data(self, symbol: str) -> None:
-        self.subscribed_symbols.discard(symbol)
-
     def stop(self) -> None:
         self._selected_account = None
-        self.subscribed_symbols = set()
         self._set_capabilities(SessionCapabilities())
         self._publish(BrokerLoggedOut(at=Timestamp.now(), reason=LogoutReason.USER_REQUESTED))
 

@@ -32,6 +32,7 @@ _PREFS_FILENAME = "login_prefs.json"
 class LoginPreferences:
     remembered_user_id: str | None = None
     remembered_account_no: str | None = None
+    certificate_imported: bool = False
 
 
 def _prefs_path() -> Path:
@@ -51,9 +52,13 @@ def load() -> LoginPreferences:
         return LoginPreferences()
     user_id = raw.get("remembered_user_id")
     account_no = raw.get("remembered_account_no")
+    certificate_imported = raw.get("certificate_imported", False)
     return LoginPreferences(
         remembered_user_id=user_id if isinstance(user_id, str) else None,
         remembered_account_no=account_no if isinstance(account_no, str) else None,
+        certificate_imported=certificate_imported
+        if isinstance(certificate_imported, bool)
+        else False,
     )
 
 
@@ -63,6 +68,7 @@ def _save(preferences: LoginPreferences) -> None:
     payload = {
         "remembered_user_id": preferences.remembered_user_id,
         "remembered_account_no": preferences.remembered_account_no,
+        "certificate_imported": preferences.certificate_imported,
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
 
@@ -92,3 +98,9 @@ def save_remembered_account_no(account_no: str | None) -> None:
         field="remembered_account_no",
         value_masked=mask_account(account_no) if account_no is not None else None,
     )
+
+
+def save_certificate_imported(imported: bool = True) -> None:
+    """Remember that this user successfully completed the one-time PFX import."""
+    _save(replace(load(), certificate_imported=imported))
+    log_info(_logger, "login_preferences_saved", field="certificate_imported", value=imported)

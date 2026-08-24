@@ -23,6 +23,7 @@ import time
 from collections.abc import Sequence
 from datetime import date, datetime
 from decimal import Decimal
+from uuid import uuid4
 
 from tfx_quant.application.ports.bar_record_repository import (
     BarRecordNotFoundError,
@@ -66,6 +67,9 @@ CREATE TABLE IF NOT EXISTS bar_records (
     revision INTEGER NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
+    source_first_sequence INTEGER,
+    source_last_sequence INTEGER,
+    is_complete INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (instrument, contract_year, contract_month, period, start_at)
 );
 CREATE INDEX IF NOT EXISTS idx_bar_records_trading_day ON bar_records (trading_day);
@@ -118,7 +122,7 @@ CREATE INDEX IF NOT EXISTS idx_bar_backfill_conflicts_trading_day
 _SELECT_COLUMNS = (
     "instrument, contract_year, contract_month, period, start_at, end_at, trading_day, "
     "session, open, high, low, close, volume, source, is_gap_recovery, revision, "
-    "created_at, updated_at"
+    "created_at, updated_at, source_first_sequence, source_last_sequence, is_complete"
 )
 
 
@@ -134,7 +138,22 @@ class SqliteBarRecordRepository:
         self._lock = threading.Lock()
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            self._migrate_source_metadata()
             self._conn.commit()
+
+    def _migrate_source_metadata(self) -> None:
+        """Add Feature 04 provenance columns to databases created by older builds."""
+        columns = {
+            str(row[1]) for row in self._conn.execute("PRAGMA table_info(bar_records)").fetchall()
+        }
+        additions = {
+            "source_first_sequence": "INTEGER",
+            "source_last_sequence": "INTEGER",
+            "is_complete": "INTEGER NOT NULL DEFAULT 1",
+        }
+        for name, declaration in additions.items():
+            if name not in columns:
+                self._conn.execute(f"ALTER TABLE bar_records ADD COLUMN {name} {declaration}")
 
     # -- Writes -----------------------------------------------------------------
 
@@ -257,8 +276,9 @@ class SqliteBarRecordRepository:
             INSERT INTO bar_records (
                 instrument, contract_year, contract_month, period, start_at, end_at,
                 trading_day, session, open, high, low, close, volume, source,
-                is_gap_recovery, revision, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                is_gap_recovery, revision, created_at, updated_at,
+                source_first_sequence, source_last_sequence, is_complete
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             _record_to_params(record),
         )
@@ -269,7 +289,8 @@ class SqliteBarRecordRepository:
             UPDATE bar_records SET
                 end_at = ?, trading_day = ?, session = ?, open = ?, high = ?, low = ?,
                 close = ?, volume = ?, source = ?, is_gap_recovery = ?, revision = ?,
-                updated_at = ?
+                updated_at = ?, source_first_sequence = ?, source_last_sequence = ?,
+                is_complete = ?
             WHERE instrument = ? AND contract_year = ? AND contract_month = ?
                 AND period = ? AND start_at = ?
             """,
@@ -286,6 +307,9 @@ class SqliteBarRecordRepository:
                 int(record.is_gap_recovery),
                 revision,
                 record.updated_at.value.isoformat(),
+                record.source_first_sequence,
+                record.source_last_sequence,
+                int(record.is_complete),
                 record.bar.instrument.value,
                 record.bar.contract.year,
                 record.bar.contract.month,
@@ -390,8 +414,14 @@ class SqliteBarRecordRepository:
         self, cutoff_trading_day: date, *, ran_at: Timestamp
     ) -> RetentionCleanupSummary:
         start = time.monotonic()
+        audit_id = uuid4().hex
         try:
             with self._lock:
+                candidate_row = self._conn.execute(
+                    "SELECT COUNT(*) FROM bar_records WHERE trading_day < ?",
+                    (cutoff_trading_day.isoformat(),),
+                ).fetchone()
+                candidate_count = 0 if candidate_row is None else int(candidate_row[0])
                 cursor = self._conn.execute(
                     "DELETE FROM bar_records WHERE trading_day < ?",
                     (cutoff_trading_day.isoformat(),),
@@ -411,12 +441,18 @@ class SqliteBarRecordRepository:
             _logger,
             "bar_record_retention_delete_completed",
             cutoff_trading_day=cutoff_trading_day.isoformat(),
+            candidate_count=candidate_count,
             deleted_count=deleted_count,
+            audit_id=audit_id,
             duration_ms=(time.monotonic() - start) * 1000,
             transaction_committed=True,
         )
         return RetentionCleanupSummary(
-            cutoff_trading_day=cutoff_trading_day, deleted_count=deleted_count, ran_at=ran_at
+            cutoff_trading_day=cutoff_trading_day,
+            candidate_count=candidate_count,
+            deleted_count=deleted_count,
+            ran_at=ran_at,
+            audit_id=audit_id,
         )
 
     def record_conflict(self, audit: BarConflictAudit) -> None:
@@ -523,6 +559,9 @@ def _record_to_params(record: BarRecord) -> tuple[object, ...]:
         record.revision,
         record.created_at.value.isoformat(),
         record.updated_at.value.isoformat(),
+        record.source_first_sequence,
+        record.source_last_sequence,
+        int(record.is_complete),
     )
 
 
@@ -546,6 +585,9 @@ def _row_to_record(row: tuple[object, ...]) -> BarRecord:
         revision,
         created_at,
         updated_at,
+        source_first_sequence,
+        source_last_sequence,
+        is_complete,
     ) = row
     assert isinstance(instrument_raw, str)
     assert isinstance(contract_year, int)
@@ -582,6 +624,13 @@ def _row_to_record(row: tuple[object, ...]) -> BarRecord:
         created_at=_dt(created_at),
         updated_at=_dt(updated_at),
         revision=revision,
+        source_first_sequence=(
+            None if source_first_sequence is None else int(str(source_first_sequence))
+        ),
+        source_last_sequence=(
+            None if source_last_sequence is None else int(str(source_last_sequence))
+        ),
+        is_complete=bool(is_complete),
     )
 
 

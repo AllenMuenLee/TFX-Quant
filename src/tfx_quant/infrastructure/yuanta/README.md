@@ -87,23 +87,17 @@ code space** — only TXF's `"FITX"` is confirmed (from the 國內期貨下單 d
 worked example); other instruments need confirmation against the vendor's
 `FunctionList.xls` before Feature 06 can place orders for them.
 
-### Market data (行情)
+### Market data — not part of this API
 
-- `SubscribeStockTick(LoginAcno, List[StockTick], lng) -> bool` /
-  `UnSubscribeStockTick(...)` — `StockTick` just needs `MarketType` (hardcoded to
-  `TAIFEX` in `spark_client.py` — this codebase only trades domestic futures) and
-  `StockCode` (the quote symbol above). Push arrives via `OnResponse` with
-  `intMark == 2`, `strIndex == 'SubscribeStockTick'`, one `StockTickResult` per tick:
-  `SerialNo` (**a real per-symbol trade sequence number, starting at 1; `-1` = 商品清
-  盤/settlement** — resolves the old ADR 0006 gap that had to fake dedup via cumulative
-  volume), `Time` (structured `TYuantaTime`: `bytHour`/`bytMin`/`bytSec`/`ushtMSec`,
-  not a raw digit string), `DealPrice`, `DealVol`. See `market_data_parsing.py`'s
-  `parse_stock_tick_push`.
-- **`GetKLine` (K線查詢) is confirmed TWSE/TWOTC-listed-securities-only** — its own docs
-  attach "註1：僅提供台股上市櫃商品查詢" directly to the `MarketType` parameter. Futures
-  historical/intraday replay after reconnect stays unsupported — the existing
-  gap-on-reconnect policy (ADR 0006 decision 7) is unchanged, and this is now a
-  *confirmed* exclusion, not an assumed one.
+This codebase has no market-data path through the SPARK API at all: no
+`SubscribeStockTick`, no `GetKLine`, no tick/quote pushes of any kind. Every OHLCV bar —
+both the near-real-time bar builder and the two-month history backfill — comes from the
+third-party `yfinance` package instead (see `infrastructure/market_data/
+yfinance_history_adapter.py`, `application/market_data/bar_service.py`, and
+`implementation prompt/00-spark-to-futures-api-migration/implementation-prompt.md`). An
+earlier revision of this codebase did wrap `SubscribeStockTick`/`GetKLine` here; both were
+deleted once the implementation prompt was rewritten to forbid any Yuanta/SPARK
+market-data path, not left in place unused.
 
 ### Reports (回報)
 

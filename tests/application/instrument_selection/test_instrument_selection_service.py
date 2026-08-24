@@ -31,7 +31,6 @@ from tfx_quant.infrastructure.bar_signal_state import InMemoryBarSignalStateStor
 from tfx_quant.infrastructure.yuanta.instrument_master_repository import (
     JsonInstrumentMasterRepository,
 )
-from tfx_quant.infrastructure.yuanta.mock_quote_gateway import MockQuoteGateway
 from tfx_quant.infrastructure.yuanta.mock_trade_gateway import MockTradeGateway
 
 _ACCOUNT = TradingAccount(branch_id="F00", account_no="9808900")
@@ -94,9 +93,7 @@ def _build(
     positions: tuple[Position, ...] = (),
     open_orders: tuple[Order, ...] = (),
     event_publisher: RecordingEventPublisher | EventCoordinator | None = None,
-) -> tuple[
-    InstrumentSelectionService, MockTradeGateway, MockQuoteGateway, InMemoryBarSignalStateStore
-]:
+) -> tuple[InstrumentSelectionService, MockTradeGateway, InMemoryBarSignalStateStore]:
     machine = StrategyStateMachine()
     if state is StrategyState.PAUSED_SAFE:
         machine.transition(StrategyState.STARTING)
@@ -106,18 +103,16 @@ def _build(
         raise AssertionError(f"unsupported test state {state}")
 
     trade_gateway = MockTradeGateway(positions=positions, open_orders=open_orders)
-    quote_gateway = MockQuoteGateway()
     bar_signal_state_store = InMemoryBarSignalStateStore()
     service = InstrumentSelectionService(
         strategy_state_machine=machine,
         trade_gateway=trade_gateway,
-        quote_gateway=quote_gateway,
         instrument_master=_master_repo(tmp_path),
         bar_signal_state_store=bar_signal_state_store,
         clock=FakeClock(),
         event_publisher=event_publisher,
     )
-    return service, trade_gateway, quote_gateway, bar_signal_state_store
+    return service, trade_gateway, bar_signal_state_store
 
 
 def _position(instrument: Instrument, contract: ContractMonth, lots: int) -> Position:
@@ -168,7 +163,6 @@ def test_resolve_manual_raises_for_non_tradable_entry(tmp_path: Path) -> None:
     service = InstrumentSelectionService(
         strategy_state_machine=StrategyStateMachine(),
         trade_gateway=MockTradeGateway(),
-        quote_gateway=MockQuoteGateway(),
         instrument_master=repo,
         bar_signal_state_store=InMemoryBarSignalStateStore(),
         clock=FakeClock(),
@@ -191,7 +185,6 @@ def test_resolve_near_month_raises_when_everything_expired(tmp_path: Path) -> No
     service = InstrumentSelectionService(
         strategy_state_machine=StrategyStateMachine(),
         trade_gateway=MockTradeGateway(),
-        quote_gateway=MockQuoteGateway(),
         instrument_master=repo,
         bar_signal_state_store=InMemoryBarSignalStateStore(),
         clock=FakeClock(),
@@ -215,7 +208,6 @@ def test_switch_blocked_while_running(tmp_path: Path) -> None:
     service = InstrumentSelectionService(
         strategy_state_machine=machine,
         trade_gateway=MockTradeGateway(),
-        quote_gateway=MockQuoteGateway(),
         instrument_master=_master_repo(tmp_path),
         bar_signal_state_store=InMemoryBarSignalStateStore(),
         clock=FakeClock(),
@@ -252,28 +244,28 @@ def test_switch_blocked_with_open_orders(tmp_path: Path) -> None:
     assert "委託" in reason
 
 
-def test_switch_to_subscribes_and_clears_bar_state(tmp_path: Path) -> None:
-    service, _trade_gateway, quote_gateway, bar_store = _build(tmp_path)
+def test_switch_to_clears_bar_state(tmp_path: Path) -> None:
+    service, _trade_gateway, bar_store = _build(tmp_path)
     resolved = service.resolve_manual(Instrument.MXF, _MXF_CONTRACT)
 
     service.switch_to(resolved)
 
     assert service.current == resolved
-    assert quote_gateway.subscriptions[-1].instrument == Instrument.MXF
-    assert quote_gateway.subscriptions[-1].contract == _MXF_CONTRACT
     assert bar_store.clear_calls == [(Instrument.MXF, _MXF_CONTRACT)]
 
 
-def test_switch_to_unsubscribes_previous_selection(tmp_path: Path) -> None:
-    service, _trade_gateway, quote_gateway, _bar_store = _build(tmp_path)
+def test_switch_to_a_second_contract_clears_bar_state_again(tmp_path: Path) -> None:
+    service, _trade_gateway, bar_store = _build(tmp_path)
     first = service.resolve_manual(Instrument.MXF, _MXF_CONTRACT)
     service.switch_to(first)
 
     second = service.resolve_manual(Instrument.MXF, _MXF_DEC_CONTRACT)
     service.switch_to(second)
 
-    assert quote_gateway.unsubscriptions[0].instrument == Instrument.MXF
-    assert quote_gateway.unsubscriptions[0].contract == _MXF_CONTRACT
+    assert bar_store.clear_calls == [
+        (Instrument.MXF, _MXF_CONTRACT),
+        (Instrument.MXF, _MXF_DEC_CONTRACT),
+    ]
     assert service.current == second
 
 
@@ -286,7 +278,7 @@ def test_switch_to_raises_when_blocked(tmp_path: Path) -> None:
 
 
 def test_switch_to_does_not_mutate_current_when_blocked(tmp_path: Path) -> None:
-    service, trade_gateway, quote_gateway, _bar_store = _build(tmp_path)
+    service, trade_gateway, _bar_store = _build(tmp_path)
     first = service.resolve_manual(Instrument.MXF, _MXF_CONTRACT)
     service.switch_to(first)
 

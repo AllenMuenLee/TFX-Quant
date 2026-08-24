@@ -113,63 +113,6 @@ def test_early_close_truncates_final_bar() -> None:
     ]
 
 
-def test_boundary_containing_finds_day_session_bar() -> None:
-    calendar = TradingCalendar()
-    entry = _entry()
-    at = _ts(_WEDNESDAY, 9, 10)
-    boundary = calendar.boundary_containing(at, entry)
-    assert boundary is not None
-    open_ts, close_ts = boundary
-    assert open_ts.value.time() == time(8, 45)
-    assert close_ts.value.time() == time(9, 45)
-
-
-def test_boundary_containing_none_outside_any_session() -> None:
-    calendar = TradingCalendar()
-    entry = _entry()
-    at = _ts(_WEDNESDAY, 7, 0)  # between night end (05:00) and day start (08:45)
-    assert calendar.boundary_containing(at, entry) is None
-
-
-def test_resolve_tick_timestamp_day_session() -> None:
-    calendar = TradingCalendar()
-    entry = _entry()
-    received_at = _ts(_WEDNESDAY, 9, 30)
-    resolved = calendar.resolve_tick_timestamp(time(9, 29, 55), received_at, entry)
-    assert resolved is not None
-    assert resolved.value.date() == _WEDNESDAY
-    assert resolved.value.time() == time(9, 29, 55)
-
-
-def test_resolve_tick_timestamp_night_session_before_midnight() -> None:
-    calendar = TradingCalendar()
-    entry = _entry()
-    received_at = _ts(_WEDNESDAY, 20, 0)
-    resolved = calendar.resolve_tick_timestamp(time(20, 0), received_at, entry)
-    assert resolved is not None
-    assert resolved.value.date() == _WEDNESDAY
-
-
-def test_resolve_tick_timestamp_night_session_after_midnight_belongs_to_next_calendar_date() -> (
-    None
-):
-    calendar = TradingCalendar()
-    entry = _entry()
-    next_day = date(2026, 9, 17)
-    received_at = _ts(next_day, 2, 5)
-    resolved = calendar.resolve_tick_timestamp(time(2, 0), received_at, entry)
-    assert resolved is not None
-    assert resolved.value.date() == next_day
-    assert resolved.value.time() == time(2, 0)
-
-
-def test_resolve_tick_timestamp_none_outside_any_session() -> None:
-    calendar = TradingCalendar()
-    entry = _entry()
-    received_at = _ts(_WEDNESDAY, 7, 0)
-    assert calendar.resolve_tick_timestamp(time(7, 0), received_at, entry) is None
-
-
 def test_session_context_for_day_session_boundary() -> None:
     calendar = TradingCalendar()
     entry = _entry()

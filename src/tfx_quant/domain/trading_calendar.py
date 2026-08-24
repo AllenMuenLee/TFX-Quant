@@ -7,11 +7,11 @@ happens to be a scheduled trading make-up day — TAIFEX makes both kinds of exc
 `application.ports.trading_calendar.TradingCalendarRepository` and
 `infrastructure.market_data.trading_calendar_repository`), never inferred or guessed
 here. Session *times* (day/night start/end) are **not** owned by this module — they
-already live per-contract in `InstrumentMasterEntry` (Feature 03); this module only
-turns (calendar date + those times) into concrete 60-minute bar boundaries and resolves
-a bare exchange time-of-day to the correct trading date, honoring "交易日不可直接等同
-曆日" (a trading day is not the same thing as a calendar day) for the night session's
-midnight crossing.
+already live per-contract in `InstrumentMasterEntry` (Feature 03); this module only turns
+(calendar date + those times) into concrete 60-minute bar boundaries and resolves a
+`yfinance` bar's open-label timestamp to the correct trading day/session, honoring "交易
+日不可直接等同曆日" (a trading day is not the same thing as a calendar day) for the night
+session's midnight crossing.
 
 Early-close overrides apply only to the day session (a session that does not cross
 midnight) — TAIFEX's historical early closes shorten the day session; there is no
@@ -30,9 +30,9 @@ from tfx_quant.domain.instrument_master import InstrumentMasterEntry
 from tfx_quant.domain.timestamp import TAIPEI_TZ, Timestamp
 
 _TRADING_DAY_SEARCH_OFFSETS = (-1, 0, 1)
-"""When resolving a bare time-of-day against a wall-clock receive time, only the
-previous/current/next calendar day are ever plausible candidates — ticks are never
-delayed by more than one day."""
+"""A bar's open-label calendar date can differ from its session's trading day by at most
+one day either way (a night session's tail crossing into the next calendar date) — only
+the previous/current/next calendar day are ever plausible candidates."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,51 +82,6 @@ class TradingCalendar:
             boundaries.append((Timestamp(cursor), Timestamp(close)))
             cursor = close
         return boundaries
-
-    def boundary_containing(
-        self, at: Timestamp, entry: InstrumentMasterEntry
-    ) -> tuple[Timestamp, Timestamp] | None:
-        """The single (open-label, close) boundary whose [open, close) window contains
-        `at`, searching the trading days around `at`'s calendar date. `None` means `at`
-        falls outside every session (a holiday, a weekend, or a genuine no-trade gap
-        between sessions)."""
-        d = at.value.date()
-        for offset in _TRADING_DAY_SEARCH_OFFSETS:
-            trading_day = d + timedelta(days=offset)
-            if not self.is_trading_day(trading_day):
-                continue
-            for start, end in _sessions_of(entry):
-                for open_ts, close_ts in self.bar_boundaries(trading_day, start, end):
-                    if open_ts.value <= at.value < close_ts.value:
-                        return open_ts, close_ts
-        return None
-
-    def resolve_tick_timestamp(
-        self, exchange_time: time, received_at: Timestamp, entry: InstrumentMasterEntry
-    ) -> Timestamp | None:
-        """Given a bare exchange time-of-day (`MatchTime`, no date) and the wall-clock
-        time the push was received, determine which trading date it belongs to — today's
-        day session, today's night session, or the tail of *yesterday's* night session
-        that spilled past midnight — and return the correctly-dated `Timestamp`. Returns
-        `None` when `exchange_time` matches no active session near `received_at` (a
-        malformed/rejected tick)."""
-        received_date = received_at.value.date()
-        best: tuple[float, datetime] | None = None
-        for offset in _TRADING_DAY_SEARCH_OFFSETS:
-            trading_day = received_date + timedelta(days=offset)
-            if not self.is_trading_day(trading_day):
-                continue
-            for start, end in _sessions_of(entry):
-                start_dt, end_dt = self._effective_session_window(trading_day, start, end)
-                for candidate_date in {start_dt.date(), end_dt.date()}:
-                    candidate = datetime.combine(candidate_date, exchange_time, tzinfo=TAIPEI_TZ)
-                    if start_dt <= candidate < end_dt:
-                        delta = abs((candidate - received_at.value).total_seconds())
-                        if best is None or delta < best[0]:
-                            best = (delta, candidate)
-        if best is None:
-            return None
-        return Timestamp(best[1])
 
     def boundary_for_open(
         self, open_ts: Timestamp, entry: InstrumentMasterEntry

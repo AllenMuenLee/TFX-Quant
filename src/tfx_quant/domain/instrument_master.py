@@ -75,9 +75,11 @@ class InstrumentMasterEntry:
     instrument: Instrument
     contract: ContractMonth
     vendor_symbol: str
-    """The SPARK API real-time quote symbol for this exact contract (e.g. "TXFH6"),
-    passed verbatim to `SubscribeStockTick`/`UnSubscribeStockTick`. Stored as a literal
-    field rather than always recomputed inline, but every value in
+    """The SPARK API real-time quote symbol for this exact contract (e.g. "TXFH6") —
+    documented purely as a historical/reference identifier now, since market data comes
+    entirely from `yfinance` and nothing in this codebase subscribes with it (see
+    `implementation prompt/00-spark-to-futures-api-migration/implementation-prompt.md`).
+    Stored as a literal field rather than always recomputed inline, but every value in
     `instrument_master.example.json` is `futures_quote_symbol()`'s actual output — see
     this module's docstring."""
     broker_product_code: str

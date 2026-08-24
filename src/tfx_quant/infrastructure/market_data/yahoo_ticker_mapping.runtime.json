@@ -1,0 +1,11 @@
+{
+  "_comment": "Runtime yfinance-only market feed. Yahoo Finance does not expose TAIFEX monthly futures through yfinance; ^TWII is the available TAIEX underlying proxy and is therefore used consistently for both TXF and MXF chart monitoring.",
+  "mappings": [
+    {"instrument": "TXF", "contract_year": 2026, "contract_month": 9, "yahoo_ticker": "^TWII"},
+    {"instrument": "TXF", "contract_year": 2026, "contract_month": 12, "yahoo_ticker": "^TWII"},
+    {"instrument": "TXF", "contract_year": 2027, "contract_month": 3, "yahoo_ticker": "^TWII"},
+    {"instrument": "MXF", "contract_year": 2026, "contract_month": 9, "yahoo_ticker": "^TWII"},
+    {"instrument": "MXF", "contract_year": 2026, "contract_month": 12, "yahoo_ticker": "^TWII"},
+    {"instrument": "MXF", "contract_year": 2027, "contract_month": 3, "yahoo_ticker": "^TWII"}
+  ]
+}

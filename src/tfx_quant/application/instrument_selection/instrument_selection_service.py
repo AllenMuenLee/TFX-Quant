@@ -2,9 +2,12 @@
 
 Owns exactly the sequence the implementation prompt spells out: 切換流程必須先暫停 (the
 strategy must already be paused/stopped — this service never drives the state machine
-itself, see below), 取消舊行情訂閱, 重新查詢帳戶狀態, 訂閱新契約並清空 K 棒／訊號狀態;
-成功後仍需使用者重新啟動。And the hard precondition: 策略執行中或存在持倉、活動委託、
-未知委託時禁止切換商品／契約。
+itself, see below), 重新查詢帳戶狀態, 清空 K 棒／訊號狀態; 成功後仍需使用者重新啟動。
+And the hard precondition: 策略執行中或存在持倉、活動委託、未知委託時禁止切換商品／契約。
+There is no market-data subscribe/unsubscribe step here — market data comes from
+`yfinance`, entirely independent of any per-contract vendor subscription; clearing the
+bar/signal state (`bar_signal_state_store.clear()`) is what points `MarketDataBarService`
+at the newly selected contract's Yahoo ticker mapping.
 
 **Why this service never transitions `StrategyStateMachine` itself**: the "must first
 pause" requirement and the "forbid switching while executing" requirement would
@@ -17,12 +20,12 @@ an action the switch performs — switching never itself moves the strategy in o
 already guarantees "成功後仍需使用者重新啟動" without this service needing to force any
 particular transition.
 
-**Why `switch_to()` calls `check_switch_allowed()` twice**: once before touching
-anything, and again after cancelling the old quote subscription but before subscribing
-the new one — this second call is the literal "重新查詢帳戶狀態" step, guarding against
-a position/order appearing in the window between the first check and the switch
-actually happening. If the real `TradeGatewayPort` can't yet answer that query (Feature
-02's `BrokerSessionTradeGatewayView.query_open_orders/positions` still raise
+**Why `switch_to()` re-validates via `_evaluate_switch_allowed()` immediately before
+clearing bar/signal state**: this is the literal "重新查詢帳戶狀態" step — a fresh
+position/order query right before the switch actually takes effect, not just the
+earlier `check_switch_allowed()` a caller may have polled moments before while the
+operator was still deciding. If the real `TradeGatewayPort` can't yet answer that query
+(Feature 02's `BrokerSessionTradeGatewayView.query_open_orders/positions` still raise
 `NotImplementedError` — structured parsing is a documented Feature 02/08 gap), that
 propagates as a blocked switch rather than a silent unsafe assumption.
 """
@@ -30,7 +33,7 @@ propagates as a blocked switch rather than a silent unsafe assumption.
 from __future__ import annotations
 
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -44,7 +47,7 @@ from tfx_quant.application.instrument_selection.validation import validate_can_o
 from tfx_quant.application.ports.bar_signal_state import BarSignalStateStore
 from tfx_quant.application.ports.clock import Clock
 from tfx_quant.application.ports.instrument_master import InstrumentMasterRepository
-from tfx_quant.application.ports.yuanta_gateways import QuoteGatewayPort, TradeGatewayPort
+from tfx_quant.application.ports.yuanta_gateways import TradeGatewayPort
 from tfx_quant.domain.contract import ContractMonth
 from tfx_quant.domain.instrument import Instrument
 from tfx_quant.domain.order import Order
@@ -110,19 +113,19 @@ class InstrumentSelectionService:
         *,
         strategy_state_machine: StrategyStateMachine,
         trade_gateway: TradeGatewayPort,
-        quote_gateway: QuoteGatewayPort,
         instrument_master: InstrumentMasterRepository,
         bar_signal_state_store: BarSignalStateStore,
         clock: Clock,
         event_publisher: EventPublisher | None = None,
+        broker_session_ready: Callable[[], bool] | None = None,
     ) -> None:
         self._strategy_state_machine = strategy_state_machine
         self._trade_gateway = trade_gateway
-        self._quote_gateway = quote_gateway
         self._instrument_master = instrument_master
         self._bar_signal_state_store = bar_signal_state_store
         self._clock = clock
         self._event_publisher = event_publisher
+        self._broker_session_ready = broker_session_ready or (lambda: True)
         self._current: ResolvedSelection | None = None
 
     @property
@@ -206,9 +209,12 @@ class InstrumentSelectionService:
 
     def _evaluate_switch_allowed(self) -> _SwitchAllowedResult:
         if self._strategy_state_machine.state not in _SWITCHABLE_STATES:
-            return _SwitchAllowedResult(
-                reason="策略執行中，禁止切換商品／契約，請先停止或暫停策略"
-            )
+            return _SwitchAllowedResult(reason="策略執行中，禁止切換商品／契約，請先停止或暫停策略")
+        # Watching Yahoo market data is deliberately available before broker login.
+        # With no active broker session there cannot be broker positions/orders to
+        # protect, and yfinance selection must not depend on the OCX being connected.
+        if not self._broker_session_ready():
+            return _SwitchAllowedResult(reason=None)
         try:
             positions = self._trade_gateway.query_positions()
             open_orders = self._trade_gateway.query_open_orders()
@@ -250,8 +256,8 @@ class InstrumentSelectionService:
         """Applies an already-`resolve_*()`'d, operator-confirmed selection.
 
         Raises `SwitchBlockedError` (and leaves everything untouched) if switching
-        isn't currently allowed — either before starting, or after cancelling the old
-        subscription (the "重新查詢帳戶狀態" re-check)."""
+        isn't currently allowed — a fresh "重新查詢帳戶狀態" check immediately before
+        the switch actually takes effect."""
         workflow_id = new_correlation_id()
         with correlation_scope(workflow_id=workflow_id):
             self._switch_to(resolved)
@@ -270,55 +276,11 @@ class InstrumentSelectionService:
         log_info(
             _logger,
             "instrument_switch_step_completed",
-            step="precondition_check",
-            passed=evaluation.reason is None,
-            duration_ms=(time.monotonic() - step_start) * 1000,
-        )
-        if evaluation.reason is not None:
-            log_warning(
-                _logger,
-                "instrument_switch_rejected",
-                step="precondition_check",
-                reason=evaluation.reason,
-                positions=_position_summary(evaluation.positions),
-                open_orders=_order_summary(evaluation.open_orders),
-            )
-            raise SwitchBlockedError(evaluation.reason)
-
-        previous = self._current
-        if previous is not None:
-            step_start = time.monotonic()
-            self._quote_gateway.unsubscribe(previous.instrument, previous.contract)
-            log_info(
-                _logger,
-                "instrument_switch_step_completed",
-                step="cancel_old_subscription",
-                instrument=previous.instrument.value,
-                contract=previous.contract.code,
-                duration_ms=(time.monotonic() - step_start) * 1000,
-            )
-
-        step_start = time.monotonic()
-        evaluation = self._evaluate_switch_allowed()
-        log_info(
-            _logger,
-            "instrument_switch_step_completed",
             step="requery_account_status",
             passed=evaluation.reason is None,
             duration_ms=(time.monotonic() - step_start) * 1000,
         )
         if evaluation.reason is not None:
-            if previous is not None:
-                # Best-effort: restore the old subscription rather than leaving the
-                # account with no market data at all after an aborted switch.
-                self._quote_gateway.subscribe(previous.instrument, previous.contract)
-                log_info(
-                    _logger,
-                    "instrument_switch_step_completed",
-                    step="restore_old_subscription",
-                    instrument=previous.instrument.value,
-                    contract=previous.contract.code,
-                )
             log_warning(
                 _logger,
                 "instrument_switch_rejected",
@@ -327,18 +289,7 @@ class InstrumentSelectionService:
                 positions=_position_summary(evaluation.positions),
                 open_orders=_order_summary(evaluation.open_orders),
             )
-            raise SwitchBlockedError(f"重新查詢帳戶狀態後中止切換：{evaluation.reason}")
-
-        step_start = time.monotonic()
-        self._quote_gateway.subscribe(resolved.instrument, resolved.contract)
-        log_info(
-            _logger,
-            "instrument_switch_step_completed",
-            step="subscribe_new_contract",
-            instrument=resolved.instrument.value,
-            contract=resolved.contract.code,
-            duration_ms=(time.monotonic() - step_start) * 1000,
-        )
+            raise SwitchBlockedError(evaluation.reason)
 
         step_start = time.monotonic()
         self._bar_signal_state_store.clear(resolved.instrument, resolved.contract)

@@ -45,7 +45,6 @@ from tfx_quant.application.events.events import (
     Event,
     FillReceived,
     MarketDataFreshnessChanged,
-    MarketDataTickReceived,
     OrderReportReceived,
     SafePauseTriggered,
 )
@@ -175,7 +174,6 @@ class ConnectivityMonitor:
         event_bus.subscribe(BrokerLoginFailed, self._on_login_failed)
         event_bus.subscribe(BrokerLoginTimedOut, self._on_login_timed_out)
         event_bus.subscribe(MarketDataFreshnessChanged, self._on_market_data_freshness_changed)
-        event_bus.subscribe(MarketDataTickReceived, self._on_market_data_tick)
         event_bus.subscribe(OrderReportReceived, self._on_order_report)
         event_bus.subscribe(FillReceived, self._on_fill)
 
@@ -282,7 +280,7 @@ class ConnectivityMonitor:
             )
 
     def cancel_reconnect(self) -> None:
-        """"允許使用者停止" — the operator-facing cancel action."""
+        """ "允許使用者停止" — the operator-facing cancel action."""
         with self._lock:
             self._broker_session.cancel_start()
             self._cancel_reconnect_locked(reason="user_requested")
@@ -474,12 +472,6 @@ class ConnectivityMonitor:
                     detail=f"{event.instrument.value} {event.contract.code} market data went stale",
                     at=now,
                 )
-
-    def _on_market_data_tick(self, _event: MarketDataTickReceived) -> None:
-        with self._lock:
-            self._update_channel(
-                ChannelId.MARKET_DATA, connected=True, at=self._clock.now(), message=True
-            )
 
     # -- Event handlers: order reports / fills (also the clock-skew signal) ----------
 

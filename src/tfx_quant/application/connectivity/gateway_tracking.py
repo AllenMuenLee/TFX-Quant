@@ -161,12 +161,6 @@ class ConnectivityTrackingBrokerSession:
     def cancel_start(self) -> None:
         self._inner.cancel_start()
 
-    def subscribe_market_data(self, symbol: str) -> None:
-        self._inner.subscribe_market_data(symbol)
-
-    def unsubscribe_market_data(self, symbol: str) -> None:
-        self._inner.unsubscribe_market_data(symbol)
-
     def stop(self) -> None:
         # An explicit disconnect — never auto-reconnect after this (see
         # `ConnectivityMonitor.forget_login_request`).

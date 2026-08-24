@@ -459,8 +459,7 @@ class ReversalWorkflowService:
             if record is None or record.state is ReversalWorkflowState.PAUSED_SAFE:
                 return
             reason = (
-                f"連結委託 {event.client_order_id.value} 進入 {event.status.value}："
-                f"{event.reason}"
+                f"連結委託 {event.client_order_id.value} 進入 {event.status.value}：{event.reason}"
             )
             self._pause(record, reason=reason, at=event.at)
 

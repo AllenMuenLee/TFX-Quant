@@ -9,8 +9,7 @@ vendor callback.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, time
-from decimal import Decimal
+from datetime import date
 
 from tfx_quant.application.ports.broker_session import LogoutReason, SessionCapabilities
 from tfx_quant.domain.account import TradingAccount
@@ -154,43 +153,26 @@ class BrokerCapabilitiesChanged(Event):
 
 @dataclass(frozen=True, slots=True)
 class BrokerSessionReady(Event):
-    """Login, order query, fill query, position query, and market data subscription
-    all succeeded — every `SessionCapabilities` flag is now true."""
+    """Login, order query, fill query, and position query all succeeded — every
+    `SessionCapabilities` flag is now true. Market data (`yfinance`) is a wholly
+    separate readiness concern — see `desktop.composition.compute_readiness` — and is
+    not part of this event or `SessionCapabilities`."""
 
     account: TradingAccount
 
 
 @dataclass(frozen=True, slots=True)
 class InstrumentSwitchCompleted(Event):
-    """`InstrumentSelectionService.switch_to()` succeeded — old quote subscription
-    cancelled, account status requeried, new contract subscribed, bar/signal state
-    cleared. The strategy state machine is left in whatever paused/stopped state it
-    was already in; per Feature 03's acceptance criteria the user must still press
-    start again (Running is only ever reachable via a fresh Starting)."""
+    """`InstrumentSelectionService.switch_to()` succeeded — account status requeried,
+    bar/signal state cleared (which points `MarketDataBarService`'s poll loop at the
+    newly selected contract's Yahoo ticker mapping). The strategy state machine is left
+    in whatever paused/stopped state it was already in; per Feature 03's acceptance
+    criteria the user must still press start again (Running is only ever reachable via
+    a fresh Starting)."""
 
     instrument: Instrument
     contract: ContractMonth
     vendor_symbol: str
-
-
-@dataclass(frozen=True, slots=True)
-class MarketDataTickReceived(Event):
-    """A raw, parsed SPARK API `StockTickResult` push — see `infrastructure/yuanta/
-    market_data_parsing.py`. Still vendor-symbol-addressed, not yet translated to
-    `Instrument`/`ContractMonth`: `MarketDataBarService` (which already knows the
-    currently active selection) does that translation and validates the symbol match,
-    same division of responsibility as `BrokerSessionOrchestrator`'s existing "never
-    translates a vendor symbol itself" boundary."""
-
-    vendor_symbol: str
-    price: Decimal
-    size: int
-    """This push's traded quantity (`DealVol`)."""
-    serial_no: int
-    """Per-symbol trade sequence number (`SerialNo`) — see `domain/tick.py`."""
-    exchange_time: time
-    """The bare exchange time-of-day from `StockTickResult.Time`, not yet
-    date-resolved."""
 
 
 @dataclass(frozen=True, slots=True)

@@ -7,17 +7,19 @@ implementation prompt requires storing — 週期 (period), 交易日 (trading_d
 資料來源 (source), and the created/updated audit timestamps — without forcing every
 existing `Bar` construction site to know about them.
 
-`source` is `BarDataSource.AGGREGATED_FROM_YUANTA_REALTIME` for the vast majority of rows
-— bars this software aggregated itself from real-time Yuanta pushes it actually received
-(see `docs/adr/0006-market-data-and-bar-aggregation.md` decision 7). A second value,
-`BACKFILLED_FROM_YFINANCE`, exists for rows filled from the third-party `yfinance`
-package when the rolling two-month window has a canonical bar identity this process never
-observed live — see `docs/adr/0007-two-month-bar-history-persistence.md`'s yfinance
-extension decision. Unlike `AGGREGATED_FROM_YUANTA_REALTIME`, this source is explicitly
-**not** an official Yuanta/TAIFEX record — a genuine third-party feed, never conflated
-with the real-time-aggregated path, and never presented as one. Neither source is ever a
-manual import, a carried-forward previous close, or a synthesized value — a row's
-`source` must always say honestly which one produced it.
+Every bar this codebase ever persists comes from the third-party `yfinance` package —
+there is no Yuanta/TAIFEX official price feed in this system (see `implementation prompt/
+04-market-data-and-60m-bars/implementation-prompt.md`'s banner). `source` distinguishes
+*when* the write happened, not *where* the data came from: `POLLED_FROM_YFINANCE` is the
+common case — `application.market_data.bar_service.MarketDataBarService` polling
+yfinance frequently and writing a bar promptly after it closed. `BACKFILLED_FROM_YFINANCE`
+is a later, coarser gap-fill sweep (`application.market_data.
+bar_history_backfill_service.BarHistoryBackfillService`) covering a canonical bar
+identity the frequent poll missed (process was down, a transient query failure, etc.) —
+see `docs/adr/0007-two-month-bar-history-persistence.md`'s yfinance extension decision.
+Neither source is ever a manual import, a carried-forward previous close, or a
+synthesized value, and neither is ever presented as an official Yuanta/TAIFEX record — a
+row's `source` must always say honestly which write path produced it.
 """
 
 from __future__ import annotations
@@ -53,18 +55,20 @@ class MarketSession(StrEnum):
 
 
 class BarDataSource(StrEnum):
-    AGGREGATED_FROM_YUANTA_REALTIME = "AGGREGATED_FROM_YUANTA_REALTIME"
-    """A bar this software aggregated itself from real-time Yuanta quote pushes it
-    actually received while running. Never third-party data or a synthesized value —
-    see the module docstring."""
+    LOCAL_YUANTA_REALTIME = "LOCAL_YUANTA_REALTIME"
+    POLLED_FROM_YFINANCE = "POLLED_FROM_YFINANCE"
+    """A bar `MarketDataBarService` observed by polling `yfinance`
+    (`application.ports.yahoo_history_query.YahooHistoryQueryPort`) shortly after it
+    closed and wrote promptly. The common case for a healthy, continuously-running
+    process. Never a synthesized/carried-forward value — see the module docstring."""
     BACKFILLED_FROM_YFINANCE = "BACKFILLED_FROM_YFINANCE"
-    """A bar filled from the third-party `yfinance` package
-    (`application.ports.yahoo_history_query.YahooHistoryQueryPort`), used only to cover
-    a canonical bar identity within the rolling two-month window this process never
-    observed live. A genuine third-party (Yahoo Finance) record, never a
-    synthesized/carried-forward value — but also never a Yuanta/TAIFEX official record,
-    so it is always kept distinct from `AGGREGATED_FROM_YUANTA_REALTIME` in storage, the
-    UI, and any future signal logic. See the module docstring."""
+    """A bar filled by `BarHistoryBackfillService`'s coarser gap-fill sweep, used to
+    cover a canonical bar identity within the rolling two-month window the frequent poll
+    never observed (process was down, a transient query failure, etc.). Both sources are
+    genuine third-party (Yahoo Finance) records, never a Yuanta/TAIFEX official one — kept
+    distinct from `POLLED_FROM_YFINANCE` in storage, the UI, and any future signal logic
+    purely to say honestly which write path produced a given row. See the module
+    docstring."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +92,9 @@ class BarRecord:
     created_at: Timestamp
     updated_at: Timestamp
     revision: int = 1
+    source_first_sequence: int | None = None
+    source_last_sequence: int | None = None
+    is_complete: bool = True
     """Bumped only by an explicit correction (see `application.ports.
     bar_record_repository.BarRecordRepository.apply_correction`) — never by an ordinary
     duplicate `BarClosed` replay, which is idempotently ignored instead."""
@@ -97,6 +104,14 @@ class BarRecord:
             raise InvalidBarRecordError(f"revision must be >= 1, got {self.revision}")
         if self.updated_at.value < self.created_at.value:
             raise InvalidBarRecordError("updated_at must be >= created_at")
+        if (self.source_first_sequence is None) != (self.source_last_sequence is None):
+            raise InvalidBarRecordError("source event sequence range must have both endpoints")
+        if (
+            self.source_first_sequence is not None
+            and self.source_last_sequence is not None
+            and self.source_first_sequence > self.source_last_sequence
+        ):
+            raise InvalidBarRecordError("source event sequence range is reversed")
 
     @property
     def identity(self) -> tuple[Instrument, ContractMonth, BarPeriod, Timestamp]:
@@ -111,11 +126,12 @@ class BarConflictAudit:
     kept as its own audit row rather than discarded — the "保存衝突 audit 與兩方摘要"
     the yfinance-backfill extension of the implementation prompt requires. `existing` is
     the canonical bar this codebase already had (never overwritten); `incoming` is the
-    rejected bar an attempted write proposed instead — always a `BACKFILLED_FROM_YFINANCE`
-    row today, since a same-identity conflict between two `AGGREGATED_FROM_YUANTA_REALTIME`
-    writes can't happen (an identical live aggregator producing two different OHLCV
-    values for the same boundary would be an aggregation bug, not an expected outcome
-    this audit trail is meant to model)."""
+    rejected bar an attempted write proposed instead. Most commonly `incoming` is a
+    `BACKFILLED_FROM_YFINANCE` row conflicting with an already-`POLLED_FROM_YFINANCE`
+    `existing` row — `yfinance` itself revising a bar's OHLCV between the fast poll and a
+    later gap-fill sweep — but a `POLLED_FROM_YFINANCE` vs `POLLED_FROM_YFINANCE` conflict
+    is also possible if yfinance revises a bar between two successive polls; this audit
+    trail doesn't assume either direction."""
 
     existing: BarRecord
     incoming: BarRecord

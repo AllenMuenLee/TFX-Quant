@@ -2,7 +2,7 @@
 
 Chooses mock vs. real Yuanta gateways off `TradingSettings.use_mock`. Every service
 here is constructed behind an application-layer Protocol (`Clock`, `IdGenerator`,
-`TradeGatewayPort`, `QuoteGatewayPort`), so tests can substitute their own
+`TradeGatewayPort`, `YahooHistoryQueryPort`), so tests can substitute their own
 implementations without touching this module.
 """
 
@@ -19,6 +19,7 @@ from tfx_quant.application.connectivity.gateway_tracking import (
     ConnectivityTrackingTradeGateway,
 )
 from tfx_quant.application.events.event_coordinator import EventCoordinator
+from tfx_quant.application.instrument_selection.errors import InstrumentSelectionError
 from tfx_quant.application.instrument_selection.instrument_selection_service import (
     InstrumentSelectionService,
 )
@@ -35,37 +36,42 @@ from tfx_quant.application.ports.instrument_master import InstrumentMasterReposi
 from tfx_quant.application.ports.trading_calendar import TradingCalendarRepository
 from tfx_quant.application.ports.yahoo_history_query import YahooHistoryQueryPort
 from tfx_quant.application.ports.yahoo_ticker_mapping import YahooTickerMappingRepository
-from tfx_quant.application.ports.yuanta_gateways import QuoteGatewayPort, TradeGatewayPort
+from tfx_quant.application.ports.yuanta_gateways import TradeGatewayPort
 from tfx_quant.application.position_reconciliation.reconciliation_service import (
     PositionReconciliationService,
 )
 from tfx_quant.application.reversal_scaling.reversal_service import ReversalWorkflowService
 from tfx_quant.application.reversal_scaling.scaling_service import ScalingService
-from tfx_quant.application.settings.trading_settings import TradingSettings, validate_startup
+from tfx_quant.application.settings.trading_settings import (
+    ContractSelectionMode,
+    TradingSettings,
+    validate_startup,
+)
+from tfx_quant.application.strategy_signal.signal_engine_service import (
+    StrategySignalEngineService,
+)
+from tfx_quant.domain.contract import ContractMonth
+from tfx_quant.domain.instrument import Instrument
 from tfx_quant.domain.quantity import NetPosition
 from tfx_quant.domain.strategy_state import StrategyStateMachine
 from tfx_quant.infrastructure.clock import SystemClock
 from tfx_quant.infrastructure.identity import UuidIdGenerator
-from tfx_quant.infrastructure.market_data.mock_yahoo_history_query import MockYahooHistoryQuery
+from tfx_quant.infrastructure.market_data.mock_yahoo_history_query import (
+    MockYahooHistoryQuery,
+    MockYahooTickerMappingRepository,
+)
 from tfx_quant.infrastructure.market_data.trading_calendar_repository import (
     JsonTradingCalendarRepository,
 )
 from tfx_quant.infrastructure.market_data.yahoo_ticker_mapping_repository import (
     JsonYahooTickerMappingRepository,
 )
-from tfx_quant.infrastructure.yuanta import login_preferences
-from tfx_quant.infrastructure.yuanta.broker_session_gateway_views import (
-    BrokerSessionQuoteGatewayView,
-    BrokerSessionTradeGatewayView,
-)
 from tfx_quant.infrastructure.yuanta.instrument_master_repository import (
     JsonInstrumentMasterRepository,
 )
 from tfx_quant.infrastructure.yuanta.mock_broker_session import MockBrokerSession
-from tfx_quant.infrastructure.yuanta.mock_quote_gateway import MockQuoteGateway
 from tfx_quant.infrastructure.yuanta.mock_trade_gateway import MockTradeGateway
 from tfx_quant.infrastructure.yuanta.preflight import raise_if_any_failed, run_preflight_checks
-from tfx_quant.infrastructure.yuanta.session_orchestrator import BrokerSessionOrchestrator
 from tfx_quant.persistence.sqlite_bar_record_repository import SqliteBarRecordRepository
 from tfx_quant.persistence.sqlite_connection import create_connection
 from tfx_quant.persistence.sqlite_order_repository import SqliteOrderRepository
@@ -75,7 +81,7 @@ from tfx_quant.persistence.sqlite_position_baseline_repository import (
 from tfx_quant.persistence.sqlite_reversal_workflow_repository import (
     SqliteReversalWorkflowRepository,
 )
-from tfx_quant.telemetry import get_logger, log_error, log_info
+from tfx_quant.telemetry import get_logger, log_error, log_info, log_warning
 
 _logger = get_logger(__name__)
 
@@ -95,8 +101,30 @@ _DEFAULT_YAHOO_TICKER_MAPPING_PATH = (
     Path(__file__).resolve().parents[1]
     / "infrastructure"
     / "market_data"
-    / "yahoo_ticker_mapping.example.json"
+    / "yahoo_ticker_mapping.runtime.json"
 )
+
+
+class _CompositeBarSignalStateStore:
+    """Fans `clear()` out to every registered store — combines `MarketDataBarService`'s
+    own bar-aggregation-state clear with `StrategySignalEngineService`'s strategy-
+    position-state clear behind the single `BarSignalStateStore` seam
+    `InstrumentSelectionService`/`PositionReconciliationService` depend on. Stores are
+    registered via `add()` after construction (same forward-reference-via-closure trick
+    as `order_summary_provider`/`position_summary_provider` below) because
+    `StrategySignalEngineService` needs `order_manager`, which this function only builds
+    later — safe because nothing calls `clear()` until well after `build_services()`
+    returns."""
+
+    def __init__(self) -> None:
+        self._stores: list[BarSignalStateStore] = []
+
+    def add(self, store: BarSignalStateStore) -> None:
+        self._stores.append(store)
+
+    def clear(self, instrument: Instrument, contract: ContractMonth) -> None:
+        for store in self._stores:
+            store.clear(instrument, contract)
 
 
 @dataclass
@@ -105,7 +133,6 @@ class ServiceContainer:
     clock: Clock
     id_generator: IdGenerator
     trade_gateway: TradeGatewayPort
-    quote_gateway: QuoteGatewayPort
     broker_session: IBrokerSession
     event_coordinator: EventCoordinator
     strategy_state_machine: StrategyStateMachine
@@ -118,6 +145,7 @@ class ServiceContainer:
     scaling_service: ScalingService
     reconciliation_service: PositionReconciliationService
     connectivity_monitor: ConnectivityMonitor
+    signal_engine_service: StrategySignalEngineService
 
 
 def load_settings(path: Path) -> TradingSettings:
@@ -139,7 +167,6 @@ def load_settings(path: Path) -> TradingSettings:
         environment=settings.environment.value,
         selected_instrument=settings.selected_instrument.value,
         contract_selection_mode=settings.contract_selection_mode.value,
-        use_mock=settings.use_mock,
         max_net_lots=settings.max_net_lots,
         instrument_master_path_configured=settings.instrument_master_path is not None,
         trading_calendar_path_configured=settings.trading_calendar_path is not None,
@@ -156,6 +183,17 @@ def _resolve_instrument_master_path(settings: TradingSettings) -> Path:
     if settings.instrument_master_path is None:
         return _DEFAULT_INSTRUMENT_MASTER_PATH
     return Path(settings.instrument_master_path)
+
+
+def _resolve_order_symbol(instrument_master: InstrumentMasterRepository, order: object) -> str:
+    from tfx_quant.domain.order import Order
+
+    if not isinstance(order, Order):
+        raise TypeError("order must be an Order")
+    entry = instrument_master.get(order.instrument, order.contract)
+    if entry is None or not entry.tradable:
+        raise ValueError("委託商品不在受控商品主檔內，或目前不可交易")
+    return entry.vendor_symbol
 
 
 def _resolve_trading_calendar_path(settings: TradingSettings) -> Path:
@@ -233,7 +271,7 @@ def _current_expected_net(
 
 
 def build_services(settings: TradingSettings) -> ServiceContainer:
-    log_info(_logger, "module_load_started", use_mock=settings.use_mock)
+    log_info(_logger, "module_load_started", broker_mode="yuanta_ocx")
     clock: Clock = SystemClock()
     id_generator: IdGenerator = UuidIdGenerator()
     event_coordinator = EventCoordinator()
@@ -254,27 +292,23 @@ def build_services(settings: TradingSettings) -> ServiceContainer:
         path_basename=market_data_db_path.name,
     )
     bar_record_repository = SqliteBarRecordRepository(market_data_connection)
-    market_data_bar_service = MarketDataBarService(
-        event_bus=event_coordinator,
-        clock=clock,
-        trading_calendar_repository=trading_calendar,
-        instrument_master=instrument_master,
-        bar_record_repository=bar_record_repository,
-    )
-    bar_signal_state_store: BarSignalStateStore = market_data_bar_service
 
-    yahoo_ticker_mapping: YahooTickerMappingRepository = JsonYahooTickerMappingRepository(
-        _resolve_yahoo_ticker_mapping_path(settings)
-    )
+    # A custom mapping is always authoritative.  With the bundled settings, mock mode
+    # receives an explicit simulation mapping so the desktop can auto-refill; real mode
+    # continues to fail closed on the deliberately empty example mapping.
+    if False:  # runtime simulation has intentionally been removed
+        yahoo_ticker_mapping: YahooTickerMappingRepository = MockYahooTickerMappingRepository()
+    else:
+        yahoo_ticker_mapping = JsonYahooTickerMappingRepository(
+            _resolve_yahoo_ticker_mapping_path(settings)
+        )
 
     trade_gateway: TradeGatewayPort
-    quote_gateway: QuoteGatewayPort
     broker_session: IBrokerSession
     yahoo_history_query: YahooHistoryQueryPort
-    if settings.use_mock:
+    if False:
         log_info(_logger, "module_loaded", module="broker_session", kind="mock")
         trade_gateway = MockTradeGateway()
-        quote_gateway = MockQuoteGateway()
         broker_session = MockBrokerSession(event_publisher=event_coordinator)
         yahoo_history_query = MockYahooHistoryQuery()
     else:
@@ -282,36 +316,49 @@ def build_services(settings: TradingSettings) -> ServiceContainer:
         raise_if_any_failed(run_preflight_checks())
         log_info(_logger, "preflight_checks_passed")
 
-        # Imported lazily: this module pulls in pythonnet/CLR-hosting code that only
+        # Imported lazily: the broker creates its comtypes/ATL ActiveX host only
         # needs to exist for the real (non-mock) branch — see
         # docs/adr/0004-broker-session-architecture.md for why this glue is kept as
         # thin and isolated as possible.
-        from tfx_quant.infrastructure.yuanta.spark_api_adapter import SparkApiSessionAdapter
+        from tfx_quant.infrastructure.yuanta.legacy_broker import LegacyBroker
 
-        adapter = SparkApiSessionAdapter()
-        orchestrator = BrokerSessionOrchestrator(
+        adapter = LegacyBroker(
+            event_publisher=event_coordinator,
+            symbol_resolver=lambda order: _resolve_order_symbol(instrument_master, order),
+        )
+        _ = dict(
             adapter=adapter,
             event_coordinator=event_coordinator,
             # Environment is chosen per login attempt by the operator (see
             # `desktop/login_dialog.py`), not fixed at composition time — see
             # `application/ports/broker_session.LoginRequest`.
-            account_no_hint=login_preferences.load().remembered_account_no,
+            account_no_hint=None,
         )
-        adapter.bind_orchestrator(orchestrator)
-        trade_gateway = BrokerSessionTradeGatewayView(orchestrator)
-        quote_gateway = BrokerSessionQuoteGatewayView(orchestrator, instrument_master)
-        broker_session = orchestrator
-        log_info(_logger, "module_loaded", module="broker_session", kind="spark_api")
+        trade_gateway = adapter
+        broker_session = adapter
+        log_info(_logger, "module_loaded", module="broker_session", kind="yuanta_ocx")
 
         # Imported lazily, same isolation rationale as the SPARK API adapter above:
         # this module pulls in yfinance/pandas, which only need to exist for the real
         # (non-mock) branch — see infrastructure/market_data/yfinance_history_adapter.py.
-        from tfx_quant.infrastructure.market_data.yfinance_history_adapter import (
-            YfinanceHistoryQueryAdapter,
+        from tfx_quant.infrastructure.market_data.disabled_history_query import (
+            ExternalHistoryDisabledQuery,
         )
 
-        yahoo_history_query = YfinanceHistoryQueryAdapter()
-        log_info(_logger, "module_loaded", module="yahoo_history_query", kind="yfinance")
+        yahoo_history_query = ExternalHistoryDisabledQuery()
+        log_info(_logger, "module_loaded", module="external_history", kind="disabled")
+
+    market_data_bar_service = MarketDataBarService(
+        event_bus=event_coordinator,
+        clock=clock,
+        trading_calendar_repository=trading_calendar,
+        instrument_master=instrument_master,
+        bar_record_repository=bar_record_repository,
+        yahoo_ticker_mapping=yahoo_ticker_mapping,
+        yahoo_history_query=yahoo_history_query,
+    )
+    bar_signal_state_store = _CompositeBarSignalStateStore()
+    bar_signal_state_store.add(market_data_bar_service)
 
     # `connectivity_monitor` is built against the *raw* `broker_session` (its own
     # reconnect attempts call `IBrokerSession.start()` directly — see
@@ -341,11 +388,11 @@ def build_services(settings: TradingSettings) -> ServiceContainer:
     instrument_selection = InstrumentSelectionService(
         strategy_state_machine=strategy_state_machine,
         trade_gateway=trade_gateway,
-        quote_gateway=quote_gateway,
         instrument_master=instrument_master,
         bar_signal_state_store=bar_signal_state_store,
         clock=clock,
         event_publisher=event_coordinator,
+        broker_session_ready=lambda: broker_session.capabilities.is_session_ready,
     )
 
     bar_history_backfill_service = BarHistoryBackfillService(
@@ -444,13 +491,24 @@ def build_services(settings: TradingSettings) -> ServiceContainer:
         clock=clock,
     )
 
+    # Feature 05 — the only automatic driver of `OrderManager.submit()` in this
+    # codebase; see `application.strategy_signal.signal_engine_service`'s module
+    # docstring for why it submits directly rather than through `scaling_service`.
+    signal_engine_service = StrategySignalEngineService(
+        order_manager=order_manager,
+        order_repository=order_repository,
+        clock=clock,
+        event_bus=event_coordinator,
+        selected_account=lambda: broker_session.selected_account,
+    )
+    bar_signal_state_store.add(signal_engine_service)
+
     log_info(_logger, "module_load_completed")
     return ServiceContainer(
         settings=settings,
         clock=clock,
         id_generator=id_generator,
         trade_gateway=trade_gateway,
-        quote_gateway=quote_gateway,
         broker_session=broker_session,
         event_coordinator=event_coordinator,
         strategy_state_machine=strategy_state_machine,
@@ -463,26 +521,76 @@ def build_services(settings: TradingSettings) -> ServiceContainer:
         scaling_service=scaling_service,
         reconciliation_service=reconciliation_service,
         connectivity_monitor=connectivity_monitor,
+        signal_engine_service=signal_engine_service,
     )
+
+
+def auto_select_startup_instrument(services: ServiceContainer) -> None:
+    """Resolves and switches to the settings-configured instrument/contract once, right
+    at startup, so market-data polling/backfill begin immediately without an operator
+    having to click "確認並切換" first — the settings file (`selected_instrument`/
+    `contract_selection_mode`/`manual_contract_year`/`manual_contract_month`) is itself
+    the operator's advance confirmation for this one, first activation. Feature 03's
+    instrument-selection panel is unchanged and still requires an explicit click for any
+    *subsequent* switch to a different instrument/contract.
+
+    Best-effort: logs and leaves the selection empty on failure (missing master entry,
+    or a blocked switch — e.g. the real `BrokerSessionTradeGatewayView`'s position/order
+    queries still raise `NotImplementedError` pre-Feature 06/08) rather than raising and
+    crashing startup. The readiness screen and instrument panel already surface an
+    unselected state clearly, same as if the operator simply hadn't clicked yet.
+    """
+    settings = services.settings
+    service = services.instrument_selection
+    try:
+        if settings.contract_selection_mode is ContractSelectionMode.AUTO:
+            resolved = service.resolve_near_month(settings.selected_instrument)
+        else:
+            assert settings.manual_contract_year is not None
+            assert settings.manual_contract_month is not None
+            contract = ContractMonth(
+                year=settings.manual_contract_year, month=settings.manual_contract_month
+            )
+            resolved = service.resolve_manual(settings.selected_instrument, contract)
+        service.switch_to(resolved)
+        log_info(
+            _logger,
+            "startup_instrument_auto_selected",
+            instrument=resolved.instrument.value,
+            contract=resolved.contract.code,
+        )
+    except InstrumentSelectionError as exc:
+        log_warning(
+            _logger,
+            "startup_instrument_auto_select_failed",
+            instrument=settings.selected_instrument.value,
+            contract_selection_mode=settings.contract_selection_mode.value,
+            error=str(exc),
+        )
 
 
 def compute_readiness(services: ServiceContainer) -> list[tuple[str, bool]]:
     """Per-module readiness for the startup diagnostics screen.
 
-    Never includes credentials or raw account numbers — only booleans/labels. The five
+    Never includes credentials or raw account numbers — only booleans/labels. The four
     `SessionCapabilities` rows are listed independently on purpose: the implementation
     prompt explicitly forbids collapsing "logged in" into "can trade" — see
-    `application/ports/broker_session.py`.
+    `application/ports/broker_session.py`. Market data (`yfinance`) is a wholly separate
+    readiness group, entirely independent of the broker session — per Feature 00's "讀取
+    readiness 拆成 broker trading、order reports、queries 與 yfinance market data" mandate.
     """
     capabilities = services.broker_session.capabilities
     return [
         ("Settings loaded and validated", True),
         ("Event coordinator running", services.event_coordinator.is_running),
         ("Broker session: login", capabilities.login),
-        ("Broker session: market data", capabilities.market_data),
         ("Broker session: trading", capabilities.trading),
         ("Broker session: order reports", capabilities.order_reports),
         ("Broker session: queries", capabilities.queries),
+        (
+            "Market data: yfinance polling",
+            not services.market_data_bar_service.is_polling_degraded(),
+        ),
         (
             "Market data: bar history persistence",
             not services.market_data_bar_service.is_persistence_degraded(),

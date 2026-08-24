@@ -2,22 +2,24 @@
 two-month bar history (Feature 04 extension, see `docs/adr/0007-two-month-bar-history-
 persistence.md`'s yfinance extension decision).
 
-`MarketDataBarService` only ever writes a bar this process itself aggregated from a live
-Yuanta tick. This service is the second, distinct writer: on startup, reconnect, contract
-switch, and daily trading-day rollover, it computes the exact set of canonical 60-minute
-bar identities the rolling two-month window expects (per `TradingCalendar`/
-`InstrumentMasterEntry` session boundaries, excluding anything not yet closed), diffs
-that against what `BarRecordRepository` already has, and asks `YahooHistoryQueryPort`
-(the third-party `yfinance` package, isolated behind `infrastructure.market_data.
-yfinance_history_adapter`) to fill only the missing identities — never a day already
-fully covered by this process's own real-time aggregation.
+`MarketDataBarService` writes a bar promptly whenever its own frequent poll observes it
+close (`BarDataSource.POLLED_FROM_YFINANCE`). This service is the second, coarser writer:
+on startup, reconnect, contract switch, and daily trading-day rollover, it computes the
+exact set of canonical 60-minute bar identities the rolling two-month window expects (per
+`TradingCalendar`/`InstrumentMasterEntry` session boundaries, excluding anything not yet
+closed), diffs that against what `BarRecordRepository` already has, and asks
+`YahooHistoryQueryPort` (the third-party `yfinance` package, isolated behind
+`infrastructure.market_data.yfinance_history_adapter` — the same port
+`MarketDataBarService` uses) to fill only the missing identities
+(`BarDataSource.BACKFILLED_FROM_YFINANCE`) — never a day already fully covered by the
+frequent poll.
 
 **Bar-level, not day-level, gap detection.** An earlier revision of this service (vendor
 `GetKLine`-based, see ADR 0007's superseded extension section) treated a trading day with
 *any* local bar as fully covered. This implementation prompt is explicit that gaps must
-be computed "依預期交易時段與 canonical bar identity" — so a day this process was only
-*partially* connected for (some hours aggregated live, others missing) is still
-correctly detected and backfilled hour-by-hour.
+be computed "依預期交易時段與 canonical bar identity" — so a day the frequent poll was only
+*partially* running for (some hours captured live, others missing) is still correctly
+detected and backfilled hour-by-hour.
 
 Runs entirely on its own background thread, never the `EventCoordinator` dispatch
 thread — a full run makes several sequential blocking HTTP calls (each already bounded/
@@ -42,6 +44,7 @@ from tfx_quant.application.events.events import (
     Event,
     InstrumentSwitchCompleted,
 )
+from tfx_quant.application.market_data.yahoo_bar_resolution import resolve_yahoo_bar
 from tfx_quant.application.ports.bar_record_repository import (
     BarRecordRepository,
     BarUpsertOutcome,
@@ -56,7 +59,6 @@ from tfx_quant.application.ports.yahoo_history_query import (
     YahooHistoryQueryPort,
 )
 from tfx_quant.application.ports.yahoo_ticker_mapping import YahooTickerMappingRepository
-from tfx_quant.domain.bar import Bar
 from tfx_quant.domain.bar_history_backfill import chunk_consecutive_days
 from tfx_quant.domain.bar_record import (
     BarConflictAudit,
@@ -66,10 +68,8 @@ from tfx_quant.domain.bar_record import (
     rolling_two_month_start,
 )
 from tfx_quant.domain.contract import ContractMonth
-from tfx_quant.domain.errors import DomainError
 from tfx_quant.domain.instrument import Instrument
 from tfx_quant.domain.instrument_master import InstrumentMasterEntry
-from tfx_quant.domain.money import Price
 from tfx_quant.domain.timestamp import Timestamp
 from tfx_quant.domain.trading_calendar import TradingCalendar
 from tfx_quant.telemetry import get_logger, log_debug, log_error, log_info, log_warning
@@ -162,6 +162,10 @@ class BarHistoryBackfillService:
                 return
             self._running = True
             self._schedule_next_tick()
+        # Starting the service is itself a startup trigger.  This makes startup
+        # deterministic even if InstrumentSwitchCompleted was handled before start(),
+        # or an event-bus implementation does not retain pre-start events.
+        self._trigger()
 
     def stop(self) -> None:
         with self._lock:
@@ -278,9 +282,7 @@ class BarHistoryBackfillService:
                 contract=active.contract.code,
                 missing_bar_count=len(missing_starts),
             )
-            self._publish_completed(
-                active, requested=len(missing_starts), filled=0, conflicts=0
-            )
+            self._publish_completed(active, requested=len(missing_starts), filled=0, conflicts=0)
             return
 
         missing_start_set = {ts.value for ts in missing_starts}
@@ -411,80 +413,40 @@ class BarHistoryBackfillService:
         window_end: date,
         now: Timestamp,
     ) -> BarRecord | None:
-        try:
-            open_ts = Timestamp(yahoo_bar.at)
-        except DomainError as exc:
+        resolved = resolve_yahoo_bar(
+            instrument=active.instrument,
+            contract=active.contract,
+            entry=entry,
+            calendar=self._calendar,
+            yahoo_bar=yahoo_bar,
+            now=now,
+        )
+        if resolved is None:
             log_debug(
                 _logger,
-                "bar_backfill_row_dropped_malformed_timestamp",
+                "bar_backfill_row_dropped_unresolved",
                 instrument=active.instrument.value,
                 contract=active.contract.code,
                 yahoo_at=str(yahoo_bar.at),
-                error=str(exc),
             )
             return None
-        boundary = self._calendar.boundary_for_open(open_ts, entry)
-        if boundary is None:
-            log_debug(
-                _logger,
-                "bar_backfill_row_dropped_off_grid",
-                instrument=active.instrument.value,
-                contract=active.contract.code,
-                yahoo_open_at=open_ts.value.isoformat(),
-            )
-            return None
-        boundary_open, boundary_close = boundary
-        if boundary_close.value > now.value:
+        if resolved.is_forming:
             log_debug(
                 _logger,
                 "bar_backfill_row_dropped_still_forming",
                 instrument=active.instrument.value,
                 contract=active.contract.code,
-                boundary_open=boundary_open.value.isoformat(),
+                boundary_open=resolved.bar.start.value.isoformat(),
             )
             return None
-        context = self._calendar.session_context_for(boundary_open, entry)
-        if context is None:
-            log_debug(
-                _logger,
-                "bar_backfill_row_dropped_no_session_context",
-                instrument=active.instrument.value,
-                contract=active.contract.code,
-                boundary_open=boundary_open.value.isoformat(),
-            )
-            return None
-        trading_day, session = context
-        if not (window_start <= trading_day <= window_end):
+        if not (window_start <= resolved.trading_day <= window_end):
             return None  # padding reached outside the two-month window — never written
 
-        try:
-            bar = Bar(
-                instrument=active.instrument,
-                contract=active.contract,
-                open=Price(yahoo_bar.open),
-                high=Price(yahoo_bar.high),
-                low=Price(yahoo_bar.low),
-                close=Price(yahoo_bar.close),
-                volume=yahoo_bar.volume,
-                start=boundary_open,
-                end=boundary_close,
-            )
-        except DomainError as exc:
-            log_debug(
-                _logger,
-                "bar_backfill_row_dropped_invalid_ohlcv",
-                instrument=active.instrument.value,
-                contract=active.contract.code,
-                boundary_open=boundary_open.value.isoformat(),
-                error=str(exc),
-            )
-            return None
-
         return BarRecord(
-            bar=bar,
+            bar=resolved.bar,
             period=BarPeriod.SIXTY_MINUTE,
-            trading_day=trading_day,
-            session=session,
+            trading_day=resolved.trading_day,
+            session=resolved.session,
             source=BarDataSource.BACKFILLED_FROM_YFINANCE,
             is_gap_recovery=False,
             created_at=now,
