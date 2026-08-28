@@ -64,10 +64,6 @@ module = "comtypes.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = "YuantaOneAPI.*"
-ignore_missing_imports = true
-
-[[tool.mypy.overrides]]
 module = "YuantaOrdLibX64.*"
 ignore_missing_imports = true
 

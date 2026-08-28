@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import threading
-from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -16,12 +14,8 @@ from tfx_quant.application.connectivity.gateway_tracking import (
     ConnectivityTrackingTradeGateway,
 )
 from tfx_quant.application.events.events import (
-    BarBackfillCompleted,
     BrokerSessionInvalidated,
     FillReceived,
-)
-from tfx_quant.application.market_data.bar_history_backfill_service import (
-    BarHistoryBackfillService,
 )
 from tfx_quant.application.order_management.errors import OrderExposureExceededError
 from tfx_quant.application.order_management.order_manager import OrderManager, OrderRequest
@@ -97,7 +91,7 @@ def test_build_services_wires_a_real_broker_session_without_connecting(
     assert readiness["Broker session: trading"] is False
     assert readiness["Broker session: order reports"] is False
     assert readiness["Broker session: queries"] is False
-    assert readiness["Market data: yfinance polling"] is True
+    assert readiness["Market data: Yuanta quote login"] is False
 
 
 def test_build_services_raises_actionable_preflight_error_when_use_mock_false(
@@ -106,7 +100,7 @@ def test_build_services_raises_actionable_preflight_error_when_use_mock_false(
     """The real branch must fail loudly at startup with an aggregated, actionable
     message for whatever preflight check fails, never silently fall back to a fake —
     per docs/adr/0004-broker-session-architecture.md. The DLL-directory check is forced
-    to fail here (pointed at an empty tmp dir, guaranteed to lack `YuantaSparkAPI.dll`)
+    to fail here (pointed at an empty tmp dir, guaranteed to lack the YuantaOrd files)
     so the assertion is deterministic regardless of host state. Credentials are no
     longer checked at startup at all (they're entered on the login screen, not
     available until then — see docs/secrets-management.md)."""
@@ -135,23 +129,17 @@ def test_compute_readiness_never_includes_account_number_or_secrets(
     assert "account_no" not in labels.lower()
 
 
-def test_market_data_bar_service_is_wired_as_the_real_bar_signal_state_store(
+def test_quote_runtime_is_wired_and_starts_disconnected(
     valid_settings_raw: dict[str, Any],
 ) -> None:
-    """ADR 0005 left `NullBarSignalStateStore` as a documented placeholder — Feature 04
-    must wire the real service in its place, so switching instruments actually resets
-    (activates) the bar aggregator for the newly-selected contract."""
     settings = validate_startup(valid_settings_raw)
     services = build_services(settings)
 
     resolved = services.instrument_selection.resolve_near_month(Instrument.MXF)
     services.instrument_selection.switch_to(resolved)
 
-    bar_service = services.market_data_bar_service
-    assert bar_service.forming_bar(resolved.instrument, resolved.contract) is None
-    assert bar_service.recent_closed_bars(resolved.instrument, resolved.contract) == ()
-    assert bar_service.is_stale(resolved.instrument, resolved.contract) is True
-    assert bar_service.has_gap(resolved.instrument, resolved.contract) is False
+    assert services.quote_runtime.forming_bar is None
+    assert services.quote_runtime.state.value == "STOPPED"
 
 
 def test_order_manager_is_wired_into_service_container(
@@ -280,31 +268,9 @@ def test_order_manager_position_lookup_is_the_reconciliation_service_not_a_flat_
         services.order_manager.submit(second_request)
 
 
-def test_bar_history_backfill_service_is_wired_into_service_container(
+def test_default_runtime_selects_contract_without_starting_quote_login(
     valid_settings_raw: dict[str, Any],
 ) -> None:
-    settings = validate_startup(valid_settings_raw)
-    services = build_services(settings)
-    assert isinstance(services.bar_history_backfill_service, BarHistoryBackfillService)
-
-
-def test_yfinance_backfill_readiness_row_is_healthy_with_no_active_selection(
-    valid_settings_raw: dict[str, Any],
-) -> None:
-    """Nothing is selected yet at composition time, so the yfinance-backfill degraded
-    check (which only ever inspects the *currently active* contract) has nothing to
-    report — same "nothing failed yet is reported healthy" posture every other
-    readiness row in this codebase takes."""
-    settings = validate_startup(valid_settings_raw)
-    services = build_services(settings)
-    readiness = dict(compute_readiness(services))
-    assert readiness["Market data: yfinance backfill"] is True
-
-
-def test_default_runtime_has_an_active_yfinance_market_data_mapping(
-    valid_settings_raw: dict[str, Any],
-) -> None:
-    """The desktop's default selection can start yfinance before broker login."""
     settings = validate_startup(valid_settings_raw)
     services = build_services(settings)
 
@@ -313,79 +279,7 @@ def test_default_runtime_has_an_active_yfinance_market_data_mapping(
     services.event_coordinator.stop(timeout=2)
 
     assert services.instrument_selection.current is not None
-    assert services.bar_history_backfill_service.is_degraded() is False
-
-
-def test_default_runtime_persists_only_yfinance_bars(
-    valid_settings_raw: dict[str, Any],
-) -> None:
-    settings = validate_startup(valid_settings_raw)
-    services = build_services(settings)
-    completed = threading.Event()
-    services.event_coordinator.subscribe(BarBackfillCompleted, lambda _event: completed.set())
-    services.event_coordinator.start()
-    try:
-        auto_select_startup_instrument(services)
-        services.market_data_bar_service.start()
-        services.bar_history_backfill_service.start()
-        assert completed.wait(timeout=15)
-
-        selected = services.instrument_selection.current
-        assert selected is not None
-        today = services.clock.now().value.date()
-        records = services.market_data_bar_service.query_history(
-            selected.instrument,
-            selected.contract,
-            start_date=today - timedelta(days=7),
-            end_date=today,
-        )
-        assert records
-        assert all("YFINANCE" in record.source.value for record in records)
-    finally:
-        services.bar_history_backfill_service.stop()
-        services.market_data_bar_service.stop()
-        services.event_coordinator.stop(timeout=2)
-
-
-def test_yahoo_ticker_mapping_path_is_honored(
-    valid_settings_raw: dict[str, Any], tmp_path: Path
-) -> None:
-    """A configured `yahoo_ticker_mapping_path` must actually be the file
-    `BarHistoryBackfillService` consults — proven behaviorally (via `is_degraded()`
-    after an instrument switch) rather than by reaching into composition internals."""
-    mapping_path = tmp_path / "yahoo_ticker_mapping.json"
-    mapping_path.write_text(
-        json.dumps(
-            {
-                "mappings": [
-                    {
-                        "instrument": "MXF",
-                        "contract_year": 2026,
-                        "contract_month": 9,
-                        "yahoo_ticker": "TESTTICKER=F",
-                    }
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-    valid_settings_raw["yahoo_ticker_mapping_path"] = str(mapping_path)
-    settings = validate_startup(valid_settings_raw)
-    services = build_services(settings)
-
-    resolved = services.instrument_selection.resolve_near_month(Instrument.MXF)
-    services.instrument_selection.switch_to(resolved)
-    # `BarHistoryBackfillService` only learns the active contract via its
-    # `InstrumentSwitchCompleted` subscription (unlike `MarketDataBarService.clear()`,
-    # which `switch_to()` calls synchronously) — the event coordinator must actually be
-    # dispatching for that handler to fire.
-    services.event_coordinator.start()
-    services.event_coordinator.stop(timeout=2)
-
-    # A configured mapping means "is_degraded" no longer reports the missing-ticker
-    # condition (mock mode's yahoo_history_query always returns empty, so there is
-    # nothing to conflict on either).
-    assert services.bar_history_backfill_service.is_degraded() is False
+    assert services.quote_runtime.state.value == "STOPPED"
 
 
 def test_connectivity_monitor_is_wired_into_service_container(

@@ -1,4 +1,4 @@
-"""Graphical yfinance candlestick view with history and live modes."""
+"""Candlestick view for locally recorded Yuanta quote data."""
 
 from __future__ import annotations
 
@@ -8,8 +8,10 @@ from decimal import Decimal
 import wx
 import wx.adv
 
+from tfx_quant.application.ports.quote_gateway import QuoteConnectionState
 from tfx_quant.desktop.composition import ServiceContainer
 from tfx_quant.domain.bar import Bar
+from tfx_quant.domain.timestamp import TAIPEI_TZ
 
 _BG = wx.Colour(15, 23, 42)
 _CARD = wx.Colour(24, 34, 55)
@@ -41,7 +43,7 @@ class CandlestickCanvas(wx.Panel):
         self._zoom = 1.0
         self._right_index = 0
         self._drag_x: int | None = None
-        self._empty_message = "等待 yfinance 資料…"
+        self._empty_message = "等待元大行情 API 資料…"
         self.Bind(wx.EVT_PAINT, self._paint)
         self.Bind(wx.EVT_SIZE, self._on_size)
         self.Bind(wx.EVT_MOUSEWHEEL, self._on_mouse_wheel)
@@ -81,8 +83,10 @@ class CandlestickCanvas(wx.Panel):
 
     def _visible_range(self, plot_width: int) -> tuple[int, int]:
         count = len(self._bars)
+        if count == 0:
+            return 0, 0
         base_visible = max(_MIN_VISIBLE_BARS, plot_width // 10)
-        visible = min(count, max(_MIN_VISIBLE_BARS, round(base_visible / self._zoom)))
+        visible = min(count, max(1, max(_MIN_VISIBLE_BARS, round(base_visible / self._zoom))))
         right = min(count, max(visible, self._right_index))
         return right - visible, right
 
@@ -143,8 +147,11 @@ class CandlestickCanvas(wx.Panel):
         visible_bars = self._bars[start_index:end_index]
         low = min(float(bar.low.amount) for bar in visible_bars)
         high = max(float(bar.high.amount) for bar in visible_bars)
-        padding = max((high - low) * 0.06, 1.0)
-        low, high = low - padding, high + padding
+        # Use the same zoom factor on both axes. At reset (1.0), the visible
+        # extrema touch the plot edges; zooming changes both candle width and height.
+        midpoint = (high + low) / 2
+        half_range = max((high - low) / 2, 0.5) / self._zoom
+        low, high = midpoint - half_range, midpoint + half_range
 
         dc.SetPen(wx.Pen(_GRID, 1))
         dc.SetTextForeground(wx.Colour(148, 163, 184))
@@ -194,7 +201,7 @@ class MarketDataPanel(wx.Panel):
         title.SetFont(title.GetFont().Bold().Scale(1.35))
         header.Add(title, 0, wx.ALIGN_CENTER_VERTICAL)
         header.AddStretchSpacer()
-        self._source = wx.StaticText(self, label="● yfinance 公開資料 · 不需券商登入")
+        self._source = wx.StaticText(self, label="● 元大行情 API · 需行情帳號登入")
         self._source.SetForegroundColour(wx.Colour(96, 165, 250))
         header.Add(self._source, 0, wx.ALIGN_CENTER_VERTICAL)
         root.Add(header, 0, wx.EXPAND | wx.BOTTOM, 12)
@@ -250,7 +257,7 @@ class MarketDataPanel(wx.Panel):
         self._history_controls.SetSizer(range_row)
         root.Add(self._history_controls, 0, wx.BOTTOM, 10)
 
-        self._status = wx.StaticText(self, label="正在連接 yfinance…")
+        self._status = wx.StaticText(self, label="尚未連接元大行情 API")
         self._status.SetForegroundColour(_TEXT)
         root.Add(self._status, 0, wx.BOTTOM, 8)
         root.Add(self._canvas, 1, wx.EXPAND)
@@ -276,34 +283,45 @@ class MarketDataPanel(wx.Panel):
         self.refresh()
 
     def refresh(self) -> None:
+        self._services.quote_runtime.refresh()
         current = self._services.instrument_selection.current
         if current is None:
             self._status.SetLabel("請選擇要監看的商品")
             self._canvas.set_bars([], "尚未選擇商品")
             return
-        service = self._services.market_data_bar_service
+        service = self._services.quote_runtime
         instrument, contract = current.instrument, current.contract
         if self._live_mode:
             end = date.today()
-            records = service.query_history(
-                instrument, contract, start_date=end - timedelta(days=10), end_date=end
-            )
+            records = service.query(end - timedelta(days=10), end)
             bars = [record.bar for record in records[-_LIVE_LIMIT:]]
-            forming = service.forming_bar(instrument, contract)
+            forming = service.forming_bar
             if forming is not None and (not bars or bars[-1].start != forming.start):
                 bars.append(forming)
-            update = service.last_update_at(instrument, contract)
-            updated = "等待首次更新" if update is None else f"更新 {update.value:%H:%M:%S}"
-            health = "連線異常" if service.is_polling_degraded() else "自動更新中"
+            last_event = service.last_event_at
+            if last_event is None:
+                updated = "尚未收到行情事件"
+            else:
+                updated = (
+                    f"最後接收 {last_event.value.astimezone(TAIPEI_TZ):%H:%M:%S}"
+                    f"（{service.event_count} 筆）"
+                )
+            health = {
+                QuoteConnectionState.LOGGED_ON: "即時行情已登入",
+                QuoteConnectionState.CONNECTING: "行情連線中",
+                QuoteConnectionState.CONNECTED: "行情已連線，等待登入",
+                QuoteConnectionState.STALE: "行情連線中斷",
+                QuoteConnectionState.FAILED: "行情登入失敗",
+                QuoteConnectionState.IDLE: "行情尚未連線",
+                QuoteConnectionState.STOPPED: "行情尚未登入或目前休市",
+            }.get(service.state, f"行情狀態：{service.state.value}")
             self._status.SetLabel(
                 f"{instrument.display_name_zh} · 自動近月 {contract.code}  |  {health} · {updated}"
             )
         else:
             start, end = _date(self._start.GetValue()), _date(self._end.GetValue())
-            records = service.query_history(instrument, contract, start_date=start, end_date=end)
+            records = service.query(start, end)
             bars = [record.bar for record in records]
             summary = f"{start} — {end} · {len(bars)} 根"
-            self._status.SetLabel(
-                f"{instrument.display_name_zh} · {contract.code}  |  {summary}"
-            )
+            self._status.SetLabel(f"{instrument.display_name_zh} · {contract.code}  |  {summary}")
         self._canvas.set_bars(bars)

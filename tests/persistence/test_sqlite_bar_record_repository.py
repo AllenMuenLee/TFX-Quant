@@ -62,7 +62,7 @@ def _record(
         period=BarPeriod.SIXTY_MINUTE,
         trading_day=start.value.date(),
         session=MarketSession.DAY,
-        source=BarDataSource.POLLED_FROM_YFINANCE,
+        source=BarDataSource.LOCAL_YUANTA_REALTIME,
         is_gap_recovery=is_gap_recovery,
         created_at=start,
         updated_at=start,
@@ -87,7 +87,7 @@ def test_upsert_new_bar_is_inserted(repo: SqliteBarRecordRepository) -> None:
     assert found[0].bar.open.amount == Decimal("17500")
     assert found[0].bar.start == record.bar.start
     assert found[0].session is MarketSession.DAY
-    assert found[0].source is BarDataSource.POLLED_FROM_YFINANCE
+    assert found[0].source is BarDataSource.LOCAL_YUANTA_REALTIME
 
 
 def test_upsert_identical_duplicate_is_ignored(repo: SqliteBarRecordRepository) -> None:
@@ -127,7 +127,7 @@ def test_apply_correction_bumps_revision_and_writes_audit(repo: SqliteBarRecordR
         period=BarPeriod.SIXTY_MINUTE,
         trading_day=start.value.date(),
         session=MarketSession.DAY,
-        source=BarDataSource.POLLED_FROM_YFINANCE,
+        source=BarDataSource.LOCAL_YUANTA_REALTIME,
         is_gap_recovery=False,
         created_at=start,
         updated_at=_ts(2026, 9, 16, 10, 0),
@@ -261,13 +261,13 @@ def test_get_one_returns_stored_record(repo: SqliteBarRecordRepository) -> None:
     assert found.bar.open.amount == Decimal("17500")
 
 
-def _yfinance_record(start: Timestamp, end: Timestamp, *, price: str) -> BarRecord:
+def _conflicting_record(start: Timestamp, end: Timestamp, *, price: str) -> BarRecord:
     return BarRecord(
         bar=_bar(start, end, price=price),
         period=BarPeriod.SIXTY_MINUTE,
         trading_day=start.value.date(),
         session=MarketSession.DAY,
-        source=BarDataSource.BACKFILLED_FROM_YFINANCE,
+        source=BarDataSource.LOCAL_YUANTA_REALTIME,
         is_gap_recovery=False,
         created_at=start,
         updated_at=start,
@@ -280,7 +280,7 @@ def test_record_conflict_and_list_conflicted_trading_days(
     start, end = _ts(2026, 9, 16, 8, 45), _ts(2026, 9, 16, 9, 45)
     existing = _record(start, end, price="17500")
     repo.upsert_closed_bar(existing)
-    incoming = _yfinance_record(start, end, price="17999")
+    incoming = _conflicting_record(start, end, price="17999")
     assert repo.upsert_closed_bar(incoming) is BarUpsertOutcome.CONFLICT_REJECTED
 
     audit = BarConflictAudit(existing=existing, incoming=incoming, detected_at=Timestamp.now())
@@ -293,13 +293,12 @@ def test_record_conflict_and_list_conflicted_trading_days(
 
     # White-box check of the audit row's stored summary of both sides.
     row = repo._conn.execute(
-        "SELECT existing_source, existing_close, incoming_source, incoming_close "
-        "FROM bar_backfill_conflicts"
+        "SELECT existing_source, existing_close, incoming_source, incoming_close FROM bar_conflicts"
     ).fetchone()
     assert row == (
-        BarDataSource.POLLED_FROM_YFINANCE.value,
+        BarDataSource.LOCAL_YUANTA_REALTIME.value,
         "17500",
-        BarDataSource.BACKFILLED_FROM_YFINANCE.value,
+        BarDataSource.LOCAL_YUANTA_REALTIME.value,
         "17999",
     )
 
@@ -319,7 +318,7 @@ def test_list_conflicted_trading_days_respects_since_trading_day(
     start, end = _ts(2026, 5, 1, 8, 45), _ts(2026, 5, 1, 9, 45)
     existing = _record(start, end, price="17500")
     repo.upsert_closed_bar(existing)
-    incoming = _yfinance_record(start, end, price="17999")
+    incoming = _conflicting_record(start, end, price="17999")
     repo.upsert_closed_bar(incoming)
     repo.record_conflict(
         BarConflictAudit(existing=existing, incoming=incoming, detected_at=Timestamp.now())

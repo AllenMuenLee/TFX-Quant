@@ -20,9 +20,8 @@ from tfx_quant.domain.timestamp import Timestamp
 
 class ChannelId(StrEnum):
     """Mirrors `application.ports.broker_session.SessionCapabilities`'s five
-    independent flags, plus tracks each one's own timing/latency/error. SPARK API's
-    single unified session (see `docs/adr/0004-broker-session-architecture.md`)
-    currently makes several of these co-vary in practice, but they stay independently
+    independent flags, plus tracks each one's own timing/latency/error. The Yuanta
+    order and quote sessions make several of these co-vary in practice, but they stay independently
     modeled here per the "不以單一布林值代表所有連線" requirement, so a future
     vendor-confirmed independent failure mode (e.g. a genuinely separate market-data
     feed outage) needs no redesign."""

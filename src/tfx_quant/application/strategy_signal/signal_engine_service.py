@@ -9,10 +9,12 @@ flag tracked for it), which is exactly Feature 03's instrument-switch reset hook
 Feature 08's manual-sync reset hook, now with a real body instead of
 `NullBarSignalStateStore`'s no-op.
 
-**Order price**: this codebase's market data is yfinance-hourly-poll only (see
-`docs/adr/0006`) — there is no live tick/quote feed anywhere, so the *only* price this
-engine (or this service) ever has is the triggering bar's close, carried on every
-`StrategyDecision.current_price`. Every submitted order uses that price.
+**Order price**: this engine only ever decides on closed 60-minute bars (see
+`docs/adr/0006`) — even though the desktop UI separately shows a live Yuanta quote
+feed for display/staleness purposes, this engine and this service never read it. The
+*only* price this engine (or this service) ever has is the triggering bar's close,
+carried on every `StrategyDecision.current_price`. Every submitted order uses that
+price.
 
 **Submission path**: every signal (`ENTER_*`/`ADD_*`/`EXIT_ALL`) goes straight through
 `OrderManager.submit()`, never through `ScalingService`/`ReversalWorkflowService`. Those
@@ -62,6 +64,7 @@ from tfx_quant.domain.instrument import Instrument
 from tfx_quant.domain.money import Price
 from tfx_quant.domain.order import OrderKind, TimeInForce
 from tfx_quant.domain.quantity import Quantity
+from tfx_quant.domain.risk import is_within_no_entry_window
 from tfx_quant.domain.side import Side
 from tfx_quant.domain.signal import SignalKind
 from tfx_quant.domain.strategy_signal_engine import (
@@ -72,6 +75,18 @@ from tfx_quant.domain.strategy_signal_engine import (
 )
 from tfx_quant.domain.timestamp import Timestamp
 from tfx_quant.telemetry import get_logger, log_info, log_warning
+
+RiskEntryWindowGate = Callable[[Timestamp], "str | None"]
+
+
+def _default_risk_entry_window_gate(now: Timestamp) -> str | None:
+    """Used only when no `risk_gate` is wired in — still independently derived from
+    `domain.risk`'s own module-level default band, a second call site from the strategy
+    engine's own internal `entry_gate_open` check, not a fallback that silently disables
+    the gate. See `application.risk.risk_supervisor.RiskSupervisor.validate_entry_window`
+    for the fully-wired version composition.py uses in production."""
+    return "位於 04:55-10:45 禁入時段，禁止建倉／加碼" if is_within_no_entry_window(now) else None
+
 
 _logger = get_logger(__name__)
 
@@ -127,6 +142,7 @@ class StrategySignalEngineService:
         event_bus: EventBus,
         selected_account: SelectedAccount,
         engine_config: EngineConfig | None = None,
+        risk_gate: RiskEntryWindowGate | None = None,
         clock_interval_seconds: float = _DEFAULT_CLOCK_INTERVAL_SECONDS,
     ) -> None:
         self._order_manager = order_manager
@@ -135,6 +151,7 @@ class StrategySignalEngineService:
         self._event_bus = event_bus
         self._selected_account = selected_account
         self._engine_config = engine_config
+        self._risk_gate = risk_gate if risk_gate is not None else _default_risk_entry_window_gate
         self._clock_interval_seconds = clock_interval_seconds
         self._lock = threading.RLock()
         self._engines: dict[_EngineKey, StrategySignalEngine] = {}
@@ -225,6 +242,14 @@ class StrategySignalEngineService:
     # -- Event handlers ---------------------------------------------------------------------
 
     def _on_bar_closed(self, event: BarClosed) -> None:
+        if event.instrument is not Instrument.MXF:
+            log_info(
+                _logger,
+                "strategy_signal_skipped_view_only_market",
+                instrument=event.instrument.value,
+                contract=event.contract.code,
+            )
+            return
         key = (event.instrument, event.contract)
         with self._lock:
             engine = self._engines.get(key)
@@ -320,6 +345,21 @@ class StrategySignalEngineService:
             )
             return
         shape = _order_shape_for(decision)
+        if shape.kind is OrderKind.OPEN:
+            # Independent, strategy-engine-agnostic risk gate — Feature 10's job. Never
+            # blocks a CLOSE (risk-driven exits are never subject to the no-entry
+            # window). Kept as a second, separately-derived check on top of the
+            # strategy engine's own `entry_gate_open`, not a replacement for it.
+            risk_reason = self._risk_gate(decision.at)
+            if risk_reason is not None:
+                log_warning(
+                    _logger,
+                    "strategy_signal_order_submit_blocked_by_risk_gate",
+                    decision_id=decision.decision_id,
+                    rule=decision.rule,
+                    reason=risk_reason,
+                )
+                return
         request = OrderRequest(
             account=account,
             instrument=instrument,

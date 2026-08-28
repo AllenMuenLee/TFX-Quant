@@ -131,8 +131,8 @@ class OrderReport:
     """One broker order-level report snapshot (ack/reject/cancel-confirm/...).
 
     `broker_seq_no` is a per-order monotonic sequence number this codebase assumes the
-    broker (or, until a real vendor adapter exists, the mock adapter) assigns — real SPARK
-    API order-report sequencing is unverified; see docs/adr/0008."""
+    local adapter assigns as callbacks are ingested. It is local ordering, not a broker
+    sequence claim."""
 
     client_order_id: ClientOrderId
     status: OrderStatus

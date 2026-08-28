@@ -108,9 +108,9 @@ class StrategyDecision:
     bar_end: Timestamp | None
     current_price: Decimal | None
     """The last closed bar's close price at the time of this evaluation — the only
-    price this engine ever sees (no tick/quote feed exists in this codebase's
-    yfinance-poll market-data design). Callers submitting an order for a signal use
-    this as the order price."""
+    price this engine ever sees, even though a live Yuanta quote feed exists elsewhere
+    in this codebase for display/staleness purposes (this engine never reads it).
+    Callers submitting an order for a signal use this as the order price."""
     candle_color: CandleColor | None
     streak_color: CandleColor | None
     streak_length: int

@@ -8,10 +8,10 @@ the `OrderReportReceived`/`FillReceived` events an implementation publishes late
 `query_order_reports`/`query_fills` back the startup/reconnect reconciliation sweep in
 `application.order_management.order_manager.OrderManager`.
 
-Only `infrastructure.yuanta` may ever import vendor (`pythonnet`/`YuantaOneAPI`) types;
+Only `infrastructure.yuanta` may ever import vendor COM/ActiveX types;
 everything else, including the desktop composition root, depends on this Protocol. There
-is no quote/market-data gateway here — market data comes entirely from `yfinance` (see
-`application.ports.yahoo_history_query.YahooHistoryQueryPort`), never this vendor.
+is no quote/market-data surface in this trading port; quotes use the separate
+`QuoteGateway` port.
 """
 
 from __future__ import annotations
@@ -25,11 +25,19 @@ from tfx_quant.domain.order_state_machine import OrderReport
 from tfx_quant.domain.position import Position
 
 
+class OrderQueryNotReadyError(RuntimeError):
+    """`query_open_orders()` cannot yet give a safe answer — either the broker's order
+    query has never completed for this session, or an order's status could not be
+    resolved. Callers must fail closed and never assume "no open orders"."""
+
+
 class TradeGatewayPort(Protocol):
     def is_logged_in(self) -> bool: ...
 
     def query_open_orders(self) -> Sequence[Order]:
-        """Used by the safety checklist's "no unknown orders" check."""
+        """Used by the safety checklist's "no unknown orders" check. Must raise
+        `OrderQueryNotReadyError` rather than returning an empty sequence whenever
+        "zero open orders" isn't a confirmed fact yet."""
         ...
 
     def query_positions(self) -> Sequence[Position]:

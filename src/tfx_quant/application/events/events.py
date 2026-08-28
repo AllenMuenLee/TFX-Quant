@@ -27,6 +27,7 @@ from tfx_quant.domain.reversal_workflow import (
     ReversalWorkflowId,
     ReversalWorkflowState,
 )
+from tfx_quant.domain.risk import EodFlattenTrigger, EodFlattenWorkflowId, EodFlattenWorkflowState
 from tfx_quant.domain.strategy_state import StrategyState
 from tfx_quant.domain.timestamp import Timestamp
 
@@ -90,8 +91,9 @@ class OrderRequiresManualReview(Event):
 
 @dataclass(frozen=True, slots=True)
 class BrokerLoginSucceeded(Event):
-    """SPARK API's `Login` result (`OnResponse`, `strIndex == 'Login'`) reported
-    success. `accounts` is the parsed, futures-only account list — session-ready still
+    """The Yuanta order OCX login callback reported success.
+
+    `accounts` is the parsed, futures-only account list — session-ready still
     requires the safety queries + market data subscription too."""
 
     accounts: tuple[TradingAccount, ...]
@@ -154,9 +156,9 @@ class BrokerCapabilitiesChanged(Event):
 @dataclass(frozen=True, slots=True)
 class BrokerSessionReady(Event):
     """Login, order query, fill query, and position query all succeeded — every
-    `SessionCapabilities` flag is now true. Market data (`yfinance`) is a wholly
-    separate readiness concern — see `desktop.composition.compute_readiness` — and is
-    not part of this event or `SessionCapabilities`."""
+    `SessionCapabilities` flag is now true. Yuanta quote-API readiness is a wholly
+    separate concern — see `desktop.composition.compute_readiness` — and is not part
+    of this event or `SessionCapabilities`."""
 
     account: TradingAccount
 
@@ -164,8 +166,9 @@ class BrokerSessionReady(Event):
 @dataclass(frozen=True, slots=True)
 class InstrumentSwitchCompleted(Event):
     """`InstrumentSelectionService.switch_to()` succeeded — account status requeried,
-    bar/signal state cleared (which points `MarketDataBarService`'s poll loop at the
-    newly selected contract's Yahoo ticker mapping). The strategy state machine is left
+    bar/signal state cleared, and `vendor_symbol` carried here so
+    `desktop.quote_runtime.QuoteRuntime._on_switch` can re-register the live Yuanta
+    quote symbol for the newly selected contract. The strategy state machine is left
     in whatever paused/stopped state it was already in; per Feature 03's acceptance
     criteria the user must still press start again (Running is only ever reachable via
     a fresh Starting)."""
@@ -235,26 +238,6 @@ class BarRetentionCleanupCompleted(Event):
 
     cutoff_trading_day: date
     deleted_count: int
-
-
-@dataclass(frozen=True, slots=True)
-class BarBackfillCompleted(Event):
-    """One `BarHistoryBackfillService` run finished for `(instrument, contract)` — the
-    "audit 摘要" for the yfinance backfill, symmetric with
-    `BarRetentionCleanupCompleted`. `requested_bar_count` is how many canonical 60-
-    minute bar identities in the rolling two-month window had no locally-recorded bar
-    when this run started; `filled_bar_count` is how many of those actually got written
-    this run (the rest remain gaps — a missing ticker mapping, an empty/error yfinance
-    response, or a bar that fails boundary alignment is never retried synchronously,
-    only on the next trigger). `conflict_count` is how many attempted writes this run
-    hit a `CONFLICT_REJECTED` outcome against an existing local bar — see
-    `domain.bar_record.BarConflictAudit`."""
-
-    instrument: Instrument
-    contract: ContractMonth
-    requested_bar_count: int
-    filled_bar_count: int
-    conflict_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -392,6 +375,58 @@ class ConnectivityReconciled(Event):
     Never itself resumes `RUNNING`."""
 
     record: SafePauseRecord
+
+
+@dataclass(frozen=True, slots=True)
+class EodFlattenWorkflowStarted(Event):
+    """A Feature 10 flatten workflow began (`EodFlattenWorkflowState.STARTED`
+    persisted) — the mandatory 04:55 forced flatten or an operator-confirmed emergency
+    flatten. Published once per `trigger_key`, never on a deduped resubmission."""
+
+    workflow_id: EodFlattenWorkflowId
+    trigger: EodFlattenTrigger
+    account: TradingAccount
+    instrument: Instrument
+    contract: ContractMonth
+    trigger_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class EodFlattenCompleted(Event):
+    """A flatten workflow reached `EodFlattenWorkflowState.COMPLETED` — a fresh broker
+    position query independently confirmed exactly zero after the close order's fill
+    report, never inferred from the fill report alone."""
+
+    workflow_id: EodFlattenWorkflowId
+
+
+@dataclass(frozen=True, slots=True)
+class EodFlattenPausedSafe(Event):
+    """A flatten workflow moved to `EodFlattenWorkflowState.PAUSED_SAFE` — a reject,
+    unexpected cancel, timeout/`UNKNOWN`, disconnect, or a contradictory final position
+    query. Fires reliably; never auto-resumes, same "PAUSED_SAFE is terminal" philosophy
+    as `ReversalPausedSafe`. This is the highest-priority alert in the codebase — it
+    means the mandatory 04:55 (or emergency) flatten did *not* complete and a position
+    may still be open."""
+
+    workflow_id: EodFlattenWorkflowId
+    state: EodFlattenWorkflowState
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class StartupPositionSafetyPauseTriggered(Event):
+    """The process started (or reconnected for the first time) already inside the
+    04:55-10:45 no-entry band with a non-zero broker-confirmed position —
+    `RiskSupervisor` never auto-flattens this case; it only forces a safe pause and
+    requires the operator to use the emergency-flatten control. See the implementation
+    prompt's "若程式在 04:55 之後啟動且有持倉，保持安全暫停並提示人工執行緊急平倉"."""
+
+    account: TradingAccount
+    instrument: Instrument
+    contract: ContractMonth
+    net: NetPosition
+    resulting_strategy_state: str | None
 
 
 @dataclass(frozen=True, slots=True)

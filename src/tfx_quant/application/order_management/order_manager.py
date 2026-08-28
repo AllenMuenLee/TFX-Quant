@@ -39,6 +39,7 @@ from tfx_quant.application.order_management.errors import (
     ActiveWorkflowInProgressError,
     OrderExposureExceededError,
     OrderNotFoundError,
+    UnsupportedTradeInstrumentError,
 )
 from tfx_quant.application.order_management.validation import validate_exposure_within_cap
 from tfx_quant.application.ports.clock import Clock
@@ -168,6 +169,14 @@ class OrderManager:
 
     def submit(self, request: OrderRequest) -> OrderIntent:
         with self._lock:
+            if request.instrument is not Instrument.MXF:
+                log_warning(
+                    _logger,
+                    "order_submit_rejected_non_mxf",
+                    requested_instrument=request.instrument.value,
+                    contract=request.contract.code,
+                )
+                raise UnsupportedTradeInstrumentError("交易商品固定為小台指（MXF）")
             existing = self._order_repository.find_by_idempotency_key(request.idempotency_key)
             if existing is not None:
                 log_info(
@@ -221,6 +230,7 @@ class OrderManager:
             log_info(
                 _logger,
                 "order_intent_persist_result",
+                audit=True,
                 local_order_id=str(intent.local_order_id.value),
                 workflow_id=intent.workflow_id,
                 idempotency_key=intent.idempotency_key,
@@ -241,10 +251,16 @@ class OrderManager:
 
             machine = OrderStateMachine(intent)
             submitting = machine.mark_submitting(at=self._clock.now())
-            self._order_repository.update_intent(submitting)
+            stage = getattr(self._order_repository, "stage_submission", None)
+            if callable(stage):
+                stage(submitting)
+            else:
+                self._order_repository.update_intent(submitting)
             log_info(
                 _logger,
                 "order_state_transitioned",
+                audit=True,
+                workflow_id=submitting.workflow_id,
                 trigger="submit",
                 local_order_id=str(submitting.local_order_id.value),
                 client_order_id=str(submitting.client_order_id.value),
@@ -264,8 +280,15 @@ class OrderManager:
                 time_in_force=request.time_in_force,
             )
             try:
+                checkpoint = getattr(self._order_repository, "mark_outbox_checkpoint", None)
+                if callable(checkpoint):
+                    checkpoint(submitting.local_order_id, "BROKER_CALL_STARTED")
                 self._trade_gateway.submit_order(order, client_order_id=client_order_id)
+                if callable(checkpoint):
+                    checkpoint(submitting.local_order_id, "BROKER_CALL_RETURNED")
             except Exception as exc:  # noqa: BLE001 - never let an ambiguous send-result propagate
+                if callable(checkpoint):
+                    checkpoint(submitting.local_order_id, "BROKER_CALL_FAILED")
                 unknown = OrderStateMachine(submitting).mark_unknown(
                     at=self._clock.now(), reason=f"trade_gateway.submit_order raised: {exc}"
                 )
@@ -273,6 +296,8 @@ class OrderManager:
                 log_error(
                     _logger,
                     "order_submit_gateway_call_failed",
+                    audit=True,
+                    workflow_id=unknown.workflow_id,
                     local_order_id=str(unknown.local_order_id.value),
                     client_order_id=str(unknown.client_order_id.value),
                     error_type=type(exc).__name__,
@@ -309,6 +334,8 @@ class OrderManager:
             log_info(
                 _logger,
                 "order_state_transitioned",
+                audit=True,
+                workflow_id=updated.workflow_id,
                 trigger="cancel_requested",
                 local_order_id=str(updated.local_order_id.value),
                 client_order_id=str(updated.client_order_id.value),
@@ -379,6 +406,8 @@ class OrderManager:
             log_error(
                 _logger,
                 "order_transition_illegal",
+                audit=True,
+                workflow_id=record.workflow_id,
                 kind=kind,
                 local_order_id=str(record.local_order_id.value),
                 client_order_id=str(client_order_id.value),
@@ -403,6 +432,8 @@ class OrderManager:
             log_info(
                 _logger,
                 "order_event_duplicate_or_out_of_order",
+                audit=True,
+                workflow_id=record.workflow_id,
                 kind=kind,
                 local_order_id=str(record.local_order_id.value),
                 client_order_id=str(client_order_id.value),
@@ -416,6 +447,8 @@ class OrderManager:
         log_info(
             _logger,
             "order_state_transitioned",
+            audit=True,
+            workflow_id=updated.workflow_id,
             trigger=kind,
             local_order_id=str(updated.local_order_id.value),
             client_order_id=str(updated.client_order_id.value),
@@ -468,6 +501,8 @@ class OrderManager:
                 log_warning(
                     _logger,
                     "order_timeout_marked_unknown",
+                    audit=True,
+                    workflow_id=updated.workflow_id,
                     local_order_id=str(updated.local_order_id.value),
                     client_order_id=str(updated.client_order_id.value),
                     previous_status=record.status.value,
@@ -492,6 +527,8 @@ class OrderManager:
         log_info(
             _logger,
             "order_timeout_follow_up_decision",
+            audit=True,
+            workflow_id=record.workflow_id,
             local_order_id=str(record.local_order_id.value),
             client_order_id=str(record.client_order_id.value),
             resolved_by_query=resolved,
@@ -551,6 +588,8 @@ class OrderManager:
         log_info(
             _logger,
             "order_reconciliation_result",
+            audit=True,
+            workflow_id=record.workflow_id,
             local_order_id=str(record.local_order_id.value),
             client_order_id=str(record.client_order_id.value),
             matched_report_count=len(matching_reports),

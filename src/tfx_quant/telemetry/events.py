@@ -32,6 +32,8 @@ from contextvars import ContextVar, Token
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
+from tfx_quant.telemetry.diagnostics import diagnostic_mode
+
 _TAIPEI = timezone(timedelta(hours=8))
 
 _sequence_lock = threading.Lock()
@@ -92,6 +94,7 @@ def log_event(
     *,
     correlation_id: str | None = None,
     workflow_id: str | None = None,
+    audit: bool = False,
     **fields: Any,
 ) -> None:
     """Emits one structured record: a JSON object (event name, sequence number, UTC +
@@ -107,7 +110,12 @@ def log_event(
     No-ops without formatting the payload when `logger` is not enabled for `level`,
     so a DEBUG-heavy call site (e.g. per-tick diagnostics) costs nothing at INFO.
     """
-    if not logger.isEnabledFor(level):
+    resolved_workflow_id = workflow_id if workflow_id is not None else _workflow_id.get()
+    diagnostic_override = level == logging.DEBUG and diagnostic_mode.allows(
+        workflow_id=resolved_workflow_id,
+        order_id=_order_id_from(fields),
+    )
+    if not logger.isEnabledFor(level) and not diagnostic_override:
         return
     now_utc = datetime.now(UTC)
     payload: dict[str, Any] = {
@@ -116,27 +124,42 @@ def log_event(
         "ts_utc": now_utc.isoformat(),
         "ts_taipei": now_utc.astimezone(_TAIPEI).isoformat(),
         "correlation_id": correlation_id if correlation_id is not None else _correlation_id.get(),
-        "workflow_id": workflow_id if workflow_id is not None else _workflow_id.get(),
+        "workflow_id": resolved_workflow_id,
+        "audit": audit,
         **fields,
     }
-    logger.log(level, json.dumps(payload, default=str, ensure_ascii=False))
+    message = json.dumps(payload, default=str, ensure_ascii=False)
+    if diagnostic_override and not logger.isEnabledFor(level):
+        # Logger._log creates and handles a DEBUG LogRecord without changing the
+        # process-wide level. This limits elevated detail to the selected target.
+        logger._log(level, message, ())
+    else:
+        logger.log(level, message)
 
 
-def log_debug(logger: logging.Logger, event: str, **fields: Any) -> None:
-    log_event(logger, logging.DEBUG, event, **fields)
+def _order_id_from(fields: dict[str, Any]) -> str | None:
+    for name in ("order_id", "client_order_id", "local_order_id", "broker_order_no"):
+        value = fields.get(name)
+        if value is not None:
+            return str(value)
+    return None
 
 
-def log_info(logger: logging.Logger, event: str, **fields: Any) -> None:
-    log_event(logger, logging.INFO, event, **fields)
+def log_debug(logger: logging.Logger, event: str, *, audit: bool = False, **fields: Any) -> None:
+    log_event(logger, logging.DEBUG, event, audit=audit, **fields)
 
 
-def log_warning(logger: logging.Logger, event: str, **fields: Any) -> None:
-    log_event(logger, logging.WARNING, event, **fields)
+def log_info(logger: logging.Logger, event: str, *, audit: bool = False, **fields: Any) -> None:
+    log_event(logger, logging.INFO, event, audit=audit, **fields)
 
 
-def log_error(logger: logging.Logger, event: str, **fields: Any) -> None:
-    log_event(logger, logging.ERROR, event, **fields)
+def log_warning(logger: logging.Logger, event: str, *, audit: bool = False, **fields: Any) -> None:
+    log_event(logger, logging.WARNING, event, audit=audit, **fields)
 
 
-def log_critical(logger: logging.Logger, event: str, **fields: Any) -> None:
-    log_event(logger, logging.CRITICAL, event, **fields)
+def log_error(logger: logging.Logger, event: str, *, audit: bool = False, **fields: Any) -> None:
+    log_event(logger, logging.ERROR, event, audit=audit, **fields)
+
+
+def log_critical(logger: logging.Logger, event: str, *, audit: bool = False, **fields: Any) -> None:
+    log_event(logger, logging.CRITICAL, event, audit=audit, **fields)

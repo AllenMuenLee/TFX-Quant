@@ -14,7 +14,7 @@
 - 使用本機可靠資料庫（例如 SQLite，依技術棧決定）保存 schema version、設定版本、bar ID、策略快照、order intents、委託／成交、position baseline、workflow、損益台帳與 audit events。
 - 對「先記錄 intent、再呼叫券商」提供 transaction/outbox 語意；提交前崩潰和提交後未收到回報必須可區分，但兩者都不能盲目重送。
 - 啟動一律進入非交易 recovery mode：登入、查活動委託／成交／持倉，與本地資料關聯，再產生 reconciliation report。
-- 任何未完成 workflow、提交中 intent、未知委託、持倉差異或資料庫損壞都保持安全暫停並要求人工確認。
+- 任何未完成 workflow、提交中 intent、未知委託、持倉差異、線上查詢失敗或資料庫損壞都保持安全暫停；不得由 UI 手動重新查詢或直接採納線上持倉覆寫 baseline。
 - 只有無未知狀態且同步完成後才可建立新 baseline；清除策略訊號狀態並由使用者重新啟動，不追補離線期間訊號。
 - 實作 migration、備份與完整性檢查。不得在未備份下破壞性升級；資料庫含敏感資料時採 Windows 存取控制／適當加密。
 

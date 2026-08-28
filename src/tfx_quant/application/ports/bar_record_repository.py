@@ -3,7 +3,7 @@
 `persistence.sqlite_bar_record_repository.SqliteBarRecordRepository` is the real
 implementation (SQLite, per this codebase's existing `persistence.sqlite_connection`
 factory). Only closed, validated bars are ever written here — see
-`application.market_data.bar_service.MarketDataBarService`, the only caller.
+`desktop.quote_runtime.QuoteRuntime`'s `LocalClosedBarWriter`, the only caller.
 """
 
 from __future__ import annotations
@@ -175,9 +175,8 @@ class BarRecordRepository(Protocol):
         since_trading_day: date,
     ) -> frozenset[date]:
         """Every trading day with at least one unresolved conflict audit row on or after
-        `since_trading_day` — used by `application.market_data.bar_service.
-        MarketDataBarService.continuous_warm_up_bars()` to exclude a conflicted day's
-        bars from the warm-up/signal-eligible continuity segment (the "阻擋該區段驅動
-        訊號" requirement), without `continuous_segments()` itself needing to know
-        anything about conflicts."""
+        `since_trading_day` — intended for a future strategy warm-up path to exclude a
+        conflicted day's bars from the signal-eligible continuity segment (the "阻擋該
+        區段驅動訊號" requirement), without `continuous_segments()` itself needing to
+        know anything about conflicts. Not yet consumed by any caller."""
         ...

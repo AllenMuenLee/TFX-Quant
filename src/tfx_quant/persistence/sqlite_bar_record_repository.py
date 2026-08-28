@@ -93,7 +93,7 @@ CREATE TABLE IF NOT EXISTS bar_record_revisions (
     reason TEXT NOT NULL,
     revised_at TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS bar_backfill_conflicts (
+CREATE TABLE IF NOT EXISTS bar_conflicts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     instrument TEXT NOT NULL,
     contract_year INTEGER NOT NULL,
@@ -115,8 +115,8 @@ CREATE TABLE IF NOT EXISTS bar_backfill_conflicts (
     incoming_volume INTEGER NOT NULL,
     detected_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_bar_backfill_conflicts_trading_day
-    ON bar_backfill_conflicts (instrument, contract_year, contract_month, period, trading_day);
+CREATE INDEX IF NOT EXISTS idx_bar_conflicts_trading_day
+    ON bar_conflicts (instrument, contract_year, contract_month, period, trading_day);
 """
 
 _SELECT_COLUMNS = (
@@ -461,7 +461,7 @@ class SqliteBarRecordRepository:
             with self._lock:
                 self._conn.execute(
                     """
-                    INSERT INTO bar_backfill_conflicts (
+                    INSERT INTO bar_conflicts (
                         instrument, contract_year, contract_month, period, start_at,
                         trading_day, existing_source, existing_open, existing_high,
                         existing_low, existing_close, existing_volume, incoming_source,
@@ -496,7 +496,7 @@ class SqliteBarRecordRepository:
             raise BarUpsertRepositoryError(f"bar conflict audit write failed: {exc}") from exc
         log_error(
             _logger,
-            "bar_backfill_conflict_recorded",
+            "bar_conflict_recorded",
             instrument=incoming.bar.instrument.value,
             contract=incoming.bar.contract.code,
             bar_start=incoming.bar.start.value.isoformat(),
@@ -514,7 +514,7 @@ class SqliteBarRecordRepository:
     ) -> frozenset[date]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT DISTINCT trading_day FROM bar_backfill_conflicts "
+                "SELECT DISTINCT trading_day FROM bar_conflicts "
                 "WHERE instrument = ? AND contract_year = ? AND contract_month = ? "
                 "AND period = ? AND trading_day >= ?",
                 (

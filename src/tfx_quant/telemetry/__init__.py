@@ -1,15 +1,14 @@
 """Structured, correlation-aware logging shared across every layer.
 
-This is deliberately a thin, dependency-free foundation (stdlib `logging` +
-`contextvars` only) — not the full Feature 13 (rolling files, DB audit table,
-retention, diagnostic mode, UI log browser). It exists so Features 01-05 can meet
-their own "除錯日誌需求" sections now; Feature 13 is expected to extend the sink
-side (handlers/formatters) without changing this call-site API.
+The call-site API stays deliberately small. Sink-side modules add the bounded UI
+buffer, SQLite audit persistence, failure-triggered safe pause, bounded diagnostic
+elevation, and reversal-chain export without coupling domain code to desktop code.
 
 Not on any `import-linter` forbidden-modules list for `domain`, `application`,
 `infrastructure`, or `persistence`, so every layer may import from here directly.
 """
 
+from tfx_quant.telemetry.diagnostics import DiagnosticMode, DiagnosticStatus, diagnostic_mode
 from tfx_quant.telemetry.events import (
     correlation_scope,
     current_correlation_id,
@@ -39,4 +38,7 @@ __all__ = [
     "log_warning",
     "mask_account",
     "new_correlation_id",
+    "DiagnosticMode",
+    "DiagnosticStatus",
+    "diagnostic_mode",
 ]

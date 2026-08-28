@@ -14,6 +14,7 @@ from tfx_quant.application.order_management.errors import (
     ActiveWorkflowInProgressError,
     OrderExposureExceededError,
     OrderNotFoundError,
+    UnsupportedTradeInstrumentError,
 )
 from tfx_quant.application.order_management.order_manager import OrderManager, OrderRequest
 from tfx_quant.domain.account import TradingAccount
@@ -136,6 +137,16 @@ def _manager(
 
 
 # -- Normal fill / synchronous callback -------------------------------------------------
+
+
+def test_non_mxf_order_is_rejected_before_persistence_or_gateway_call() -> None:
+    manager, gateway, repo, _bus = _manager()
+
+    with pytest.raises(UnsupportedTradeInstrumentError):
+        manager.submit(_request(instrument=Instrument.TXF))
+
+    assert repo.find_by_idempotency_key("key-1") is None
+    assert gateway.submitted_orders == []
 
 
 def test_normal_fill_reaches_filled_with_correct_avg_price() -> None:

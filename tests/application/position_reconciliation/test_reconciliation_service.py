@@ -258,6 +258,7 @@ def test_reconcile_matches_when_expected_and_actual_are_both_flat() -> None:
     assert record.discrepancy is DiscrepancyKind.NONE
     assert record.paused is False
     assert h.strategy_state_machine.state is StrategyState.RUNNING
+    assert h.strategy_state_machine.state is StrategyState.RUNNING
 
 
 def test_reconcile_skipped_when_no_instrument_selected() -> None:
@@ -348,9 +349,10 @@ def test_reconcile_logs_but_does_not_compare_other_contract_positions() -> None:
     h = _setup(positions=(_position(0, contract=_CONTRACT), _position(1, contract=_OTHER_CONTRACT)))
     record = h.service.reconcile(trigger=ReconciliationTrigger.TIMED_POLL)
     assert record is not None
-    assert record.discrepancy is DiscrepancyKind.NONE
+    assert record.discrepancy is DiscrepancyKind.OTHER_CONTRACT
     assert record.other_contract_position_count == 1
-    assert record.paused is False
+    assert record.paused is True
+    assert h.strategy_state_machine.state is StrategyState.PAUSED_SAFE
 
 
 def test_reconcile_query_failure_is_not_treated_as_a_discrepancy() -> None:
@@ -363,8 +365,8 @@ def test_reconcile_query_failure_is_not_treated_as_a_discrepancy() -> None:
     assert record.query_succeeded is False
     assert record.query_error == "timeout"
     assert record.actual_net is None
-    assert record.paused is False
-    assert h.strategy_state_machine.state is StrategyState.RUNNING
+    assert record.paused is True
+    assert h.strategy_state_machine.state is StrategyState.PAUSED_SAFE
     assert h.event_bus.published == []
 
 

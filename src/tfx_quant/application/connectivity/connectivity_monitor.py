@@ -13,7 +13,7 @@ with the operator's last-used `LoginRequest`.
 
 Never resumes `RUNNING` itself. Reaching `PAUSED_SAFE` — even once every channel is
 healthy again and a fresh `BrokerSessionReady` has re-triggered `OrderManager`/
-`PositionReconciliationService`/`BarHistoryBackfillService`'s own reconnect-
+`PositionReconciliationService` and the quote recorder's own reconnect-
 reconciliation — still requires a human to restart the strategy through `Starting`'s
 full safety checklist, exactly like every other safe-pause path in this codebase.
 `OrderManager`'s existing timeout/reconciliation logic already guarantees an order that
@@ -181,7 +181,7 @@ class ConnectivityMonitor:
         """Subscribes this monitor's *second* `BrokerSessionReady` handler — the one
         that marks an existing `SafePauseRecord` reconciled and publishes
         `ConnectivityReconciled` — call this LAST in `desktop/composition.py`, strictly
-        after `OrderManager`/`PositionReconciliationService`/`BarHistoryBackfillService`
+        after `OrderManager`, `PositionReconciliationService`, and the quote recorder
         have all been constructed (each subscribes its own `BrokerSessionReady` handler
         in its own `__init__`).
 
@@ -390,7 +390,7 @@ class ConnectivityMonitor:
         # `attach_reconnect_reconciliation_watcher()` (see
         # docs/adr/0011-connectivity-reconnect-and-safe-pause.md) — by the time this
         # handler runs, OrderManager/PositionReconciliationService/
-        # BarHistoryBackfillService's own `BrokerSessionReady` handlers (whose
+        # the quote recorder's own `BrokerSessionReady` handlers (whose
         # order/fill/position reconciliation calls are synchronous, all on this same
         # EventCoordinator dispatch thread) have already run for this event.
         now = self._clock.now()

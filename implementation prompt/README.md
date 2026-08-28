@@ -13,11 +13,11 @@
 
 ## 全域不可妥協規則
 
-- 最大淨持倉為 2 口，且只允許小台指或大台指其中一個目前選定商品。
+- 最大淨持倉為 2 口，交易商品固定且只允許小台指（MXF）；UI 的小台／大台切換只改變市場行情監看，不得改變委託商品。
 - 反手必須先收到原部位完全平倉的確定成交回報，再建立反向 1 口。
 - 部分成交、未成交逾時、拒單、斷線、委託狀態不明或持倉不一致時，進入安全暫停並等待人工確認。
 - 狀態不明的委託不得自動重送；所有送單必須具備冪等識別與可追蹤性。
-- 偵測手機 App 或其他來源造成的實際持倉異動時，自動暫停。人工同步後以元大實際持倉為基準，並重置策略判斷狀態。
+- 系統自動比較本機 expected position 與元大線上持倉；查詢失敗或偵測手機 App／其他來源造成的異動時自動安全暫停。UI 不提供人工重新查詢或人工同步按鈕。
 - 04:55 前執行收盤平倉流程，不留倉。08:45、09:45 不建立新倉，日盤最早 10:45 才能依 60 分 K 判斷建倉。
 - 金額、時間、契約、買賣別、口數及損益都需採明確型別；禁止用浮點數保存金額。
 
@@ -43,16 +43,16 @@
 | 00 | SPARK-to-Futures API migration | 移除舊 SPARK 設定並建立期貨交易 API 與 yfinance 設定基線 |
 | 01 | Solution foundation | Windows 技術棧、領域模型、模組界線與設定 |
 | 02 | Yuanta API session | 登入、憑證、帳號、API 執行緒與登出 |
-| 03 | Instrument selection | 小台／大台與契約月份選擇及切換保護 |
+| 03 | Instrument selection | 小台／大台行情切換與自動近月顯示；交易固定 MXF |
 | 04 | Market data and bars | yfinance 行情、60 分 K 正規化與交易時段 |
 | 05 | Strategy signal engine | 連續紅黑 K、加碼與進場時段規則 |
 | 06 | Order/fill state machine | 委託、成交、部分成交、拒單與冪等防護 |
 | 07 | Safe reversal/scaling | 完全平倉後反手、最多 2 口 |
-| 08 | Position reconciliation | 實際持倉核對、外部交易偵測、人工同步 |
+| 08 | Position reconciliation | 自動持倉核對、查詢／差異異常安全暫停 |
 | 09 | Connectivity/safe pause | 斷線、重連、狀態不明與安全暫停 |
 | 10 | Risk/EOD/emergency | 04:55 平倉、緊急平倉與風險閘門 |
 | 11 | P&L/reports | 每日、每月實際成交損益與明細 |
-| 12 | Windows UI | 啟動、停止、暫停、監控與人工操作 |
+| 12 | Windows UI | 啟動、停止、暫停、監控、緊急操作與一般文字日誌視窗 |
 | 13 | Logging/audit | 錯誤、交易紀錄與可稽核事件鏈 |
 | 14 | Persistence/recovery | 重啟恢復、快照與未決委託保守處理 |
 | 15 | Simulation/tests | 模擬 API、歷史回放、故障注入與驗收測試 |

@@ -24,7 +24,7 @@ from tfx_quant.domain.position import Position
 from tfx_quant.domain.quantity import Quantity
 from tfx_quant.domain.side import Side
 from tfx_quant.domain.timestamp import Timestamp
-from tfx_quant.infrastructure.yuanta.session_orchestrator import EventPublisher
+from tfx_quant.infrastructure.yuanta.event_publisher import EventPublisher
 
 OnSubmit = Callable[["MockTradeGateway", Order, ClientOrderId], None]
 

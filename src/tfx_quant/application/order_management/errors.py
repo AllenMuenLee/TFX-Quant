@@ -23,3 +23,7 @@ class OrderExposureExceededError(OrderManagementError):
 class OrderNotFoundError(OrderManagementError):
     """`OrderManager.cancel` was called for a `ClientOrderId` with no matching local
     intent."""
+
+
+class UnsupportedTradeInstrumentError(OrderManagementError):
+    """An order attempted to trade anything other than Mini-TAIEX futures (MXF)."""

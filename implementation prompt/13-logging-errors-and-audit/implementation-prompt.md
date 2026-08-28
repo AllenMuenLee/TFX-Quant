@@ -9,22 +9,23 @@
 
 建立結構化、可搜尋且不可混淆順序的執行紀錄，支援問題診斷、交易稽核與 UI 顯示，同時保護帳密與個資。
 
-## 必須實作
+## 必須實作（依目前程式邊界）
 
-- 定義事件分類：session、market data、bar、strategy decision、risk decision、order intent、broker request、order report、fill、position query、reconciliation、user action、system/error。
-- 每筆事件含 UTC 與台北時間、單調序號、severity、correlation/workflow ID、策略狀態、商品契約及結構化 payload；保存原始券商錯誤碼但遮蔽敏感資料。
-- 策略每次「有動作或無動作」都記錄輸入 bar ID、持倉、規則結果及阻擋原因，讓事後能重現決策。
-- 使用 rolling files 與資料庫 audit table；設定保存期限、容量上限與匯出功能。log 寫入失敗需告警，關鍵交易 audit 無法持久化時安全暫停。
-- 全域例外處理不得吞錯；將技術錯誤轉為可行動的繁中訊息，同時保留 stack trace 供支援人員查閱。
-- UI 顯示目前錯誤與歷史紀錄，可依時間、severity、商品、order/workflow ID 篩選。
-- 記錄使用者的啟動、暫停、停止、同步、緊急平倉及確認內容，但不記錄密碼／憑證／完整帳號。
+- 使用 Python `logging` 輸出結構化 JSON event；每筆包含 UTC、台北時間、process-wide 單調序號、correlation ID、workflow ID 與呼叫端提供的結構化欄位。
+- 提供 DEBUG／INFO／WARNING／ERROR／CRITICAL helper；無法 JSON 原生序列化的 domain value 以 `str()` 降級，logging 不得使業務流程崩潰。
+- 帳號只保留末四碼，其餘遮罩；密碼及憑證只記錄是否存在，不記錄內容。敏感欄位仍由呼叫端在進入 telemetry API 前遮罩。
+- UI 提供「查看所有日誌」按鈕及獨立視窗，顯示本次啟動後的日誌。使用一般單行時間／severity／來源／訊息格式、持續更新、可捲動，並以 10,000 筆有界記憶體緩衝保存。
+- 使用 SQLite `audit_events` 保存結構化事件。反手 workflow 的生命週期事件標記為 critical audit；critical audit 寫入失敗時輸出獨立 stderr 告警，並透過既有 `attempt_safe_pause()` 將策略轉為 `PAUSED_SAFE`（若狀態只能 fault，則轉為 `FAULTED`）。普通診斷事件寫入失敗不得觸發策略暫停。
+- 提供受控診斷模式，只能指定一個 workflow ID 或 order ID，提高該目標的 DEBUG 詳細度；每次啟用必須同時具有自動到期時間及最大事件筆數，任一限制到達後立即失效，不改變全域 logger level。
+- 提供反手 workflow 匯出：以 workflow ID 查詢 `audit_events`，按全域單調序號輸出 UTF-8 JSON Lines。匯出應包含相同 workflow ID 的反手啟動、起始持倉查詢、平倉委託、委託回報／成交、零持倉確認、反向建倉與完成事件；查無資料時明確失敗，不產生空白匯出。
 
-## 除錯日誌需求
+## 明確不在本 Feature 範圍
 
-- 定義並文件化 DEBUG／INFO／WARNING／ERROR／CRITICAL 的使用準則、事件 schema、必要欄位、event-name catalog、correlation 傳播規則與 payload 版本；schema 驗證失敗本身也須可觀測。
-- 記錄 logger 啟動、sink readiness、queue depth、批次寫入耗時、輪替、保留清理、drop／sampling 數及 file/database sink 失敗；關鍵 audit 寫入失敗須有獨立告警與安全暫停事件。
-- 提供受控診斷模式以提高特定 workflow／order ID 的詳細度，須有自動到期與容量上限；測試證明密碼、token、完整帳號及敏感 exception/payload 在所有 sink、匯出與 stack trace 中皆被遮蔽。
+- rolling file、非同步 queue、batch、sampling/drop metrics、保存期限與 retention cleanup。
+- 強制 event-name catalog、事件分類 enum、payload schema/version 驗證及遞迴 sink-side redaction。
+- 全域例外 hook、繁中錯誤轉譯，以及 stack trace 的自動敏感資料清洗。
+- 通用 audit UI 或匯出 UI；本 Feature 僅提供可由 application/UI 呼叫的反手 JSONL 匯出函式。
 
 ## 驗收
 
-測試高頻行情下不阻塞交易佇列、檔案輪替、磁碟滿、資料庫鎖定、敏感欄位遮蔽、跨 thread 事件排序及 correlation chain。從一個反手案例的匯出紀錄應能完整追到 K 棒、策略意圖、平倉、零持倉確認與反向建倉。
+測試 UTC／台北時間、單調序號、correlation scope、UI 單行 formatter、帳號遮罩、critical 與 non-critical audit 寫入失敗的不同結果、診斷模式到期與容量上限，以及反手 workflow JSONL 匯出的 workflow 隔離與序號順序。完整反手案例應可追到反手啟動／trigger key、起始持倉、平倉委託與成交、零持倉確認、反向建倉及完成；目前不要求直接嵌入原始 K 棒 payload。

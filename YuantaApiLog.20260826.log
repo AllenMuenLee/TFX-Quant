@@ -1,0 +1,20 @@
+20260826 10:04:44.743 YuantaOrd 1.6.1.3 for ActiveX control
+20260826 10:04:44.743 Create
+20260826 10:04:44.756 SetWaitOrdResult(0)
+20260826 10:04:44.756 SetFutOrdConnection(E123663395,pw,apitest.yuantafutures.com.tw,80)
+20260826 10:04:44.776 return: 3
+20260826 10:04:55.014 OnLogonS(-1,NULL,NULL,NULL)
+
+20260826 10:13:02.339 YuantaOrd 1.6.1.3 for ActiveX control
+20260826 10:13:02.339 Create
+20260826 10:13:02.344 SetWaitOrdResult(0)
+20260826 10:13:02.344 SetFutOrdConnection(E123663395,pw,apitest.yuantafutures.com.tw,80)
+20260826 10:13:02.357 return: 3
+20260826 10:13:12.533 OnLogonS(-1,NULL,NULL,NULL)
+
+20260826 10:31:22.984 YuantaOrd 1.6.1.3 for ActiveX control
+20260826 10:31:22.984 Create
+20260826 10:31:22.988 SetWaitOrdResult(0)
+20260826 10:31:22.989 SetFutOrdConnection(E123663395,pw,api.yuantafutures.com.tw,443)
+20260826 10:31:23.000 return: 3
+20260826 10:31:23.502 OnLogonS(4,ß‰§£®Ï√±≥πæÃ√“!,NULL,NULL)

@@ -135,6 +135,7 @@ class PositionReconciliationService:
         self._timer: threading.Timer | None = None
         self._running = False
         self._has_completed_first_session_ready = False
+        self._last_record: ReconciliationRecord | None = None
 
         event_bus.subscribe(FillReceived, self._on_fill)
         event_bus.subscribe(BrokerSessionReady, self._on_session_ready)
@@ -172,6 +173,12 @@ class PositionReconciliationService:
         """Public so tests can drive the timed-poll trigger directly, without a real
         timer — same convention as `OrderManager.on_clock_tick`."""
         self.reconcile(trigger=ReconciliationTrigger.TIMED_POLL)
+
+    @property
+    def last_record(self) -> ReconciliationRecord | None:
+        """Most recent automatic broker/local comparison for read-only UI display."""
+        with self._lock:
+            return self._last_record
 
     # -- OrderManager's position_lookup seam ---------------------------------------------
 
@@ -283,13 +290,15 @@ class PositionReconciliationService:
                 return None
             resolved_account, resolved_instrument, resolved_contract = target
             with self._lock:
-                return self._run(
+                record = self._run(
                     trigger,
                     resolved_account,
                     resolved_instrument,
                     resolved_contract,
                     correlation_id,
                 )
+                self._last_record = record
+                return record
 
     def _resolve_target(
         self,
@@ -339,6 +348,12 @@ class PositionReconciliationService:
                 error_type=type(exc).__name__,
                 error=str(exc),
             )
+            current_state = self._strategy_state_machine.state
+            query_failure_state = (
+                attempt_safe_pause(self._strategy_state_machine)
+                if current_state is StrategyState.RUNNING
+                else current_state
+            )
             return ReconciliationRecord(
                 correlation_id=correlation_id,
                 query_id=query_id,
@@ -353,8 +368,10 @@ class PositionReconciliationService:
                 has_active_or_unknown_orders=False,
                 active_or_unknown_order_count=0,
                 other_contract_position_count=0,
-                paused=False,
-                resulting_strategy_state=None,
+                paused=True,
+                resulting_strategy_state=(
+                    query_failure_state.value if query_failure_state is not None else None
+                ),
                 possible_causes=(),
                 query_duration_seconds=duration,
                 query_error=str(exc),
@@ -375,6 +392,10 @@ class PositionReconciliationService:
         )
         has_active_or_unknown = bool(active_orders)
         discrepancy = classify_discrepancy(expected_net, actual_net)
+        if discrepancy is DiscrepancyKind.NONE and any(
+            not position.net.is_flat for position in other_positions
+        ):
+            discrepancy = DiscrepancyKind.OTHER_CONTRACT
 
         log_info(
             _logger,

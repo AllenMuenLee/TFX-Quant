@@ -14,10 +14,8 @@ from datetime import time
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ValidationError, field_validator
 
-from tfx_quant.domain.contract import ContractMonth
-from tfx_quant.domain.errors import DomainError
 from tfx_quant.domain.instrument import Instrument
 from tfx_quant.domain.quantity import MAX_LOTS
 
@@ -32,7 +30,6 @@ class Environment(StrEnum):
 
 class ContractSelectionMode(StrEnum):
     AUTO = "AUTO"
-    MANUAL = "MANUAL"
 
 
 class SettingsValidationError(ValueError):
@@ -47,9 +44,7 @@ class TradingSettings(BaseModel):
     """A non-secret label (e.g. "primary"), never the raw broker account number."""
     environment: Environment
     selected_instrument: Instrument
-    contract_selection_mode: ContractSelectionMode
-    manual_contract_year: int | None = None
-    manual_contract_month: int | None = None
+    contract_selection_mode: ContractSelectionMode = ContractSelectionMode.AUTO
     timezone_id: str = REQUIRED_TIMEZONE_ID
     eod_flatten_local_time: time = REQUIRED_EOD_FLATTEN_TIME
     max_net_lots: int = MAX_LOTS
@@ -64,14 +59,6 @@ class TradingSettings(BaseModel):
     holiday dates are a best-effort web-search seed, not yet confirmed against TAIFEX's
     official calendar (see `infrastructure/market_data/trading_calendar.example.json`'s
     own warning)."""
-    yahoo_ticker_mapping_path: str | None = None
-    """Path to the controlled 內部商品／契約 -> Yahoo ticker JSON file (see
-    `application.ports.yahoo_ticker_mapping`). `None` falls back to the bundled
-    example/seed file, whose `mappings` array is deliberately empty — no confirmed
-    Yahoo Finance ticker for any TAIFEX futures contract has been verified (see
-    `infrastructure/market_data/yahoo_ticker_mapping.example.json`'s own warning), so
-    the yfinance backfill simply finds nothing to query until an operator supplies a
-    real, confirmed mapping."""
     market_data_db_path: str | None = None
     """Path to the SQLite database file this software persists its own self-aggregated
     two-month 60-minute bar history to (see `application.ports.bar_record_repository`
@@ -102,6 +89,15 @@ class TradingSettings(BaseModel):
     Windows) — see `desktop.composition._resolve_position_baseline_db_path`.
     Deliberately a separate file from every other `*_db_path`, never the same connection
     — see `docs/adr/0010-position-reconciliation-and-manual-sync.md`."""
+    eod_flatten_workflow_db_path: str | None = None
+    """Path to the SQLite database file `application.risk.risk_supervisor.
+    RiskSupervisor` persists 04:55/emergency flatten workflows to (see
+    `application.ports.eod_flatten_workflow_repository` and `persistence.
+    sqlite_eod_flatten_workflow_repository`). `None` falls back to a per-user data
+    directory (`%LOCALAPPDATA%/tfx_quant/eod_flatten_workflows.sqlite3` on Windows) —
+    see `desktop.composition._resolve_eod_flatten_workflow_db_path`. Deliberately a
+    separate file from every other `*_db_path`, never the same connection — same
+    lock-hazard reasoning as every other dedicated workflow database in this codebase."""
 
     @field_validator("account_alias")
     @classmethod
@@ -130,25 +126,6 @@ class TradingSettings(BaseModel):
         if not (1 <= v <= MAX_LOTS):
             raise ValueError(f"max_net_lots must be between 1 and {MAX_LOTS}, got {v}")
         return v
-
-    @model_validator(mode="after")
-    def _manual_contract_required_when_manual(self) -> TradingSettings:
-        if self.contract_selection_mode is ContractSelectionMode.MANUAL:
-            if self.manual_contract_year is None or self.manual_contract_month is None:
-                raise ValueError(
-                    "manual_contract_year and manual_contract_month are both required "
-                    "when contract_selection_mode is MANUAL"
-                )
-            try:
-                ContractMonth(year=self.manual_contract_year, month=self.manual_contract_month)
-            except DomainError as exc:
-                raise ValueError(f"invalid manual contract: {exc}") from exc
-        return self
-
-    def manual_contract(self) -> ContractMonth | None:
-        if self.manual_contract_year is None or self.manual_contract_month is None:
-            return None
-        return ContractMonth(year=self.manual_contract_year, month=self.manual_contract_month)
 
 
 def validate_startup(raw: dict[str, Any]) -> TradingSettings:

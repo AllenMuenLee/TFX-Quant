@@ -5,10 +5,8 @@ value objects. This is a plain file reader — no vendor SDK dependency — but 
 under `infrastructure.yuanta` rather than the generic `infrastructure` package because
 its content is inherently Yuanta-specific data.
 
-**Why a controlled file instead of a live vendor query**: the SPARK API docs
-(`http://www.yuanta.com.tw/file-repository/content/sparkapi_docs/`) document no "list
-tradable contracts"/"commodity master" call anywhere in 行情/交易/帳務 — every query
-found is a quote/order/position/report operation, not a product catalog. The
+**Why a controlled file instead of a live vendor query**: the checked-in Yuanta API
+documents provide quote/order/position/report operations, not a complete product catalog. The
 implementation prompt explicitly allows sourcing this from either the vendor API *or* a
 controlled master file ("元大 API 或受控商品主檔") — with no live API to call, this
 repository is the only honest option. `vendor_symbol` itself, however, is no longer an

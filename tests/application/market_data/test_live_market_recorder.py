@@ -5,8 +5,8 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 
 from tfx_quant.application.market_data.event_parser import MarketEventParser
-from tfx_quant.application.market_data.recorder_service import MarketDataRecorderService
 from tfx_quant.application.market_data.realtime_bar_aggregator import RealtimeBarAggregator
+from tfx_quant.application.market_data.recorder_service import MarketDataRecorderService
 from tfx_quant.domain.bar_record import MarketSession
 from tfx_quant.domain.contract import ContractMonth
 from tfx_quant.domain.instrument import Instrument
@@ -17,9 +17,11 @@ from tfx_quant.persistence.sqlite_market_event_repository import SqliteMarketEve
 
 def _raw(sequence: int, at: datetime, *, total: str = "10") -> RawMarketEvent:
     return RawMarketEvent(
-        "TXFA6", sequence, "session-1", Timestamp(at),
-        {"MatchTime": at.isoformat(), "MatchPri": "18000.5", "MatchQty": "2",
-         "TolMatchQty": total},
+        "TXFA6",
+        sequence,
+        "session-1",
+        Timestamp(at),
+        {"MatchTime": at.isoformat(), "MatchPri": "18000.5", "MatchQty": "2", "TolMatchQty": total},
     )
 
 
@@ -42,7 +44,8 @@ def test_commit_precedes_aggregation_and_duplicate_sequence_is_idempotent() -> N
     repository = SqliteMarketEventRepository(sqlite3.connect(":memory:"))
     parser = MarketEventParser(lambda raw, _received: datetime.fromisoformat(raw))
     aggregator = RealtimeBarAggregator(
-        Instrument.TXF, ContractMonth(2026, 8),
+        Instrument.TXF,
+        ContractMonth(2026, 8),
         lambda _at: (Timestamp(at), Timestamp(end), at.date(), MarketSession.DAY),
     )
     closed: list[object] = []

@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from collections import defaultdict
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -31,7 +32,7 @@ from tfx_quant.infrastructure.yuanta.mock_trade_gateway import MockTradeGateway
 from tfx_quant.persistence.sqlite_order_repository import SqliteOrderRepository
 
 _ACCOUNT = TradingAccount(branch_id="0001", account_no="1234567")
-_INSTRUMENT = Instrument.TXF
+_INSTRUMENT = Instrument.MXF
 _CONTRACT = ContractMonth(year=2026, month=9)
 _MA_WINDOW = 35
 _FLAT_LOOKBACK = 5
@@ -153,6 +154,15 @@ def _publish_bars(event_bus: FakeEventBus, bars: list[Bar]) -> None:
 
 
 # -- Bar -> decision -> order submission --------------------------------------------------
+
+
+def test_txf_market_bars_are_view_only_and_never_submit_orders() -> None:
+    _service_instance, gateway, _repo, event_bus, _clock = _service()
+    bars = [replace(bar, instrument=Instrument.TXF) for bar in _rising_warmup_plus_entry()]
+
+    _publish_bars(event_bus, bars)
+
+    assert gateway.submitted_orders == []
 
 
 def test_entry_signal_submits_order_via_order_manager() -> None:

@@ -1,11 +1,9 @@
 """CandleStreakCounter — 紅K/黑K consecutive-streak tracking over closed bars.
 
-Bars themselves are no longer assembled tick-by-tick in this codebase — every bar comes
-pre-aggregated as one `yfinance` `interval="1h"` row (see `application.market_data.
-bar_service.MarketDataBarService`/`application.market_data.bar_history_backfill_service.
-BarHistoryBackfillService`, both resolving rows via `application.market_data.
-yahoo_bar_resolution.resolve_yahoo_bar`). This module only tracks the red/black streak
-over whatever closed `Bar`s it's fed, independent of how they arrived.
+Bars are assembled from real-time Yuanta quote events by `application.market_data.
+realtime_bar_aggregator.RealtimeBarAggregator` (see `desktop.quote_runtime.
+QuoteRuntime`). This module only tracks the red/black streak over whatever closed
+`Bar`s it's fed, independent of how they arrived.
 """
 
 from __future__ import annotations

@@ -1,4 +1,4 @@
-"""LoginDialog — the Yuanta SPARK API login screen (Feature 02 extension).
+"""Login dialog for Yuanta's separate order and quote OCX sessions.
 
 Implements `implementation prompt/02-yuanta-api-session/login-input-implementation-
 prompt.md`: collects 執行環境, 帳號, 密碼, 記住帳號, and 安全儲存密碼 from the operator,
@@ -7,20 +7,14 @@ builds a `LoginRequest` (`application/ports/broker_session.py`), and hands it to
 that stays inside the adapter `IBrokerSession` wraps.
 
 The validation/DTO-building logic (`build_login_request`) is deliberately a plain,
-wx-free function so it's unit-testable without a live `wx.App` — the same split this
-codebase already uses between `BrokerSessionOrchestrator` (pure) and the `pythonnet`/wx
-glue around it. `LoginDialog` itself is a thin shell that calls it.
-
-Also hosts the one-time SPARK API certificate import (帳號/密碼 aren't enough on
-Windows in production — see 前言 > 測試環境&正式環境說明: a certificate must be
-imported into the OS certificate store before `Login()` will succeed). This is a
-`certutil`-based, app-level convenience (see `infrastructure.yuanta.credentials.
-ensure_certificate_imported`'s docstring for why it's not a documented vendor API call)
-— a separate action from submitting a login, not part of `LoginRequest`.
+wx-free function so it is testable without a live `wx.App`. The selected environment
+routes only the order connection; the quote API has one documented host and a separate
+login call.
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import wx
@@ -43,9 +37,10 @@ from tfx_quant.telemetry.masking import field_present, mask_account
 _logger = get_logger(__name__)
 
 _ENVIRONMENT_CHOICES: tuple[Environment, ...] = (Environment.TEST, Environment.PRODUCTION)
-_ENVIRONMENT_LABELS = ("測試 UAT (TEST)", "正式 PROD (PRODUCTION)")
-
-_ACCOUNT_HINT = "證券：S+分公司代號(4)+帳號(7)；期貨：F+分公司代號(7+3)+帳號(7)"
+_ENVIRONMENT_LABELS = (
+    "交易測試 UAT（行情 API 仍使用唯一正式主機）",
+    "交易正式 PROD (PRODUCTION)",
+)
 
 _PRODUCTION_CONFIRM_MESSAGE = (
     "即將以「正式環境」登入元大期貨 API，登入成功後可能影響真實帳戶／交易相關資料。\n"
@@ -55,6 +50,11 @@ _PRODUCTION_CONFIRM_MESSAGE = (
 
 class LoginFormError(Exception):
     """A field failed validation — the dialog shows `str(exc)` to the operator."""
+
+
+class CertificateFormError(Exception):
+    """A certificate-import field failed validation — the dialog shows `str(exc)` to
+    the operator."""
 
 
 def build_login_request(
@@ -90,6 +90,51 @@ def build_login_request(
     )
 
 
+def _same_certificate_file(left: str, right: str | None) -> bool:
+    """Whether two path strings name the same file, for deciding if a remembered
+    password still belongs to the certificate being imported."""
+    if not right:
+        return False
+    return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
+
+
+def build_certificate_import_request(
+    *,
+    certificate_path: str,
+    certificate_password: str,
+    stored_certificate_password: str | None,
+    stored_certificate_path: str | None = None,
+) -> tuple[str, SecretStr]:
+    """Pure validation for the certificate-import controls — mirrors
+    `build_login_request`'s wx-free split so it is testable without a live `wx.App`.
+
+    Per the vendor docs (前言 > 測試環境＆正式環境說明), the login certificate must be
+    imported into the Windows certificate store before `SetFutOrdConnection` will
+    succeed on the production endpoint (`OnLogonS` TLinkStatus `4`/`lsCAError`
+    otherwise). A blank password falls back to a previously secure-stored one, the
+    same "記住密碼" semantics as `build_login_request` — but **only for the certificate
+    that password was stored for**. There is one global keyring entry
+    (`credentials.CERTIFICATE_KEYRING_USER`), not one per file, so reusing it for a
+    newly chosen `.pfx` just feeds `certutil` the wrong password: the import fails with
+    an opaque exit code and the operator is never told the blank box silently supplied
+    a stale secret.
+    """
+    certificate_path = certificate_path.strip()
+    if not certificate_path:
+        raise CertificateFormError("憑證檔案路徑不可空白")
+    if not credentials.certificate_path_exists(certificate_path):
+        raise CertificateFormError("找不到指定的憑證檔案")
+
+    if not certificate_password and _same_certificate_file(
+        certificate_path, stored_certificate_path
+    ):
+        certificate_password = stored_certificate_password or ""
+    if not certificate_password:
+        raise CertificateFormError("憑證密碼不可空白")
+
+    return certificate_path, SecretStr(certificate_password)
+
+
 @dataclass(frozen=True, slots=True)
 class _FormValues:
     environment: Environment
@@ -104,10 +149,11 @@ class LoginDialog(wx.Dialog):
     is observed, or `wx.ID_CANCEL` if the operator cancels."""
 
     def __init__(self, parent: wx.Window | None, services: ServiceContainer) -> None:
-        super().__init__(parent, title="元大 SPARK API 登入", style=wx.DEFAULT_DIALOG_STYLE)
+        super().__init__(parent, title="元大交易／行情 API 登入", style=wx.DEFAULT_DIALOG_STYLE)
         self._services = services
         self._connecting = False
         self._pending_secure_store = False
+        self._pending_quote_credentials: tuple[str, SecretStr] | None = None
         self._password_masked = True
 
         prefs = login_preferences.load()
@@ -127,10 +173,6 @@ class LoginDialog(wx.Dialog):
         self._user_id_ctrl = wx.TextCtrl(panel, value=prefs.remembered_user_id or "")
         id_row.Add(self._user_id_ctrl, 1, wx.ALL | wx.EXPAND, 6)
         sizer.Add(id_row, 0, wx.EXPAND)
-        id_hint = wx.StaticText(panel, label=_ACCOUNT_HINT)
-        id_hint.Wrap(360)
-        sizer.Add(id_hint, 0, wx.LEFT | wx.RIGHT, 8)
-
         self._password_row_sizer = wx.BoxSizer(wx.HORIZONTAL)
         self._password_row_sizer.Add(
             wx.StaticText(panel, label="密碼："), 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 6
@@ -151,38 +193,38 @@ class LoginDialog(wx.Dialog):
 
         sizer.Add(wx.StaticLine(panel), 0, wx.EXPAND | wx.ALL, 6)
 
-        cert_state = "✓ 已匯入憑證" if prefs.certificate_imported else "尚未匯入憑證"
-        self._certificate_state_label = wx.StaticText(
-            panel,
-            label=cert_state,
+        sizer.Add(
+            wx.StaticText(panel, label="憑證匯入（正式環境登入前需完成一次）"), 0, wx.ALL, 6
         )
-        self._certificate_state_label.SetForegroundColour(
-            wx.Colour(22, 163, 74) if prefs.certificate_imported else wx.Colour(220, 38, 38)
-        )
-        self._certificate_state_label.SetFont(self._certificate_state_label.GetFont().Bold())
-        sizer.Add(self._certificate_state_label, 0, wx.ALL, 6)
-
         cert_path_row = wx.BoxSizer(wx.HORIZONTAL)
-        cert_path_row.Add(
-            wx.StaticText(panel, label="憑證檔案："), 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 6
-        )
-        self._certificate_path_ctrl = wx.TextCtrl(panel)
+        self._certificate_path_ctrl = wx.TextCtrl(panel, value=prefs.certificate_path or "")
         cert_path_row.Add(self._certificate_path_ctrl, 1, wx.ALL | wx.EXPAND, 6)
         self._browse_certificate_button = wx.Button(panel, label="瀏覽…", style=wx.BU_EXACTFIT)
         self._browse_certificate_button.Bind(wx.EVT_BUTTON, self._on_browse_certificate)
         cert_path_row.Add(self._browse_certificate_button, 0, wx.ALL, 6)
         sizer.Add(cert_path_row, 0, wx.EXPAND)
 
-        cert_pass_row = wx.BoxSizer(wx.HORIZONTAL)
-        cert_pass_row.Add(
+        cert_password_row = wx.BoxSizer(wx.HORIZONTAL)
+        cert_password_row.Add(
             wx.StaticText(panel, label="憑證密碼："), 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 6
         )
         self._certificate_password_ctrl = wx.TextCtrl(panel, style=wx.TE_PASSWORD)
-        cert_pass_row.Add(self._certificate_password_ctrl, 1, wx.ALL | wx.EXPAND, 6)
+        cert_password_row.Add(self._certificate_password_ctrl, 1, wx.ALL | wx.EXPAND, 6)
+        sizer.Add(cert_password_row, 0, wx.EXPAND)
+
+        self._remember_certificate_password_checkbox = wx.CheckBox(panel, label="記住憑證密碼")
+        sizer.Add(self._remember_certificate_password_checkbox, 0, wx.ALL, 6)
+
+        cert_button_row = wx.BoxSizer(wx.HORIZONTAL)
+        cert_button_row.AddStretchSpacer()
         self._import_certificate_button = wx.Button(panel, label="匯入憑證")
         self._import_certificate_button.Bind(wx.EVT_BUTTON, self._on_import_certificate)
-        cert_pass_row.Add(self._import_certificate_button, 0, wx.ALL, 6)
-        sizer.Add(cert_pass_row, 0, wx.EXPAND)
+        cert_button_row.Add(self._import_certificate_button, 0, wx.ALL, 6)
+        sizer.Add(cert_button_row, 0, wx.EXPAND)
+
+        self._certificate_status_label = wx.StaticText(panel, label="")
+        self._certificate_status_label.Wrap(360)
+        sizer.Add(self._certificate_status_label, 0, wx.ALL | wx.EXPAND, 8)
 
         sizer.Add(wx.StaticLine(panel), 0, wx.EXPAND | wx.ALL, 6)
 
@@ -242,37 +284,6 @@ class LoginDialog(wx.Dialog):
         self._password_ctrl = new_ctrl
         self._toggle_password_button.SetLabel("隱藏" if not self._password_masked else "顯示")
         self._panel.Layout()
-
-    # -- Certificate import -----------------------------------------------------
-
-    def _on_browse_certificate(self, _event: wx.CommandEvent) -> None:
-        with wx.FileDialog(
-            self,
-            "選擇憑證檔案 (.pfx)",
-            wildcard="PFX 憑證 (*.pfx)|*.pfx|所有檔案 (*.*)|*.*",
-            style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST,
-        ) as dialog:
-            if dialog.ShowModal() == wx.ID_OK:
-                self._certificate_path_ctrl.SetValue(dialog.GetPath())
-
-    def _on_import_certificate(self, _event: wx.CommandEvent) -> None:
-        path = self._certificate_path_ctrl.GetValue().strip()
-        password = self._certificate_password_ctrl.GetValue()
-        if not path:
-            self._status_label.SetLabel("請先選擇憑證檔案")
-            return
-        if not credentials.certificate_path_exists(path):
-            self._status_label.SetLabel(f"找不到憑證檔案：{path}")
-            return
-        try:
-            credentials.ensure_certificate_imported(path, SecretStr(password))
-        except CertificateImportError as exc:
-            self._status_label.SetLabel(f"憑證匯入失敗：{exc}")
-            return
-        login_preferences.save_certificate_imported(True)
-        self._certificate_state_label.SetLabel("✓ 已匯入憑證")
-        self._certificate_state_label.SetForegroundColour(wx.Colour(22, 163, 74))
-        self._status_label.SetLabel("憑證已匯入本機憑證存放區。")
 
     # -- Form state -------------------------------------------------------------
 
@@ -356,6 +367,7 @@ class LoginDialog(wx.Dialog):
         login_preferences.save_remembered_user_id(request.user_id if values.remember_id else None)
 
         self._pending_secure_store = values.secure_store
+        self._pending_quote_credentials = (request.user_id, request.password)
         self._connecting = True
         self._set_form_enabled(False)
         self._status_label.SetLabel("登入中…")
@@ -376,6 +388,14 @@ class LoginDialog(wx.Dialog):
             user_id = values.user_id.strip()
             if user_id and values.password:
                 credentials.store_password(user_id, values.password)
+        if self._pending_quote_credentials is not None:
+            user_id, password = self._pending_quote_credentials
+            try:
+                self._services.quote_runtime.start(user_id, password)
+            except Exception as exc:
+                log_warning(_logger, "quote_login_failed", reason=str(exc))
+            finally:
+                self._pending_quote_credentials = None
         self._connecting = False
         if self.IsModal():
             self.EndModal(wx.ID_OK)
@@ -401,6 +421,68 @@ class LoginDialog(wx.Dialog):
         self._connecting = False
         self._set_form_enabled(True)
         self._status_label.SetLabel(message)
+
+    # -- Certificate import ---------------------------------------------------------
+
+    def _on_browse_certificate(self, _event: wx.CommandEvent) -> None:
+        with wx.FileDialog(
+            self,
+            "選擇憑證檔案",
+            wildcard="PFX 憑證檔 (*.pfx)|*.pfx|所有檔案 (*.*)|*.*",
+            style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST,
+        ) as dialog:
+            if dialog.ShowModal() == wx.ID_OK:
+                self._certificate_path_ctrl.SetValue(dialog.GetPath())
+
+    def _on_import_certificate(self, _event: wx.CommandEvent) -> None:
+        path = self._certificate_path_ctrl.GetValue()
+        password = self._certificate_password_ctrl.GetValue()
+        stored_password = credentials.load_certificate_password()
+        remembered = login_preferences.load()
+        log_info(
+            _logger,
+            "certificate_import_requested",
+            certificate_path_provided=field_present(path),
+            certificate_password_provided=field_present(password) or stored_password is not None,
+        )
+        try:
+            certificate_path, certificate_password = build_certificate_import_request(
+                certificate_path=path,
+                certificate_password=password,
+                stored_certificate_password=stored_password,
+                stored_certificate_path=remembered.certificate_path,
+            )
+        except CertificateFormError as exc:
+            log_info(_logger, "certificate_import_validation_failed", failure_phase=str(exc))
+            self._certificate_status_label.SetLabel(str(exc))
+            return
+
+        # Remembered before the attempt, not after it: the field prefills this dialog's
+        # path box, so persisting only on success left the box silently reverting to a
+        # previously imported certificate every time a newly chosen one failed — the
+        # operator sees the old path and no explanation.
+        if not _same_certificate_file(certificate_path, remembered.certificate_path):
+            login_preferences.save_certificate_path(certificate_path)
+            login_preferences.save_certificate_imported(False)
+
+        try:
+            credentials.ensure_certificate_imported(certificate_path, certificate_password)
+        except CertificateImportError as exc:
+            log_warning(_logger, "certificate_import_failed", reason=str(exc))
+            self._certificate_status_label.SetLabel(str(exc))
+            return
+
+        login_preferences.save_certificate_path(certificate_path)
+        login_preferences.save_certificate_imported(True)
+        if self._remember_certificate_password_checkbox.GetValue():
+            credentials.store_certificate_password(certificate_password.get_secret_value())
+        elif not _same_certificate_file(certificate_path, remembered.certificate_path):
+            # A different certificate is now the remembered one; the single keyring
+            # entry still holds the previous file's password, which would otherwise be
+            # offered for this one on the next blank-password import.
+            credentials.clear_certificate_password()
+        log_info(_logger, "certificate_import_succeeded")
+        self._certificate_status_label.SetLabel("憑證匯入成功")
 
     # -- Clear stored password ----------------------------------------------------
 

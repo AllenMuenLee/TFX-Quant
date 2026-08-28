@@ -1,17 +1,16 @@
 """MockBrokerSession — a fully scriptable `IBrokerSession`, no COM/network at all.
 
-Used by `desktop/composition.py` when `TradingSettings.use_mock` is true (the
-default), and directly importable by tests that want to drive UI/composition code
-through specific session-lifecycle scenarios without the real orchestrator's
-generation/phase machinery (that machinery has its own dedicated test suite against
-`BrokerSessionOrchestrator` — see `tests/infrastructure/
-test_broker_session_orchestrator.py`).
+Not wired by `desktop/composition.py` (which always uses the real `LegacyBroker` —
+see `docs/adr/0004-broker-session-architecture.md`'s "never a silent mock fallback"
+posture); directly importable by tests that want to drive UI/composition code through
+specific session-lifecycle scenarios without the real broker's OCX machinery.
 
 `start()` defaults to an immediate, synchronous happy path (single mock futures
-account, all four capabilities become true) so the readiness screen and composition
-tests work out of the box; call one of the `simulate_*` methods instead of `start()`
-to script a specific failure/edge-case scenario. No market-data capability lives here —
-market data comes from `yfinance`, entirely independent of this session.
+account, all four capabilities become true) so composition tests work out of the box;
+call one of the `simulate_*` methods instead of `start()` to script a specific
+failure/edge-case scenario. No market-data capability lives here — quote-API market
+data is handled entirely by `desktop.quote_runtime.QuoteRuntime`, independent of this
+session.
 """
 
 from __future__ import annotations
@@ -37,7 +36,7 @@ from tfx_quant.application.ports.broker_session import (
 from tfx_quant.domain.account import TradingAccount
 from tfx_quant.domain.timestamp import Timestamp
 from tfx_quant.infrastructure.yuanta.errors import AccountSelectionError
-from tfx_quant.infrastructure.yuanta.session_orchestrator import EventPublisher
+from tfx_quant.infrastructure.yuanta.event_publisher import EventPublisher
 
 _DEFAULT_MOCK_ACCOUNT = TradingAccount(branch_id="F00", account_no="9808900", sub_account="")
 

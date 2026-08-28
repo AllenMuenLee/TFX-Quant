@@ -9,9 +9,9 @@ happens to be a scheduled trading make-up day — TAIFEX makes both kinds of exc
 here. Session *times* (day/night start/end) are **not** owned by this module — they
 already live per-contract in `InstrumentMasterEntry` (Feature 03); this module only turns
 (calendar date + those times) into concrete 60-minute bar boundaries and resolves a
-`yfinance` bar's open-label timestamp to the correct trading day/session, honoring "交易
-日不可直接等同曆日" (a trading day is not the same thing as a calendar day) for the night
-session's midnight crossing.
+locally-aggregated bar's open-label timestamp to the correct trading day/session,
+honoring "交易日不可直接等同曆日" (a trading day is not the same thing as a calendar
+day) for the night session's midnight crossing.
 
 Early-close overrides apply only to the day session (a session that does not cross
 midnight) — TAIFEX's historical early closes shorten the day session; there is no
@@ -87,14 +87,13 @@ class TradingCalendar:
         self, open_ts: Timestamp, entry: InstrumentMasterEntry
     ) -> tuple[Timestamp, Timestamp] | None:
         """The (open, close) boundary whose open-label timestamp exactly equals
-        `open_ts` — used to resolve a historical bar timestamp from a third-party source
-        (`application.ports.yahoo_history_query.YahooBar.at`) under this codebase's own
-        open-time bar-labeling convention (see `domain.bar.Bar`'s docstring). Whether
-        `yfinance`'s `interval="1h"` index labels a bar's open or close time is not
-        documented, so this is a stated assumption, not a verified fact — see
-        `docs/adr/0007-two-month-bar-history-persistence.md`'s yfinance extension
-        decision. Returns `None` when `open_ts` isn't exactly one of this calendar/
-        entry's own boundary opens (off-grid timestamp, the close-label interpretation
+        `open_ts` — resolves a bar timestamp against this codebase's own open-time
+        bar-labeling convention (see `domain.bar.Bar`'s docstring). Not currently
+        consumed by any caller (the locally-aggregated live pipeline already produces
+        boundary-aligned bars directly); kept as a general utility for a future
+        timestamp-resolution need. Returns `None` when `open_ts` isn't exactly one of
+        this calendar/entry's own boundary opens (off-grid timestamp, the close-label
+        interpretation
         being the correct one after all, or a non-trading period) — callers must never
         snap or coerce it to the nearest boundary, only accept an exact match; anything
         else is left as an unresolved gap."""
@@ -107,6 +106,22 @@ class TradingCalendar:
                 for candidate_open, candidate_close in self.bar_boundaries(trading_day, start, end):
                     if candidate_open.value == open_ts.value:
                         return candidate_open, candidate_close
+        return None
+
+    def boundary_containing(
+        self, instant: Timestamp, entry: InstrumentMasterEntry
+    ) -> tuple[Timestamp, Timestamp, date, MarketSession] | None:
+        """Resolve an actual trade instant to its configured 60-minute boundary."""
+        candidate_date = instant.value.date()
+        for offset in _TRADING_DAY_SEARCH_OFFSETS:
+            trading_day = candidate_date + timedelta(days=offset)
+            if not self.is_trading_day(trading_day):
+                continue
+            for session_index, (session_start, session_end) in enumerate(_sessions_of(entry)):
+                for start, end in self.bar_boundaries(trading_day, session_start, session_end):
+                    if start.value <= instant.value < end.value:
+                        session = MarketSession.DAY if session_index == 0 else MarketSession.NIGHT
+                        return start, end, trading_day, session
         return None
 
     def session_context_for(

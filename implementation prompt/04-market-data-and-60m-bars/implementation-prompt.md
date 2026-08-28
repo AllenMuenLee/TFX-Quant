@@ -12,11 +12,14 @@
 
 ## 文件允許的 API 範圍
 
-- 使用 `SetMktLogon(User, pass, IP, PORT)` 連線；帳密不得寫入程式碼或日誌。
-- 依文件處理 `OnMktStatusChange(Status, Msg)`、所有 `TlinkStatus` 數值及登入訊息代碼。
-- 使用 `AddMktReg(Symbol, UpdateMode)` 註冊商品，並處理 `RegErrCode`。需要當下資料與後續更新時使用文件記載的 `SnapshotUpd`；不得把 snapshot 解讀為歷史查詢。
-- 使用 `DelMktReg(Symbol)` 取消註冊，並處理 `OnRegError(Symbol, UpdateMode, ErrorCode)`。
-- 只從 `OnGetMktAll(...)` 接收文件記載的欄位：`Symbol`、`RefPri`、`OpenPri`、`HighPri`、`LowPri`、`UpPri`、`DnPri`、`MatchTime`、`MatchPri`、`MatchQty`、`TolMatchQty`、五檔買賣價量及盤前揭示欄位。
+- 以 QAPI 目錄中的 `YuantaQuoteAPI Sample.py` 及已安裝 `YuantaQuote_v2.1.2.9.ocx` type library 為實際呼叫契約；PDF 中省略參數的舊版短簽章不得用於此 OCX。
+- Quote OCX 必須在 32-bit Windows Python、wx UI thread 與真實 window handle 上，以 `AtlAxCreateControlEx("YUANTAQUOTE.YuantaQuoteCtrl.1", ...)` 建立；不得以無視窗的 `CreateObject` 取代。COM control、event sink、advise connection 與承載 window 必須由同一 host 一起持有到停止，且所有 control 操作維持在建立它的 UI thread。
+- 使用 `SetMktLogon(User, pass, IP, PORT, ReqType, SetMap)` 連線；`PORT` 傳字串、`SetMap=0`。`ReqType=1` 代表 T 盤（sample 使用 port 80），`ReqType=2` 代表 T+1 盤（sample 使用 port 82）。帳密不得寫入程式碼或日誌。
+- vendor sample 的 callback 簽章含首個 COM `this`，但本系統向 `GetEvents` 明確傳入 `_DYuantaQuoteEvents` interface，comtypes 的 `without_this` wrapper 會在呼叫 Python sink 前移除它。因此 sink 必須實作 `OnMktStatusChange(Status, Msg, ReqType)`，不得再宣告 `this`；同時處理所有 `TlinkStatus` 數值及登入訊息代碼。
+- 使用 `AddMktReg(Symbol, UpdMode, ReqType, SetMap)` 註冊商品；`UpdMode` 依 sample 傳字串 `"1"`、`"2"` 或 `"4"`，`SetMap=0`，並處理回傳 `RegErrCode`。需要當下資料與後續更新時使用 `SnapshotUpd (4)`；不得把 snapshot 解讀為歷史查詢。
+- 使用 `DelMktReg(Symbol, ReqType)` 取消註冊；Python sink 處理移除 `this` 後的 `OnRegError(Symbol, UpdMode, ErrorCode, ReqType)`。重新連線後須以 callback 的 `ReqType` 對原訂閱重新註冊；失敗須留下 gap。
+- Python sink 從移除 `this` 後的 `OnGetMktAll(Symbol, ..., ReqType)` 接收完整 20 個業務參數：`Symbol`、`RefPri`、`OpenPri`、`HighPri`、`LowPri`、`UpPri`、`DnPri`、`MatchTime`、`MatchPri`、`MatchQty`、`TolMatchQty`、五檔買賣價量、盤前揭示欄位及末尾 `ReqType`。原始欄位先保存為字串，再由 parser 做嚴格轉換。
+- QAPI 路徑優先接受 `TFX_QUANT_YUANTA_QAPI_DIR`，其次使用 `C:\Yuanta\QAPI`，開發工作樹可回退至 repo 內 `行情API元件及說明文件\行情API元件及說明文件\QAPI`；preflight 必須檢查 Windows、32-bit、comtypes、wxPython 與 OCX 是否存在。
 - 商品代碼只能使用文件明載的規則或經使用者提供並驗證的 EASYWIN 報價代碼；不得猜測、替換月份契約或使用未經確認的連續契約。
 
 ## 必須實作
@@ -50,6 +53,7 @@
 
 ## 驗收
 
+- 以 fake control 固定驗證 sample 的實際 arity 與型別：`SetMktLogon` 六參數、`AddMktReg` 四參數且 update mode 為字串、`DelMktReg` 二參數；另直接呼叫 sink 驗證 comtypes 移除 `this` 後的 callback arity，且末參數仍為 `ReqType`。
 - 以 fake COM event source 驗證完整連線狀態、登入訊息、註冊模式、註冊錯誤、取消註冊及斷線重連流程。
 - 以 `OnGetMktAll` fixture 驗證欄位解析、盤前 `TolMatchQty = -1`、重複、亂序、遲到、無效數值、原始時間保存及敏感資訊遮罩。
 - 驗證事件先落盤後聚合、60 分鐘邊界、跨午夜、程序重啟、idempotency、forming／closed 狀態及十字 K 規則。

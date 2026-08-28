@@ -72,7 +72,8 @@ def parse_pipe_fields(payload: str) -> dict[str, str]:
 def parse_pipe_rows(payload: str, row_count: int, *, first_tag: str) -> tuple[dict[str, str], ...]:
     """Split a documented query callback containing repeated tag sets."""
     if row_count == 0:
-        return ()
+        # A zero-row callback is an explicit broker answer, not an optimistic default.
+        return tuple()
     marker = f"{first_tag}="
     starts = [index for index in range(len(payload)) if payload.startswith(marker, index)]
     if len(starts) != row_count:
@@ -263,6 +264,14 @@ class LegacyOrderApiClient:
         if client_id is not None and parsed.order_sequence_no:
             self._order_sequences[parsed.order_sequence_no] = client_id
         return parsed
+
+    def order_for(self, client_order_id: ClientOrderId) -> Order | None:
+        """The original `Order` this process submitted for `client_order_id`, or
+        `None` if it was never submitted through this process (e.g. a report row that
+        correlates to nothing this in-memory client has ever tracked). Never
+        reconstructed by guessing at raw report fields — only what `submit_order`
+        itself recorded."""
+        return self._orders.get(client_order_id)
 
     def correlate(self, fields: Mapping[str, str]) -> ClientOrderId | None:
         client_id = self._order_sequences.get(fields.get("Oseq_No", ""))

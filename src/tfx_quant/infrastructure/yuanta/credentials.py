@@ -25,6 +25,7 @@ from tfx_quant.telemetry.masking import mask_account
 _logger = get_logger(__name__)
 
 KEYRING_SERVICE_NAME = "tfx_quant.yuanta"
+CERTIFICATE_KEYRING_USER = "certificate-import-password"
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,11 +86,43 @@ def clear_stored_password(user_id: str) -> None:
     log_info(_logger, "stored_password_cleared", user_id_masked=mask_account(user_id))
 
 
+def store_certificate_password(password: str) -> None:
+    """Store the PFX password in the OS credential vault, never in preferences JSON."""
+    import keyring
+
+    keyring.set_password(KEYRING_SERVICE_NAME, CERTIFICATE_KEYRING_USER, password)
+
+
+def clear_certificate_password() -> None:
+    """Removes the stored PFX password. Safe to call when nothing is stored (a no-op).
+
+    Called when the operator imports a *different* certificate without asking to
+    remember its password: there is only one certificate keyring entry, so leaving the
+    previous file's password behind would let it be silently reused for the new one."""
+    import contextlib
+
+    import keyring
+    import keyring.errors
+
+    with contextlib.suppress(keyring.errors.PasswordDeleteError):
+        keyring.delete_password(KEYRING_SERVICE_NAME, CERTIFICATE_KEYRING_USER)
+    log_info(_logger, "certificate_password_cleared")
+
+
+def load_certificate_password() -> str | None:
+    """Load the PFX password used by automatic startup certificate import."""
+    try:
+        import keyring
+    except ImportError:
+        return None
+    return keyring.get_password(KEYRING_SERVICE_NAME, CERTIFICATE_KEYRING_USER)
+
+
 def ensure_certificate_imported(certificate_path: str, certificate_password: SecretStr) -> None:
-    """Imports a SPARK API login certificate (`.pfx`) into the current Windows user's
+    """Imports a Yuanta login certificate (`.pfx`) into the current Windows user's
     personal certificate store, via the built-in `certutil` tool.
 
-    This is an **application-level design choice, not a documented SPARK API call** —
+    This is an application-level certificate-store operation, not a broker API call —
     the official docs only say the certificate must be "匯入至電腦" (imported into the
     computer) before `Login(Account, Pass)` will work on Windows; they don't prescribe
     how (see 前言 > 測試環境&正式環境說明). `certutil -importpfx` is the standard

@@ -145,7 +145,8 @@ class ReversalWorkflowService:
             if existing is not None:
                 log_info(
                     _logger,
-                    "reversal_submit_deduped",
+                "reversal_submit_deduped",
+                audit=True,
                     trigger_key=trigger_key,
                     workflow_id=str(existing.workflow_id.value),
                     state=existing.state.value,
@@ -185,6 +186,7 @@ class ReversalWorkflowService:
                 log_warning(
                     _logger,
                     "reversal_blocked_too_close_to_eod",
+                    audit=True,
                     workflow_id=str(blocked.workflow_id.value),
                     trigger_key=trigger_key,
                 )
@@ -204,6 +206,7 @@ class ReversalWorkflowService:
             log_info(
                 _logger,
                 "reversal_workflow_started",
+                audit=True,
                 workflow_id=str(record.workflow_id.value),
                 account_no=mask_account(account.account_no),
                 instrument=signal.instrument.value,
@@ -246,7 +249,8 @@ class ReversalWorkflowService:
             updated = machine.mark_blocked(reason=reason, at=now)
             self._update_and_untrack(updated)
             log_warning(
-                _logger, "reversal_blocked_already_flat", workflow_id=str(updated.workflow_id.value)
+                _logger, "reversal_blocked_already_flat", audit=True,
+                workflow_id=str(updated.workflow_id.value)
             )
             self._publish(
                 ReverseEntryBlocked(
@@ -259,6 +263,7 @@ class ReversalWorkflowService:
         log_info(
             _logger,
             "reversal_position_queried",
+            audit=True,
             workflow_id=str(updated.workflow_id.value),
             starting_net=net.lots,
             reversal_side=updated.reversal_side.value if updated.reversal_side else None,
@@ -297,6 +302,7 @@ class ReversalWorkflowService:
         log_info(
             _logger,
             "reversal_close_order_submitted",
+            audit=True,
             workflow_id=str(updated.workflow_id.value),
             client_order_id=str(order_intent.client_order_id.value),
             quantity=request.quantity.lots,
@@ -323,6 +329,7 @@ class ReversalWorkflowService:
             log_error(
                 _logger,
                 "reversal_flat_confirmation_failed",
+                audit=True,
                 workflow_id=str(updated.workflow_id.value),
                 is_flat=result.is_flat,
                 position_lots=result.position_lots,
@@ -338,7 +345,10 @@ class ReversalWorkflowService:
             return updated
         updated = ReversalWorkflowStateMachine(record).mark_flat_confirmed(at=now)
         self._repo.update(updated)
-        log_info(_logger, "reversal_flat_confirmed", workflow_id=str(updated.workflow_id.value))
+        log_info(
+            _logger, "reversal_flat_confirmed", audit=True,
+            workflow_id=str(updated.workflow_id.value)
+        )
         self._publish(ReversalFlatConfirmed(at=now, workflow_id=updated.workflow_id))
         return self._advance(updated)
 
@@ -373,6 +383,7 @@ class ReversalWorkflowService:
         log_info(
             _logger,
             "reversal_entry_order_submitted",
+            audit=True,
             workflow_id=str(updated.workflow_id.value),
             client_order_id=str(order_intent.client_order_id.value),
         )
@@ -394,6 +405,7 @@ class ReversalWorkflowService:
         log_error(
             _logger,
             "reversal_paused_safe",
+            audit=True,
             workflow_id=str(updated.workflow_id.value),
             reason=reason,
         )
@@ -440,14 +452,18 @@ class ReversalWorkflowService:
             updated = ReversalWorkflowStateMachine(record).mark_close_filled(at=at)
             self._repo.update(updated)
             log_info(
-                _logger, "reversal_close_order_filled", workflow_id=str(updated.workflow_id.value)
+                _logger, "reversal_close_order_filled", audit=True,
+                workflow_id=str(updated.workflow_id.value)
             )
             self._advance(updated)
         elif is_entry_leg:
             updated = ReversalWorkflowStateMachine(record).mark_completed(at=at)
             self._repo.update(updated)
             self._untrack(updated)
-            log_info(_logger, "reversal_completed", workflow_id=str(updated.workflow_id.value))
+            log_info(
+                _logger, "reversal_completed", audit=True,
+                workflow_id=str(updated.workflow_id.value)
+            )
             self._publish(ReversalCompleted(at=at, workflow_id=updated.workflow_id))
 
     def _on_order_requires_manual_review(self, event: OrderRequiresManualReview) -> None:
@@ -516,6 +532,7 @@ class ReversalWorkflowService:
                 log_info(
                     _logger,
                     "reversal_close_order_filled",
+                    audit=True,
                     workflow_id=str(updated.workflow_id.value),
                     resumed=True,
                 )
@@ -527,6 +544,7 @@ class ReversalWorkflowService:
                 log_info(
                     _logger,
                     "reversal_completed",
+                    audit=True,
                     workflow_id=str(updated.workflow_id.value),
                     resumed=True,
                 )

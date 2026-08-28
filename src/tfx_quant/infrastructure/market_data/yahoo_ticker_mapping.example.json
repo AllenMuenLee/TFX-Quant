@@ -1,4 +1,0 @@
-{
-  "_comment": "範例／種子 內部商品／契約 -> Yahoo ticker 對照表 — 對照 infrastructure/yuanta/instrument_master.example.json、infrastructure/market_data/trading_calendar.example.json 的用途。**截至撰寫本檔為止，未能於 Yahoo Finance 公開網站確認任一 TAIFEX 期貨契約（大台指 TXF／小台指 MXF，任何月份）存在對應且可用的 1 小時 K 歷史查詢 ticker**——Yahoo Finance 對台灣期貨交易所商品的涵蓋範圍未見官方文件說明，且本環境無法對真實 Yahoo Finance 端點發出網路請求以逐一驗證候選 ticker（見 docs/adr/0007-two-month-bar-history-persistence.md 的 yfinance 擴充決策之誠實揭露）。因此本檔案的 mappings 陣列刻意留空，而非填入未經驗證的猜測值——操作人員必須自行於 Yahoo Finance 逐月確認可用 ticker（若存在）後才能新增筆數，比照 instrument_master.example.json 的 vendor_symbol 標示原則；找不到任何確認 ticker 時，回補流程會保留缺口並將 readiness 標示為 degraded，不會用其他契約月份或連續合約 ticker 替代猜測。若確有連續合約 ticker 可用且產品面決定採用，必須以獨立的 instrument identity（而非直接覆蓋契約月份 mapping）保存並在 UI 標示，見同一 ADR 決策。",
-  "mappings": []
-}

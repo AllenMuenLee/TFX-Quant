@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
@@ -7,7 +8,15 @@ from uuid import UUID
 import pytest
 from pydantic import SecretStr
 
-from tfx_quant.application.ports.broker_session import LoginRequest
+from tfx_quant.application.events.events import (
+    BrokerCapabilitiesChanged,
+    BrokerLoggedOut,
+    BrokerLoginFailed,
+    BrokerSessionInvalidated,
+    BrokerSessionReady,
+)
+from tfx_quant.application.ports.broker_session import LoginRequest, SessionCapabilities
+from tfx_quant.application.ports.yuanta_gateways import OrderQueryNotReadyError
 from tfx_quant.application.settings.trading_settings import Environment
 from tfx_quant.domain.account import TradingAccount
 from tfx_quant.domain.contract import ContractMonth
@@ -217,8 +226,11 @@ def test_missing_or_malformed_broker_fields_fail_closed() -> None:
 @pytest.mark.parametrize(
     ("environment", "expected_endpoint"),
     [
+        # Both ports come from the vendor's 使用說明.txt 連線位置 section:
+        # 測試環境 Port:80, 正式環境 Port:80/443 — production may use either, and 80
+        # is the configured choice.
         (Environment.TEST, ("apitest.yuantafutures.com.tw", 80)),
-        (Environment.PRODUCTION, ("api.yuantafutures.com.tw", 443)),
+        (Environment.PRODUCTION, ("api.yuantafutures.com.tw", 80)),
     ],
 )
 def test_login_environment_selects_documented_simulation_or_live_endpoint(
@@ -260,3 +272,291 @@ def test_failed_connection_closes_host_and_allows_retry() -> None:
     with pytest.raises(OSError, match="COM connection failed"):
         broker.start(LoginRequest(Environment.TEST, "TEST-ID", SecretStr("secret")))
     assert close_calls == [None, None]
+
+
+def _logged_in_broker() -> tuple[LegacyBroker, FakeHost]:
+    host = FakeHost()
+    broker = LegacyBroker(
+        event_publisher=FakePublisher(),
+        symbol_resolver=lambda _order: "MXFU6",
+        host_factory=lambda: host,  # type: ignore[arg-type]
+    )
+    broker.start(LoginRequest(Environment.TEST, "TEST-ID", SecretStr("secret")))
+    host.handlers["OnLogonS"](2, "2-F00-1234567-", "", "")
+    return broker, host
+
+
+def test_query_open_orders_fails_closed_before_report_query_ever_completed() -> None:
+    broker, _host = _logged_in_broker()
+
+    with pytest.raises(OrderQueryNotReadyError):
+        broker.query_open_orders()
+
+
+def test_query_open_orders_confirms_zero_once_report_query_completes_empty() -> None:
+    broker, _host = _logged_in_broker()
+
+    broker._on_report_query(0, "")
+
+    assert broker.query_open_orders() == ()
+
+
+def test_query_open_orders_returns_currently_open_order() -> None:
+    broker, _host = _logged_in_broker()
+    order = _order()
+    assert broker._orders is not None
+    broker._orders.submit_order(order, order.client_order_id)
+    broker._orders.handle_order_result("REQ-1", "SEQ1|0000|")
+
+    broker._on_report_query(1, "Omkt=F|Statusc=0|Ts_Code=04|Oseq_No=SEQ1|R_Time=091500")
+
+    assert broker.query_open_orders() == (order,)
+
+
+def test_query_open_orders_excludes_terminal_status_orders() -> None:
+    broker, _host = _logged_in_broker()
+    order = _order()
+    assert broker._orders is not None
+    broker._orders.submit_order(order, order.client_order_id)
+    broker._orders.handle_order_result("REQ-1", "SEQ1|0000|")
+
+    broker._on_report_query(1, "Omkt=F|Statusc=0|Ts_Code=06|Oseq_No=SEQ1|R_Time=091500")
+
+    assert broker.query_open_orders() == ()
+
+
+def test_query_open_orders_uses_latest_report_not_a_stale_earlier_one() -> None:
+    broker, _host = _logged_in_broker()
+    order = _order()
+    assert broker._orders is not None
+    broker._orders.submit_order(order, order.client_order_id)
+    broker._orders.handle_order_result("REQ-1", "SEQ1|0000|")
+
+    # Acknowledged, then filled — two distinct report rows for the same order.
+    broker._on_report_query(1, "Omkt=F|Statusc=0|Ts_Code=04|Oseq_No=SEQ1|R_Time=091500")
+    broker._on_report_query(1, "Omkt=F|Statusc=0|Ts_Code=06|Oseq_No=SEQ1|R_Time=091600")
+
+    assert broker.query_open_orders() == ()
+
+
+def test_query_open_orders_fails_closed_on_unresolved_status() -> None:
+    broker, _host = _logged_in_broker()
+    order = _order()
+    assert broker._orders is not None
+    broker._orders.submit_order(order, order.client_order_id)
+    broker._orders.handle_order_result("REQ-1", "SEQ1|0000|")
+
+    broker._on_report_query(1, "Omkt=F|Statusc=0|Ts_Code=99|Oseq_No=SEQ1|R_Time=091500")
+
+    with pytest.raises(OrderQueryNotReadyError):
+        broker.query_open_orders()
+
+
+# -- Session lifecycle: handshake, passive disconnect, reconnect -------------------------
+
+
+def _fresh_broker(
+    *,
+    host_factory: Any | None = None,
+    ui_dispatch: Any | None = None,
+) -> tuple[LegacyBroker, FakeHost, FakePublisher]:
+    host = FakeHost()
+    publisher = FakePublisher()
+    broker = LegacyBroker(
+        event_publisher=publisher,
+        symbol_resolver=lambda _order: "MXFU6",
+        host_factory=host_factory or (lambda: host),  # type: ignore[arg-type]
+        ui_dispatch=ui_dispatch,
+    )
+    return broker, host, publisher
+
+
+def _login_request() -> LoginRequest:
+    return LoginRequest(Environment.TEST, "TEST-ID", SecretStr("secret"))
+
+
+def _complete_handshake(broker: LegacyBroker) -> None:
+    """The three query callbacks whose arrival marks the session fully ready."""
+    broker._on_report_query(0, "")
+    broker._on_deal_query(0, "")
+    broker._on_position_query(0, "", "RA003")
+
+
+def _ready_broker() -> tuple[LegacyBroker, FakeHost, FakePublisher]:
+    broker, host, publisher = _fresh_broker()
+    broker.start(_login_request())
+    host.handlers["OnLogonS"](2, "2-F00-1234567-", "", "")
+    _complete_handshake(broker)
+    return broker, host, publisher
+
+
+def _of_type(publisher: FakePublisher, kind: type) -> list[Any]:
+    return [event for event in publisher.events if isinstance(event, kind)]
+
+
+def test_session_ready_is_published_once_per_session_not_once_per_query_callback() -> None:
+    """Regression: `_mark_query_part` used to re-publish `BrokerSessionReady` on *every*
+    query callback once the three parts had arrived. Each republish re-ran every
+    subscriber's reconciliation sweep, whose queries produced more callbacks — a loop
+    that issued ~2,900 broker queries in 16 seconds on the first successful login."""
+    broker, _host, publisher = _ready_broker()
+
+    assert len(_of_type(publisher, BrokerSessionReady)) == 1
+
+    for _ in range(3):
+        _complete_handshake(broker)
+
+    assert len(_of_type(publisher, BrokerSessionReady)) == 1
+    ready_changes = [
+        event
+        for event in _of_type(publisher, BrokerCapabilitiesChanged)
+        if event.capabilities.is_session_ready
+    ]
+    assert len(ready_changes) == 1
+
+
+def test_stop_clears_session_state_so_the_next_login_reruns_the_handshake() -> None:
+    broker, host, publisher = _ready_broker()
+    broker._on_report_query(1, "Omkt=F|Statusc=0|Ts_Code=04|Oseq_No=SEQ1|R_Time=091500")
+
+    broker.stop()
+
+    assert broker.accounts == ()
+    assert broker.selected_account is None
+    assert broker.capabilities == SessionCapabilities()
+    assert broker.query_order_reports() == ()
+
+    broker.start(_login_request())
+    host.handlers["OnLogonS"](2, "2-F00-1234567-", "", "")
+
+    # The previous session's completed parts must not carry over: a fresh session has
+    # to earn its own handshake before it is announced ready.
+    assert len(_of_type(publisher, BrokerSessionReady)) == 1
+    _complete_handshake(broker)
+    assert len(_of_type(publisher, BrokerSessionReady)) == 2
+
+
+def test_terminal_logon_status_after_ready_invalidates_rather_than_fails_login() -> None:
+    broker, host, publisher = _ready_broker()
+
+    host.handlers["OnLogonS"](-1, None, "", "")
+
+    invalidated = _of_type(publisher, BrokerSessionInvalidated)
+    assert len(invalidated) == 1
+    assert invalidated[0].reason == "TLinkStatus=-1"
+    assert _of_type(publisher, BrokerLoginFailed) == []
+    assert broker.capabilities == SessionCapabilities()
+
+
+def test_logon_rejection_before_login_keeps_the_brokers_own_message() -> None:
+    broker, host, publisher = _fresh_broker()
+    broker.start(_login_request())
+
+    host.handlers["OnLogonS"](-102, "00003無 api 使用權限，請洽所屬營業員！", "", "")
+
+    failed = _of_type(publisher, BrokerLoginFailed)
+    assert len(failed) == 1
+    assert failed[0].reason == "TLinkStatus=-102：00003無 api 使用權限，請洽所屬營業員！"
+    assert _of_type(publisher, BrokerSessionInvalidated) == []
+
+
+@pytest.mark.parametrize("status", [1, 3, 100, 201, 202])
+def test_transient_logon_statuses_are_progress_not_a_login_failure(status: int) -> None:
+    broker, host, publisher = _fresh_broker()
+    broker.start(_login_request())
+
+    host.handlers["OnLogonS"](status, None, "", "")
+
+    assert publisher.events == []
+
+
+@pytest.mark.parametrize("status", [1, 3, 100, 201, 202])
+def test_transient_logon_status_never_invalidates_a_healthy_session(status: int) -> None:
+    broker, host, publisher = _ready_broker()
+
+    host.handlers["OnLogonS"](status, None, "", "")
+
+    assert _of_type(publisher, BrokerSessionInvalidated) == []
+    assert broker.capabilities.is_session_ready
+
+
+def test_reconnect_after_invalidation_replaces_the_dead_host_silently() -> None:
+    hosts: list[FakeHost] = []
+    closed: list[FakeHost] = []
+
+    def factory() -> FakeHost:
+        host = FakeHost()
+        host.close = lambda h=host: closed.append(h)  # type: ignore[method-assign,misc]
+        hosts.append(host)
+        return host
+
+    broker, _unused, publisher = _fresh_broker(host_factory=factory)
+    broker.start(_login_request())
+    hosts[0].handlers["OnLogonS"](2, "2-F00-1234567-", "", "")
+    _complete_handshake(broker)
+    hosts[0].handlers["OnLogonS"](-1, None, "", "")
+
+    broker.start(_login_request())
+
+    # Before this fix `start()` returned early while `_host` was set, so a reconnect
+    # attempt against a dropped session silently did nothing.
+    assert len(hosts) == 2
+    assert closed == [hosts[0]]
+    assert hosts[1].control.connections == [
+        ("TEST-ID", "secret", "apitest.yuantafutures.com.tw", 80)
+    ]
+    # `BrokerLoggedOut` would cancel the very reconnect episode driving this call.
+    assert _of_type(publisher, BrokerLoggedOut) == []
+
+
+def test_start_while_a_healthy_session_is_live_is_still_a_no_op() -> None:
+    hosts: list[FakeHost] = []
+
+    def factory() -> FakeHost:
+        host = FakeHost()
+        hosts.append(host)
+        return host
+
+    broker, _unused, _publisher = _fresh_broker(host_factory=factory)
+    broker.start(_login_request())
+    hosts[0].handlers["OnLogonS"](2, "2-F00-1234567-", "", "")
+
+    broker.start(_login_request())
+
+    assert len(hosts) == 1
+
+
+def test_start_off_the_ui_thread_is_marshalled_onto_it() -> None:
+    """`ConnectivityMonitor` retries from a `threading.Timer` thread, but the OCX may
+    only be created on the thread owning the wx event loop."""
+    dispatched: list[Any] = []
+    broker, host, _publisher = _fresh_broker(ui_dispatch=dispatched.append)
+    failures: list[BaseException] = []
+
+    def call_start() -> None:
+        try:
+            broker.start(_login_request())
+        except BaseException as exc:  # noqa: BLE001 - recorded, then asserted on
+            failures.append(exc)
+
+    worker = threading.Thread(target=call_start)
+    worker.start()
+    worker.join()
+
+    assert failures == []
+    assert host.control.connections == []
+    assert len(dispatched) == 1
+
+    dispatched[0]()
+
+    assert host.control.connections == [("TEST-ID", "secret", "apitest.yuantafutures.com.tw", 80)]
+
+
+def test_start_on_the_ui_thread_is_not_marshalled() -> None:
+    dispatched: list[Any] = []
+    broker, host, _publisher = _fresh_broker(ui_dispatch=dispatched.append)
+
+    broker.start(_login_request())
+
+    assert dispatched == []
+    assert len(host.control.connections) == 1

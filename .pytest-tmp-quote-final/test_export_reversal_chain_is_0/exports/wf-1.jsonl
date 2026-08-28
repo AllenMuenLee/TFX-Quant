@@ -1,0 +1,8 @@
+{"event": "reversal_workflow_started", "seq": 136, "ts_utc": "2026-08-28T02:04:14.540627+00:00", "ts_taipei": "2026-08-28T10:04:14.540627+08:00", "correlation_id": null, "workflow_id": "wf-1", "audit": true}
+{"event": "reversal_position_queried", "seq": 137, "ts_utc": "2026-08-28T02:04:14.546628+00:00", "ts_taipei": "2026-08-28T10:04:14.546628+08:00", "correlation_id": null, "workflow_id": "wf-1", "audit": true}
+{"event": "reversal_close_order_submitted", "seq": 138, "ts_utc": "2026-08-28T02:04:14.553373+00:00", "ts_taipei": "2026-08-28T10:04:14.553373+08:00", "correlation_id": null, "workflow_id": "wf-1", "audit": true}
+{"event": "order_report_applied", "seq": 139, "ts_utc": "2026-08-28T02:04:14.559379+00:00", "ts_taipei": "2026-08-28T10:04:14.559379+08:00", "correlation_id": null, "workflow_id": "wf-1", "audit": true}
+{"event": "reversal_close_order_filled", "seq": 140, "ts_utc": "2026-08-28T02:04:14.566555+00:00", "ts_taipei": "2026-08-28T10:04:14.566555+08:00", "correlation_id": null, "workflow_id": "wf-1", "audit": true}
+{"event": "reversal_flat_confirmed", "seq": 141, "ts_utc": "2026-08-28T02:04:14.574420+00:00", "ts_taipei": "2026-08-28T10:04:14.574420+08:00", "correlation_id": null, "workflow_id": "wf-1", "audit": true}
+{"event": "reversal_entry_order_submitted", "seq": 142, "ts_utc": "2026-08-28T02:04:14.581535+00:00", "ts_taipei": "2026-08-28T10:04:14.581535+08:00", "correlation_id": null, "workflow_id": "wf-1", "audit": true}
+{"event": "reversal_completed", "seq": 143, "ts_utc": "2026-08-28T02:04:14.588536+00:00", "ts_taipei": "2026-08-28T10:04:14.588536+08:00", "correlation_id": null, "workflow_id": "wf-1", "audit": true}

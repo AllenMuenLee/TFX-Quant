@@ -20,6 +20,8 @@
   → 歷史查詢／UI／策略暖機
 ```
 
+此圖中的行情來源須沿用主 prompt 定義的 sample-based Quote host：以真實 wx window handle 和 `AtlAxCreateControlEx` 建立 32-bit OCX，並由 host 持有 control、event sink 及 advise connection。vendor callback 的 COM 簽章是 `OnGetMktAll(this, Symbol, RefPri, OpenPri, HighPri, LowPri, UpPri, DnPri, MatchTime, MatchPri, MatchQty, TolMatchQty, BestBuyQty, BestBuyPri, BestSellQty, BestSellPri, FDBPri, FDBQty, FDSPri, FDSQty, ReqType)`；由於 host 向 `GetEvents` 明確提供 event interface，comtypes 會移除 `this`，Python sink 實作的入口從 `Symbol` 開始。不得改回 PDF 的省略版簽章，也不得在 sink 再加入 `this`。`ReqType=1` 為 T 盤、`ReqType=2` 為 T+1 盤，必須隨原始事件保存或保留在 session provenance 中，以避免跨盤資料混用。
+
 歷史讀取只能查詢上述本機 repository。任何無法追溯到已保存 raw event／closed bar 的資料均不得進入正式歷史。
 
 ## 必須實作

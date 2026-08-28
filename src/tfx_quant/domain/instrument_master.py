@@ -6,9 +6,9 @@ InstrumentMasterRepository` and `infrastructure.yuanta.instrument_master_reposit
 — none of those are safely derivable, and never will be (see
 `docs/adr/0005-instrument-master-and-selection.md`).
 
-`vendor_symbol` (the SPARK API real-time quote symbol, e.g. "TXFH6") is different: the
+`vendor_symbol` (the Yuanta quote API real-time symbol, e.g. "TXFH6") is different: the
 official docs (期貨報價代碼7xxx變更規則 page) now document its encoding precisely — see
-`futures_quote_symbol()` below. This is a genuine SPARK-API-pivot change from the old
+`futures_quote_symbol()` below. This differs from the order OCX's
 legacy OCX API, whose EasyWin-format vendor symbol had no documented month/year
 encoding anywhere in the vendor PDFs (ADR 0005's original reasoning for treating it as
 pure controlled data). The master file still *stores* `vendor_symbol` as a literal
@@ -17,7 +17,7 @@ dataclass a plain value object and lets an operator eyeball/override a symbol di
 in the JSON — but every value in `instrument_master.example.json` is now
 `futures_quote_symbol()`'s actual output, not a guess.
 
-`order_commodity_code` (SPARK API's `SendFutureOrder.CommodityID1`, e.g. "FITX" for
+`order_commodity_code` (the order API's commodity code, e.g. "FITX" for
 TXF) is a **separate code space from `vendor_symbol`** — confirmed by the 交易 > 國內期貨
 下單 docs page's own worked example (`CommodityID1 = 'FITX'` alongside a completely
 different-looking quote symbol format). Only TXF's code is confirmed from that worked
@@ -45,7 +45,7 @@ index 6 ("F") = 六月/June, matching the docs' own worked example below."""
 
 
 def futures_quote_symbol(instrument: Instrument, contract: ContractMonth) -> str:
-    """The SPARK API real-time quote symbol for a specific futures contract month:
+    """The Yuanta quote API symbol for a specific futures contract month:
     `<root><month-code><year-digit>` per the 期貨報價代碼7xxx變更規則 docs page. E.g.
     `futures_quote_symbol(Instrument.TXF, ContractMonth(2021, 6))` == "TXFF1", matching
     the docs' own worked example ("2021年台指期6月:TXFF1") exactly.
@@ -75,13 +75,12 @@ class InstrumentMasterEntry:
     instrument: Instrument
     contract: ContractMonth
     vendor_symbol: str
-    """The SPARK API real-time quote symbol for this exact contract (e.g. "TXFH6") —
-    documented purely as a historical/reference identifier now, since market data comes
-    entirely from `yfinance` and nothing in this codebase subscribes with it (see
-    `implementation prompt/00-spark-to-futures-api-migration/implementation-prompt.md`).
-    Stored as a literal field rather than always recomputed inline, but every value in
-    `instrument_master.example.json` is `futures_quote_symbol()`'s actual output — see
-    this module's docstring."""
+    """The Yuanta quote-API real-time quote symbol for this exact contract (e.g.
+    "TXFF1") — this is what `desktop.quote_runtime.QuoteRuntime` actually registers
+    with the live quote gateway on login and on every instrument/contract switch (see
+    `LiveQuoteService.start`/`.select_symbol`). Stored as a literal field rather than
+    always recomputed inline, but every value in `instrument_master.example.json` is
+    `futures_quote_symbol()`'s actual output — see this module's docstring."""
     broker_product_code: str
     """The broker's base product code shown on screen (e.g. "TXF"/"MXF"), distinct
     from `vendor_symbol` which also encodes the contract month."""
@@ -100,7 +99,7 @@ class InstrumentMasterEntry:
     """Operator-controlled kill switch (到期、停止交易 etc.) — independent of
     `expiry_date` so a halt can be flagged before/without a code or data-file change."""
     order_commodity_code: str = ""
-    """SPARK API's `SendFutureOrder.CommodityID1` (e.g. "FITX" for TXF) — a separate
+    """The order API commodity code (e.g. "FITX" for TXF) — a separate
     code space from `vendor_symbol`, needed for order placement (Feature 06), not
     quote subscription. Defaults to "" (unresolved) since not every instrument's code
     is confirmed yet — see this module's docstring. Feature 06 must refuse to place an

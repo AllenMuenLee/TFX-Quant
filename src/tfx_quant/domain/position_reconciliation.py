@@ -44,6 +44,8 @@ class DiscrepancyKind(StrEnum):
     """Expected and actual disagree on sign (long vs. short, or flat vs. non-flat)."""
     QUANTITY = "QUANTITY"
     """Same sign (or both flat, which can't reach this branch), different magnitude."""
+    OTHER_CONTRACT = "OTHER_CONTRACT"
+    """The broker reports a non-flat position outside the locally selected contract."""
 
 
 def classify_discrepancy(expected: NetPosition, actual: NetPosition) -> DiscrepancyKind:

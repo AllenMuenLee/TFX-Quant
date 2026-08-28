@@ -30,12 +30,41 @@ class QuoteUpdateMode(IntEnum):
     SNAPSHOT_UPDATE = 4
 
 
+class QuoteRequestType(IntEnum):
+    """The vendor's feed selector, passed to and returned by every quote call.
+
+    The installed ``YuantaQuote_v2.1.2.9.ocx`` takes this argument on ``SetMktLogon``,
+    ``AddMktReg`` and ``DelMktReg``, and echoes it back as the last argument of every
+    event.  It is absent from ``元大行情API.pdf`` (which documents an older, shorter
+    signature) and is defined only by ``YuantaQuoteAPI Sample.py``:
+
+        # T port 80/443 , T+1 port 82/442 ,  reqType=1 T盤 , reqType=2  T+1盤
+
+    The OCX's own ``event.log`` labels it ``MarketType``; the type library calls it
+    ``ReqType``.  It selects which of the two feed sessions (``Ses1``/``Ses2`` in the
+    vendor logs) the call applies to.
+    """
+
+    T = 1
+    T_PLUS_1 = 2
+
+
 class QuoteGateway(Protocol):
     @property
     def state(self) -> QuoteConnectionState: ...
-    def connect(self, user_id: str, password: SecretStr, host: str, port: int) -> None: ...
-    def subscribe(
-        self, symbol: str, mode: QuoteUpdateMode = QuoteUpdateMode.SNAPSHOT_UPDATE
+    def connect(
+        self,
+        user_id: str,
+        password: SecretStr,
+        host: str,
+        port: int,
+        request_type: QuoteRequestType,
     ) -> None: ...
-    def unsubscribe(self, symbol: str) -> None: ...
+    def subscribe(
+        self,
+        symbol: str,
+        request_type: QuoteRequestType,
+        mode: QuoteUpdateMode = QuoteUpdateMode.SNAPSHOT_UPDATE,
+    ) -> None: ...
+    def unsubscribe(self, symbol: str, request_type: QuoteRequestType) -> None: ...
     def stop(self) -> None: ...

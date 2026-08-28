@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-import ctypes
 import os
 import struct
 import sys
 import threading
 from collections.abc import Callable
-from ctypes import wintypes
 from pathlib import Path
 from typing import Any
+
+from tfx_quant.infrastructure.yuanta.ocx_hosting import create_activex_control, preload_control
 
 _EVENT_NAMES = frozenset(
     {
@@ -23,7 +23,6 @@ _EVENT_NAMES = frozenset(
         "OnUserDefinsFuncResult",
     }
 )
-_LOAD_WITH_ALTERED_SEARCH_PATH = 0x00000008
 
 
 def default_api_directory() -> Path:
@@ -53,17 +52,6 @@ def is_control_registered() -> bool:
             return True
     except FileNotFoundError:
         return False
-
-
-def _preload_control(ocx_path: Path) -> None:
-    """Load the OCX with its directory in the dependency search path."""
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    load_library = kernel32.LoadLibraryExW
-    load_library.restype = ctypes.c_void_p
-    load_library.argtypes = [ctypes.c_wchar_p, ctypes.c_void_p, ctypes.c_uint32]
-    if not load_library(str(ocx_path), None, _LOAD_WITH_ALTERED_SEARCH_PATH):
-        error = ctypes.get_last_error()
-        raise OSError(error, f"LoadLibraryExW failed for {ocx_path}")
 
 
 class YuantaOcxHost:
@@ -105,11 +93,11 @@ class YuantaOcxHost:
         self.control: Any = None
         self._frame: Any = wx.Frame(owner, size=(0, 0), style=0)
         try:
-            _preload_control(ocx_path)
+            preload_control(ocx_path)
             generated = comtypes.client.GetModule(str(ocx_path))
             dispatch_interface = generated._DYuantaOrd
             events_interface = generated._DYuantaOrdEvents
-            self.control = self._create_control(
+            self.control = create_activex_control(
                 yuanta_control_progid(), self._frame.GetHandle(), dispatch_interface
             )
             # The connection object owns the COM advise cookie and must stay alive.
@@ -120,43 +108,6 @@ class YuantaOcxHost:
             self._frame.Destroy()
             self._frame = None
             raise
-
-    @staticmethod
-    def _create_control(progid: str, hwnd: int, dispatch_interface: Any) -> Any:
-        import comtypes
-        import comtypes.automation
-
-        atl = ctypes.OleDLL("atl.dll")
-        create = atl.AtlAxCreateControlEx
-        create.argtypes = [
-            wintypes.LPCWSTR,
-            wintypes.HWND,
-            ctypes.c_void_p,
-            ctypes.POINTER(ctypes.c_void_p),
-            ctypes.POINTER(ctypes.c_void_p),
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-        ]
-        create.restype = wintypes.LONG
-        container = ctypes.c_void_p()
-        raw_control = ctypes.c_void_p()
-        null_iid = comtypes.GUID()
-        result = create(
-            progid,
-            wintypes.HWND(hwnd),
-            None,
-            ctypes.byref(container),
-            ctypes.byref(raw_control),
-            ctypes.byref(null_iid),
-            None,
-        )
-        if result < 0:
-            raise OSError(
-                f"AtlAxCreateControlEx({progid!r}) failed, HRESULT=0x{result & 0xFFFFFFFF:08X}"
-            )
-        unknown = ctypes.cast(raw_control, ctypes.POINTER(comtypes.IUnknown))
-        dispatch = unknown.QueryInterface(comtypes.automation.IDispatch)
-        return ctypes.cast(dispatch, ctypes.POINTER(dispatch_interface))
 
     def bind(self, event_name: str, handler: Callable[..., object]) -> None:
         """Route one documented COM callback to an application handler."""

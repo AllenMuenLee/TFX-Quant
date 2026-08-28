@@ -75,6 +75,13 @@ CREATE INDEX IF NOT EXISTS idx_order_intents_status ON order_intents (status);
 CREATE INDEX IF NOT EXISTS idx_order_intents_contract
     ON order_intents (account_branch_id, account_no, account_sub_account, instrument,
                        contract_year, contract_month);
+CREATE TABLE IF NOT EXISTS order_outbox (
+    outbox_id TEXT PRIMARY KEY,
+    local_order_id TEXT NOT NULL UNIQUE REFERENCES order_intents(local_order_id),
+    idempotency_key TEXT NOT NULL UNIQUE,
+    checkpoint TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 _SELECT_COLUMNS = (
@@ -194,6 +201,53 @@ class SqliteOrderRepository:
             status=intent.status.value,
             duration_ms=(time.monotonic() - start) * 1000,
         )
+
+    def stage_submission(self, intent: OrderIntent) -> None:
+        """Atomically persist SUBMITTING plus an outbox CALL_PENDING checkpoint."""
+        start = time.monotonic()
+        try:
+            with self._lock:
+                self._conn.execute("BEGIN IMMEDIATE")
+                cursor = self._conn.execute(
+                    "UPDATE order_intents SET status=?, updated_at=?, last_event_summary=? "
+                    "WHERE local_order_id=?",
+                    (intent.status.value, intent.updated_at.value.isoformat(),
+                     intent.last_event_summary, str(intent.local_order_id.value)),
+                )
+                if cursor.rowcount != 1:
+                    raise OrderRepositoryError("cannot stage a missing order intent")
+                self._conn.execute(
+                    "INSERT INTO order_outbox VALUES (?, ?, ?, 'CALL_PENDING', ?)",
+                    (str(intent.local_order_id.value), str(intent.local_order_id.value),
+                     intent.idempotency_key, intent.updated_at.value.isoformat()),
+                )
+                self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        log_debug(_logger, "order_outbox_staged", outbox_id=str(intent.local_order_id.value),
+                  idempotency_key=intent.idempotency_key, checkpoint="CALL_PENDING",
+                  commit_result="committed", duration_ms=(time.monotonic()-start)*1000)
+
+    def mark_outbox_checkpoint(self, local_order_id: LocalOrderId, checkpoint: str) -> None:
+        allowed = {"BROKER_CALL_STARTED", "BROKER_CALL_RETURNED", "BROKER_CALL_FAILED"}
+        if checkpoint not in allowed:
+            raise ValueError(f"invalid outbox checkpoint: {checkpoint}")
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE order_outbox SET checkpoint=?, updated_at=? WHERE local_order_id=?",
+                (checkpoint, datetime.now().astimezone().isoformat(), str(local_order_id.value)),
+            )
+            self._conn.commit()
+        if cursor.rowcount != 1:
+            raise OrderRepositoryError("cannot checkpoint a missing outbox record")
+
+    def list_unresolved_outbox(self) -> Sequence[tuple[str, str, str]]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT outbox_id, idempotency_key, checkpoint FROM order_outbox "
+                "WHERE checkpoint != 'BROKER_CALL_RETURNED' ORDER BY updated_at"
+            ).fetchall()
 
     # -- Reads ------------------------------------------------------------------------
 

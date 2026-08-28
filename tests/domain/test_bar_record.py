@@ -50,7 +50,7 @@ def _record(start: Timestamp, end: Timestamp, **overrides: object) -> BarRecord:
         "period": BarPeriod.SIXTY_MINUTE,
         "trading_day": start.value.date(),
         "session": MarketSession.DAY,
-        "source": BarDataSource.POLLED_FROM_YFINANCE,
+        "source": BarDataSource.LOCAL_YUANTA_REALTIME,
         "is_gap_recovery": False,
         "created_at": start,
         "updated_at": start,
@@ -162,12 +162,7 @@ def test_bar_conflict_audit_accepts_matching_identities() -> None:
     start = _ts(2026, 9, 16, 8, 45)
     end = _ts(2026, 9, 16, 9, 45)
     existing = _record(start, end, bar=_bar(start, end, price="17500"))
-    incoming = _record(
-        start,
-        end,
-        bar=_bar(start, end, price="17600"),
-        source=BarDataSource.BACKFILLED_FROM_YFINANCE,
-    )
+    incoming = _record(start, end, bar=_bar(start, end, price="17600"))
     audit = BarConflictAudit(existing=existing, incoming=incoming, detected_at=Timestamp.now())
     assert audit.existing is existing
     assert audit.incoming is incoming
@@ -175,10 +170,6 @@ def test_bar_conflict_audit_accepts_matching_identities() -> None:
 
 def test_bar_conflict_audit_rejects_mismatched_identities() -> None:
     existing = _record(_ts(2026, 9, 16, 8, 45), _ts(2026, 9, 16, 9, 45))
-    incoming = _record(
-        _ts(2026, 9, 16, 9, 45),
-        _ts(2026, 9, 16, 10, 45),
-        source=BarDataSource.BACKFILLED_FROM_YFINANCE,
-    )
+    incoming = _record(_ts(2026, 9, 16, 9, 45), _ts(2026, 9, 16, 10, 45))
     with pytest.raises(InvalidBarRecordError):
         BarConflictAudit(existing=existing, incoming=incoming, detected_at=Timestamp.now())

@@ -47,6 +47,12 @@ def test_certificate_import_state_is_remembered() -> None:
     assert login_preferences.load().certificate_imported is True
 
 
+def test_certificate_path_is_remembered() -> None:
+    login_preferences.save_certificate_path(r"C:\certs\yuanta.pfx")
+
+    assert login_preferences.load().certificate_path == r"C:\certs\yuanta.pfx"
+
+
 def test_load_tolerates_a_corrupt_prefs_file(tmp_path: Path) -> None:
     prefs_path = tmp_path / "tfx_quant" / "login_prefs.json"
     prefs_path.parent.mkdir(parents=True)

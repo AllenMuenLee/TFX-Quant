@@ -6,14 +6,9 @@ discovery/selection, capability tracking, and graceful shutdown. A concrete adap
 satisfy both Protocols at once, but callers that only need query access should keep
 depending on the narrower port.
 
-There is no market-data capability here at all: market data comes from `yfinance`
-(`application.market_data.bar_service.MarketDataBarService`), entirely independent of
-this session — see `implementation prompt/00-spark-to-futures-api-migration/
-implementation-prompt.md`'s "讀取 readiness 拆成 broker trading、order reports、queries
-與 yfinance market data" mandate. `SessionCapabilities` deliberately keeps "logged in",
-"can trade", "can receive order/fill reports", and "can query" as four independent
-booleans — the implementation prompt explicitly forbids collapsing "logged in" into "can
-trade".
+Market data is deliberately absent from this port. Yuanta's documented quote OCX uses
+its own `SetMktLogon` connection, independently of the order OCX session represented
+here. `SessionCapabilities` therefore describes only order/trading readiness.
 """
 
 from __future__ import annotations
@@ -40,18 +35,12 @@ class LoginRequest:
     not depend on it — see the "Application does not depend on infrastructure"
     import-linter contract).
 
-    `user_id` is the full SPARK API account string the operator types in (e.g.
-    `F...`+17 digits for futures) — see 元大 SPARK API's 登入 docs page. There is no
-    separate "quote session" concept in SPARK API (unlike the legacy OCX API's day/
-    night quote ports) — one login covers trading, market data, and reports together.
+    `user_id` is the operator's identity ID. It is supplied to both the documented
+    order OCX call `SetFutOrdConnection(ID, Pass, IP, Port)` and the separate quote OCX
+    call `SetMktLogon(User, pass, IP, PORT)`.
 
-    Deliberately does **not** carry a certificate path/password: on Windows, SPARK
-    API's `Login(Account, Pass)` itself takes no certificate parameter — the docs say
-    the certificate must be imported into the OS certificate store ahead of time, a
-    one-time setup step independent of any individual login attempt. That one-time
-    import is a `desktop/login_dialog.py`-local UI action
-    (`infrastructure.yuanta.credentials.ensure_certificate_imported`), not part of the
-    `Login()` RPC this DTO models — see the login screen for where it lives."""
+    Neither documented login signature accepts a certificate path or certificate
+    password, so neither belongs in this DTO."""
 
     environment: Environment
     user_id: str

@@ -52,26 +52,19 @@ def test_manual_contract_mode_without_contract_is_rejected(
         validate_startup(valid_settings_raw)
 
 
-def test_manual_contract_mode_with_invalid_month_is_rejected(
-    valid_settings_raw: dict[str, Any],
-) -> None:
-    valid_settings_raw["contract_selection_mode"] = "MANUAL"
-    valid_settings_raw["manual_contract_year"] = 2026
-    valid_settings_raw["manual_contract_month"] = 13
-    with pytest.raises(SettingsValidationError):
-        validate_startup(valid_settings_raw)
-
-
-def test_manual_contract_mode_with_valid_contract_succeeds(
+def test_manual_contract_fields_are_rejected_even_with_valid_contract(
     valid_settings_raw: dict[str, Any],
 ) -> None:
     valid_settings_raw["contract_selection_mode"] = "MANUAL"
     valid_settings_raw["manual_contract_year"] = 2026
     valid_settings_raw["manual_contract_month"] = 9
+    with pytest.raises(SettingsValidationError):
+        validate_startup(valid_settings_raw)
+
+
+def test_contract_selection_is_always_auto(valid_settings_raw: dict[str, Any]) -> None:
     settings = validate_startup(valid_settings_raw)
-    assert settings.contract_selection_mode is ContractSelectionMode.MANUAL
-    assert settings.manual_contract() is not None
-    assert settings.manual_contract().code == "202609"  # type: ignore[union-attr]
+    assert settings.contract_selection_mode is ContractSelectionMode.AUTO
 
 
 def test_blank_account_alias_is_rejected(valid_settings_raw: dict[str, Any]) -> None:

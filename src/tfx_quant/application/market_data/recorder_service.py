@@ -11,6 +11,7 @@ from tfx_quant.application.market_data.realtime_bar_aggregator import (
 )
 from tfx_quant.application.ports.market_event_repository import MarketEventRepository
 from tfx_quant.domain.market_data import RawMarketEvent
+from tfx_quant.domain.timestamp import Timestamp
 
 
 class MarketDataRecorderService:
@@ -34,3 +35,8 @@ class MarketDataRecorderService:
         for closed in self._aggregator.accept(normalized):
             self._on_closed(closed)
         return True
+
+    def advance(self, now: Timestamp) -> None:
+        """Close a boundary on wall-clock time even when no next trade arrives."""
+        for closed in self._aggregator.advance(now):
+            self._on_closed(closed)

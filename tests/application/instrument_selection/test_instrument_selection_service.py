@@ -12,7 +12,6 @@ from tfx_quant.application.events.event_coordinator import EventCoordinator
 from tfx_quant.application.events.events import Event, InstrumentSwitchCompleted
 from tfx_quant.application.instrument_selection.errors import (
     InstrumentMasterEntryNotFoundError,
-    SwitchBlockedError,
 )
 from tfx_quant.application.instrument_selection.instrument_selection_service import (
     InstrumentSelectionService,
@@ -222,12 +221,10 @@ def test_switch_allowed_while_paused_safe(tmp_path: Path) -> None:
     assert service.check_switch_allowed() is None
 
 
-def test_switch_blocked_with_open_position(tmp_path: Path) -> None:
+def test_quote_switch_allowed_with_open_position(tmp_path: Path) -> None:
     position = _position(Instrument.MXF, _MXF_CONTRACT, lots=1)
     service, *_ = _build(tmp_path, positions=(position,))
-    reason = service.check_switch_allowed()
-    assert reason is not None
-    assert "持倉" in reason
+    assert service.check_switch_allowed() is None
 
 
 def test_switch_allowed_with_only_flat_positions(tmp_path: Path) -> None:
@@ -236,12 +233,10 @@ def test_switch_allowed_with_only_flat_positions(tmp_path: Path) -> None:
     assert service.check_switch_allowed() is None
 
 
-def test_switch_blocked_with_open_orders(tmp_path: Path) -> None:
+def test_quote_switch_allowed_with_open_orders(tmp_path: Path) -> None:
     order = _order(Instrument.MXF, _MXF_CONTRACT)
     service, *_ = _build(tmp_path, open_orders=(order,))
-    reason = service.check_switch_allowed()
-    assert reason is not None
-    assert "委託" in reason
+    assert service.check_switch_allowed() is None
 
 
 def test_switch_to_clears_bar_state(tmp_path: Path) -> None:
@@ -269,15 +264,15 @@ def test_switch_to_a_second_contract_clears_bar_state_again(tmp_path: Path) -> N
     assert service.current == second
 
 
-def test_switch_to_raises_when_blocked(tmp_path: Path) -> None:
+def test_quote_switch_succeeds_with_open_order(tmp_path: Path) -> None:
     order = _order(Instrument.MXF, _MXF_CONTRACT)
     service, *_ = _build(tmp_path, open_orders=(order,))
     resolved = service.resolve_manual(Instrument.MXF, _MXF_CONTRACT)
-    with pytest.raises(SwitchBlockedError):
-        service.switch_to(resolved)
+    service.switch_to(resolved)
+    assert service.current == resolved
 
 
-def test_switch_to_does_not_mutate_current_when_blocked(tmp_path: Path) -> None:
+def test_quote_switch_succeeds_with_existing_position(tmp_path: Path) -> None:
     service, trade_gateway, _bar_store = _build(tmp_path)
     first = service.resolve_manual(Instrument.MXF, _MXF_CONTRACT)
     service.switch_to(first)
@@ -287,10 +282,8 @@ def test_switch_to_does_not_mutate_current_when_blocked(tmp_path: Path) -> None:
     trade_gateway.add_position(_position(Instrument.MXF, _MXF_CONTRACT, lots=1))
 
     second = service.resolve_manual(Instrument.MXF, _MXF_DEC_CONTRACT)
-    with pytest.raises(SwitchBlockedError):
-        service.switch_to(second)
-
-    assert service.current == first
+    service.switch_to(second)
+    assert service.current == second
 
 
 def test_switch_to_publishes_event(tmp_path: Path) -> None:

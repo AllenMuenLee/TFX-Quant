@@ -4,10 +4,12 @@ Owns exactly the sequence the implementation prompt spells out: 切換流程必�
 strategy must already be paused/stopped — this service never drives the state machine
 itself, see below), 重新查詢帳戶狀態, 清空 K 棒／訊號狀態; 成功後仍需使用者重新啟動。
 And the hard precondition: 策略執行中或存在持倉、活動委託、未知委託時禁止切換商品／契約。
-There is no market-data subscribe/unsubscribe step here — market data comes from
-`yfinance`, entirely independent of any per-contract vendor subscription; clearing the
-bar/signal state (`bar_signal_state_store.clear()`) is what points `MarketDataBarService`
-at the newly selected contract's Yahoo ticker mapping.
+This service itself never touches the quote-gateway registration directly — publishing
+`InstrumentSwitchCompleted` (carrying `vendor_symbol`) is what drives
+`desktop.quote_runtime.QuoteRuntime._on_switch` to re-register the live Yuanta quote
+symbol for the newly selected contract; clearing the bar/signal state
+(`bar_signal_state_store.clear()`) is a separate step, resetting Feature 05's
+per-(instrument, contract) engine state.
 
 **Why this service never transitions `StrategyStateMachine` itself**: the "must first
 pause" requirement and the "forbid switching while executing" requirement would
@@ -25,9 +27,10 @@ clearing bar/signal state**: this is the literal "重新查詢帳戶狀態" step
 position/order query right before the switch actually takes effect, not just the
 earlier `check_switch_allowed()` a caller may have polled moments before while the
 operator was still deciding. If the real `TradeGatewayPort` can't yet answer that query
-(Feature 02's `BrokerSessionTradeGatewayView.query_open_orders/positions` still raise
-`NotImplementedError` — structured parsing is a documented Feature 02/08 gap), that
-propagates as a blocked switch rather than a silent unsafe assumption.
+safely, `LegacyBroker.query_open_orders` raises `OrderQueryNotReadyError` whenever the broker's
+report query hasn't completed yet or an order's status is unresolved (see
+`infrastructure.yuanta.legacy_broker`) — that propagates as a blocked switch rather
+than a silent unsafe assumption.
 """
 
 from __future__ import annotations
@@ -47,7 +50,9 @@ from tfx_quant.application.instrument_selection.validation import validate_can_o
 from tfx_quant.application.ports.bar_signal_state import BarSignalStateStore
 from tfx_quant.application.ports.clock import Clock
 from tfx_quant.application.ports.instrument_master import InstrumentMasterRepository
-from tfx_quant.application.ports.yuanta_gateways import TradeGatewayPort
+from tfx_quant.application.ports.yuanta_gateways import (
+    TradeGatewayPort,
+)
 from tfx_quant.domain.contract import ContractMonth
 from tfx_quant.domain.instrument import Instrument
 from tfx_quant.domain.order import Order
@@ -208,36 +213,12 @@ class InstrumentSelectionService:
     # -- Switching --------------------------------------------------------------
 
     def _evaluate_switch_allowed(self) -> _SwitchAllowedResult:
-        if self._strategy_state_machine.state not in _SWITCHABLE_STATES:
-            return _SwitchAllowedResult(reason="策略執行中，禁止切換商品／契約，請先停止或暫停策略")
-        # Watching Yahoo market data is deliberately available before broker login.
-        # With no active broker session there cannot be broker positions/orders to
-        # protect, and yfinance selection must not depend on the OCX being connected.
-        if not self._broker_session_ready():
+        # This selection controls only the quote subscription and chart identity.
+        # Trading is independently restricted to MXF at the order boundary, so
+        # broker positions and active orders do not block a market-view switch.
+        if self._strategy_state_machine.state in _SWITCHABLE_STATES:
             return _SwitchAllowedResult(reason=None)
-        try:
-            positions = self._trade_gateway.query_positions()
-            open_orders = self._trade_gateway.query_open_orders()
-        except NotImplementedError:
-            return _SwitchAllowedResult(
-                reason="尚無法查詢帳戶持倉／委託狀態（結構化查詢尚未實作），"
-                "為安全起見禁止切換商品／契約"
-            )
-        positions = tuple(positions)
-        open_orders = tuple(open_orders)
-        if any(not position.net.is_flat for position in positions):
-            return _SwitchAllowedResult(
-                reason="尚有持倉，禁止切換商品／契約",
-                positions=positions,
-                open_orders=open_orders,
-            )
-        if open_orders:
-            return _SwitchAllowedResult(
-                reason="尚有活動委託或狀態不明委託，禁止切換商品／契約",
-                positions=positions,
-                open_orders=open_orders,
-            )
-        return _SwitchAllowedResult(reason=None, positions=positions, open_orders=open_orders)
+        return _SwitchAllowedResult(reason="策略執行中，禁止切換市場行情，請先停止或安全暫停")
 
     def check_switch_allowed(self) -> str | None:
         """Returns a Chinese block-reason, or `None` if switching is currently
