@@ -211,23 +211,37 @@ class SqliteOrderRepository:
                 cursor = self._conn.execute(
                     "UPDATE order_intents SET status=?, updated_at=?, last_event_summary=? "
                     "WHERE local_order_id=?",
-                    (intent.status.value, intent.updated_at.value.isoformat(),
-                     intent.last_event_summary, str(intent.local_order_id.value)),
+                    (
+                        intent.status.value,
+                        intent.updated_at.value.isoformat(),
+                        intent.last_event_summary,
+                        str(intent.local_order_id.value),
+                    ),
                 )
                 if cursor.rowcount != 1:
                     raise OrderRepositoryError("cannot stage a missing order intent")
                 self._conn.execute(
                     "INSERT INTO order_outbox VALUES (?, ?, ?, 'CALL_PENDING', ?)",
-                    (str(intent.local_order_id.value), str(intent.local_order_id.value),
-                     intent.idempotency_key, intent.updated_at.value.isoformat()),
+                    (
+                        str(intent.local_order_id.value),
+                        str(intent.local_order_id.value),
+                        intent.idempotency_key,
+                        intent.updated_at.value.isoformat(),
+                    ),
                 )
                 self._conn.commit()
         except Exception:
             self._conn.rollback()
             raise
-        log_debug(_logger, "order_outbox_staged", outbox_id=str(intent.local_order_id.value),
-                  idempotency_key=intent.idempotency_key, checkpoint="CALL_PENDING",
-                  commit_result="committed", duration_ms=(time.monotonic()-start)*1000)
+        log_debug(
+            _logger,
+            "order_outbox_staged",
+            outbox_id=str(intent.local_order_id.value),
+            idempotency_key=intent.idempotency_key,
+            checkpoint="CALL_PENDING",
+            commit_result="committed",
+            duration_ms=(time.monotonic() - start) * 1000,
+        )
 
     def mark_outbox_checkpoint(self, local_order_id: LocalOrderId, checkpoint: str) -> None:
         allowed = {"BROKER_CALL_STARTED", "BROKER_CALL_RETURNED", "BROKER_CALL_FAILED"}
@@ -304,6 +318,13 @@ class SqliteOrderRepository:
                 f"SELECT {_SELECT_COLUMNS} FROM order_intents "
                 f"WHERE status NOT IN ({placeholders}) ORDER BY created_at ASC",
                 _TERMINAL_STATUS_VALUES,
+            ).fetchall()
+        return [_row_to_intent(row) for row in rows]
+
+    def list_all(self) -> Sequence[OrderIntent]:
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {_SELECT_COLUMNS} FROM order_intents ORDER BY created_at ASC, rowid ASC"
             ).fetchall()
         return [_row_to_intent(row) for row in rows]
 

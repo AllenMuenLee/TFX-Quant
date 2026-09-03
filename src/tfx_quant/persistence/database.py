@@ -90,7 +90,10 @@ def open_managed_database(
         _logger.info(
             "database_startup_completed path=%s schema_version=%d integrity=%s "
             "backup_id=%s duration_ms=%.3f",
-            _masked(path), target_version, integrity, backup_id,
+            _masked(path),
+            target_version,
+            integrity,
+            backup_id,
             (time.monotonic() - started) * 1000,
         )
         return DatabaseStartupResult(connection, target_version, integrity, backup_id)

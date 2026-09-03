@@ -22,9 +22,9 @@ from tfx_quant.domain.timestamp import TAIPEI_TZ, Timestamp
 
 _INSTRUMENT = Instrument.TXF
 _CONTRACT = ContractMonth(year=2026, month=9)
-_MA_WINDOW = 35
+_MA_WINDOW = 20
 _FLAT_LOOKBACK = 5
-_WARMUP = _MA_WINDOW + _FLAT_LOOKBACK - 1  # 39: enough closes for 5 full MA values
+_WARMUP = _MA_WINDOW + _FLAT_LOOKBACK - 1  # 24: enough closes for 5 full MA values
 
 
 def _engine(config: EngineConfig | None = None) -> StrategySignalEngine:

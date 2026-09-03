@@ -1,9 +1,22 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """`real_api` tests hit a real Yuanta OCX; they are skipped unless opted in with
+    `TFX_QUANT_REAL_API=1`, and even then must never submit an order (each carries its
+    own no-send guard)."""
+    if os.environ.get("TFX_QUANT_REAL_API") == "1":
+        return
+    skip = pytest.mark.skip(reason="real_api: set TFX_QUANT_REAL_API=1 to run (never sends orders)")
+    for item in items:
+        if "real_api" in item.keywords:
+            item.add_marker(skip)
 
 
 @pytest.fixture
@@ -30,4 +43,7 @@ def valid_settings_raw(tmp_path: Path) -> dict[str, Any]:
         # Same isolation again, for PositionReconciliationService's
         # SqlitePositionBaselineRepository (Feature 08).
         "position_baseline_db_path": str(tmp_path / "position_baselines.sqlite3"),
+        # Same isolation again, for FillLedgerService's SqliteFillLedgerRepository
+        # (Feature 11).
+        "fill_ledger_db_path": str(tmp_path / "fill_ledger.sqlite3"),
     }

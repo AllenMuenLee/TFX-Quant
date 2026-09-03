@@ -36,6 +36,12 @@ class LedgerFill:
     commission: Decimal | None
     tax: Decimal | None
     source: str
+    simulation: bool
+    """Indelible provenance flag — `True` for every fill produced by the local broker
+    simulator (測試環境), `False` for a real Yuanta fill report.
+    Deliberately has no default: every construction site states it explicitly, and it is
+    persisted as its own column so a simulated fill can never be mistaken for a real one
+    after the fact."""
 
     def __post_init__(self) -> None:
         if not self.fill_id.strip() or not self.broker_order_no.strip() or not self.source.strip():
@@ -87,6 +93,10 @@ class RealizedTrade:
     matching_method: str = "FIFO"
     matching_version: str = "1"
     provisional_reasons: tuple[str, ...] = ()
+    simulation: bool = False
+    """`True` only when every fill in the match was simulated. A match that mixed a
+    simulated and a real fill carries `"mixed_simulation_fills"` in
+    `provisional_reasons` and stays `simulation=False`."""
 
     @property
     def provisional(self) -> bool:
@@ -102,6 +112,7 @@ class ReportSummary:
     net_pnl: Decimal
     filled_lots: int
     provisional: bool
+    simulation: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +126,10 @@ class TradeReport:
     daily: tuple[ReportSummary, ...]
     monthly: tuple[ReportSummary, ...]
     warnings: tuple[str, ...] = field(default_factory=tuple)
+    simulation: bool = False
+    """`True` only when every fill in the window was simulated; `False` for an empty
+    window or any real fill. A window mixing simulated and real fills also adds the
+    `"mixed_simulation_and_real_fills"` warning."""
 
 
 def money_round(value: Decimal, quantum: Decimal = Decimal("1")) -> Decimal:

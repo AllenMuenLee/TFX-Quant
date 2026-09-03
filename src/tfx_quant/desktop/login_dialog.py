@@ -1,15 +1,18 @@
 """Login dialog for Yuanta's separate order and quote OCX sessions.
 
-Implements `implementation prompt/02-yuanta-api-session/login-input-implementation-
-prompt.md`: collects 執行環境, 帳號, 密碼, 記住帳號, and 安全儲存密碼 from the operator,
+Collects 帳號, 密碼, 記住帳號, 安全儲存密碼 and the login certificate from the operator,
 builds a `LoginRequest` (`application/ports/broker_session.py`), and hands it to
 `services.broker_session.start()`. Never touches the `pythonnet`/CLR layer directly —
 that stays inside the adapter `IBrokerSession` wraps.
 
 The validation/DTO-building logic (`build_login_request`) is deliberately a plain,
-wx-free function so it is testable without a live `wx.App`. The selected environment
-routes only the order connection; the quote API has one documented host and a separate
-login call.
+wx-free function so it is testable without a live `wx.App`.
+
+This dialog is the **正式環境 (PRODUCTION)** trade login only. The 執行環境 選擇（模擬下單 ↔
+正式下單）lives on the readiness screen (`ReadinessFrame`) and rebuilds the whole service
+container; the 測試環境 uses the local broker simulator and a separate quote-only dialog
+(`quote_login_dialog.py`). There is no "log in to a UAT/test trade server" flow — the only
+real trade endpoint is production.
 """
 
 from __future__ import annotations
@@ -35,12 +38,6 @@ from tfx_quant.telemetry import get_logger, log_info, log_warning
 from tfx_quant.telemetry.masking import field_present, mask_account
 
 _logger = get_logger(__name__)
-
-_ENVIRONMENT_CHOICES: tuple[Environment, ...] = (Environment.TEST, Environment.PRODUCTION)
-_ENVIRONMENT_LABELS = (
-    "交易測試 UAT（行情 API 仍使用唯一正式主機）",
-    "交易正式 PROD (PRODUCTION)",
-)
 
 _PRODUCTION_CONFIRM_MESSAGE = (
     "即將以「正式環境」登入元大期貨 API，登入成功後可能影響真實帳戶／交易相關資料。\n"
@@ -137,7 +134,6 @@ def build_certificate_import_request(
 
 @dataclass(frozen=True, slots=True)
 class _FormValues:
-    environment: Environment
     user_id: str
     password: str
     remember_id: bool
@@ -162,11 +158,7 @@ class LoginDialog(wx.Dialog):
         self._panel = panel
         sizer = wx.BoxSizer(wx.VERTICAL)
 
-        self._environment_radio = wx.RadioBox(
-            panel, label="執行環境", choices=list(_ENVIRONMENT_LABELS)
-        )
-        self._environment_radio.SetSelection(0)  # 預設測試
-        sizer.Add(self._environment_radio, 0, wx.ALL | wx.EXPAND, 8)
+        sizer.Add(wx.StaticText(panel, label="正式環境（PRODUCTION）交易登入"), 0, wx.ALL, 8)
 
         id_row = wx.BoxSizer(wx.HORIZONTAL)
         id_row.Add(wx.StaticText(panel, label="帳號："), 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 6)
@@ -193,9 +185,7 @@ class LoginDialog(wx.Dialog):
 
         sizer.Add(wx.StaticLine(panel), 0, wx.EXPAND | wx.ALL, 6)
 
-        sizer.Add(
-            wx.StaticText(panel, label="憑證匯入（正式環境登入前需完成一次）"), 0, wx.ALL, 6
-        )
+        sizer.Add(wx.StaticText(panel, label="憑證匯入（正式環境登入前需完成一次）"), 0, wx.ALL, 6)
         cert_path_row = wx.BoxSizer(wx.HORIZONTAL)
         self._certificate_path_ctrl = wx.TextCtrl(panel, value=prefs.certificate_path or "")
         cert_path_row.Add(self._certificate_path_ctrl, 1, wx.ALL | wx.EXPAND, 6)
@@ -289,7 +279,6 @@ class LoginDialog(wx.Dialog):
 
     def _read_form(self) -> _FormValues:
         return _FormValues(
-            environment=_ENVIRONMENT_CHOICES[self._environment_radio.GetSelection()],
             user_id=self._user_id_ctrl.GetValue(),
             password=self._password_ctrl.GetValue(),
             remember_id=self._remember_id_checkbox.GetValue(),
@@ -298,7 +287,6 @@ class LoginDialog(wx.Dialog):
 
     def _set_form_enabled(self, enabled: bool) -> None:
         for ctrl in (
-            self._environment_radio,
             self._user_id_ctrl,
             self._password_ctrl,
             self._toggle_password_button,
@@ -317,16 +305,11 @@ class LoginDialog(wx.Dialog):
             return  # 禁止重複送出
 
         values = self._read_form()
-        log_info(
-            _logger,
-            "login_environment_selected",
-            environment=values.environment.value,
-        )
         stripped_id = values.user_id.strip()
         stored_password = credentials.load_stored_password(stripped_id) if stripped_id else None
         try:
             request = build_login_request(
-                environment=values.environment,
+                environment=Environment.PRODUCTION,
                 user_id=values.user_id,
                 password=values.password,
                 stored_password=stored_password,
@@ -347,22 +330,21 @@ class LoginDialog(wx.Dialog):
             user_id_masked=mask_account(request.user_id),
         )
 
-        if values.environment is Environment.PRODUCTION:
-            confirmed_at = Timestamp.now()
-            confirmed = (
-                wx.MessageBox(
-                    _PRODUCTION_CONFIRM_MESSAGE, "正式環境確認", wx.YES_NO | wx.ICON_WARNING, self
-                )
-                == wx.YES
+        confirmed_at = Timestamp.now()
+        confirmed = (
+            wx.MessageBox(
+                _PRODUCTION_CONFIRM_MESSAGE, "正式環境確認", wx.YES_NO | wx.ICON_WARNING, self
             )
-            log_info(
-                _logger,
-                "production_environment_confirmation",
-                confirmed_at=confirmed_at.value.isoformat(),
-                confirmed=confirmed,
-            )
-            if not confirmed:
-                return
+            == wx.YES
+        )
+        log_info(
+            _logger,
+            "production_environment_confirmation",
+            confirmed_at=confirmed_at.value.isoformat(),
+            confirmed=confirmed,
+        )
+        if not confirmed:
+            return
 
         login_preferences.save_remembered_user_id(request.user_id if values.remember_id else None)
 

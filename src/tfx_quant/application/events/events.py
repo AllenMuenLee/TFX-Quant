@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+from decimal import Decimal
 
 from tfx_quant.application.ports.broker_session import LogoutReason, SessionCapabilities
 from tfx_quant.domain.account import TradingAccount
@@ -90,6 +91,32 @@ class OrderRequiresManualReview(Event):
 
 
 @dataclass(frozen=True, slots=True)
+class TradeLedgerFillRecorded(Event):
+    """`application.trade_reports.fill_ledger_service.FillLedgerService` translated a
+    `FillReceived` into an append-only `LedgerFill` and handed it to the ledger. Carries
+    the dedup `outcome` (`FillAppendOutcome` value) so a duplicate broker fill callback is
+    visibly a no-op, and `simulation` so a UI/subscriber can key on provenance without
+    reloading the row."""
+
+    fill_id: str
+    outcome: str
+    order_correlation: str
+    simulation: bool
+
+
+@dataclass(frozen=True, slots=True)
+class TradeLedgerAppendFailed(Event):
+    """A `FillReceived` could not be turned into a `LedgerFill` — no matching order
+    intent, the intent has no broker order number yet, or the ledger write itself failed.
+    Fires reliably; does not itself enforce a strategy-wide pause, same "fires reliably,
+    doesn't enforce" split as `OrderRequiresManualReview` — the P&L numbers are simply
+    incomplete until an operator resolves it."""
+
+    client_order_id: ClientOrderId
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class BrokerLoginSucceeded(Event):
     """The Yuanta order OCX login callback reported success.
 
@@ -166,12 +193,13 @@ class BrokerSessionReady(Event):
 @dataclass(frozen=True, slots=True)
 class InstrumentSwitchCompleted(Event):
     """`InstrumentSelectionService.switch_to()` succeeded — account status requeried,
-    bar/signal state cleared, and `vendor_symbol` carried here so
-    `desktop.quote_runtime.QuoteRuntime._on_switch` can re-register the live Yuanta
-    quote symbol for the newly selected contract. The strategy state machine is left
-    in whatever paused/stopped state it was already in; per Feature 03's acceptance
-    criteria the user must still press start again (Running is only ever reachable via
-    a fresh Starting)."""
+    bar/signal state cleared, and `vendor_symbol` carried here for
+    `desktop.quote_runtime.QuoteRuntime._on_switch`. That handler changes only which
+    recorded market is charted: every `Instrument` is registered and recorded for the
+    whole quote session, so a switch re-registers nothing unless it also changes a
+    contract month. The strategy state machine is left in whatever paused/stopped state
+    it was already in; per Feature 03's acceptance criteria the user must still press
+    start again (Running is only ever reachable via a fresh Starting)."""
 
     instrument: Instrument
     contract: ContractMonth
@@ -193,6 +221,21 @@ class MarketDataFreshnessChanged(Event):
     instrument: Instrument
     contract: ContractMonth
     is_stale: bool
+
+
+@dataclass(frozen=True, slots=True)
+class LatestPriceObserved(Event):
+    """The most recent valid match price for a recorded market, published by
+    `desktop.quote_runtime.QuoteRuntime` — coalesced to at most one per second per
+    (instrument, contract) so it is a mark-to-market feed, not a per-tick firehose.
+    `quality` (`"OK"` / `"STALE"` / `"GAP"`) lets a consumer refuse to value a position
+    off a price it cannot trust rather than silently using a stale number."""
+
+    instrument: Instrument
+    contract: ContractMonth
+    price: Decimal
+    observed_at: Timestamp
+    quality: str
 
 
 @dataclass(frozen=True, slots=True)

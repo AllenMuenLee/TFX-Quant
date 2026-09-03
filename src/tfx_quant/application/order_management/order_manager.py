@@ -381,7 +381,7 @@ class OrderManager:
         broker_seq_no: int,
         kind: str,
         now: Timestamp,
-        **extra_log_fields: object,
+        **extra_log_fields: Any,
     ) -> None:
         record = self._order_repository.find_by_client_order_id(client_order_id)
         if record is None:

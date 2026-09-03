@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 _SCHEMA = """
@@ -50,9 +51,14 @@ class SqliteAuditHandler(logging.Handler):
                 self._connection.execute(
                     "INSERT OR IGNORE INTO audit_events VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (
-                        payload["seq"], payload["ts_utc"], record.levelname, record.name,
-                        payload["event"], payload.get("correlation_id"),
-                        payload.get("workflow_id"), json.dumps(payload, ensure_ascii=False),
+                        payload["seq"],
+                        payload["ts_utc"],
+                        record.levelname,
+                        record.name,
+                        payload["event"],
+                        payload.get("correlation_id"),
+                        payload.get("workflow_id"),
+                        json.dumps(payload, ensure_ascii=False),
                     ),
                 )
                 self._connection.commit()
@@ -97,6 +103,49 @@ def install_audit_handler(
     return handler
 
 
+@dataclass(frozen=True, slots=True)
+class AuditTimelineStep:
+    seq: int
+    ts_utc: str
+    severity: str
+    source: str
+    event: str
+    fields: dict[str, object]
+
+
+def read_workflow_timeline(audit_path: Path, workflow_id: str) -> tuple[AuditTimelineStep, ...]:
+    """Every audited event for one workflow/correlation id, in global sequence order —
+    the decision → intent → submit → ack → fill → position → P&L trail the trade-report
+    drill-down renders. Returns `()` (never raises) when the audit DB is missing or has
+    nothing for that id, so the UI degrades to "no recorded timeline"."""
+    if not audit_path.exists():
+        return ()
+    connection = sqlite3.connect(audit_path)
+    try:
+        rows = connection.execute(
+            "SELECT seq, ts_utc, severity, source, event, payload_json FROM audit_events "
+            "WHERE workflow_id = ? OR correlation_id = ? ORDER BY seq ASC",
+            (workflow_id, workflow_id),
+        ).fetchall()
+    finally:
+        connection.close()
+    steps: list[AuditTimelineStep] = []
+    for seq, ts_utc, severity, source, event, payload_json in rows:
+        try:
+            payload = json.loads(payload_json)
+        except (json.JSONDecodeError, TypeError):
+            payload = {}
+        fields = {
+            k: v
+            for k, v in payload.items()
+            if k not in {"seq", "ts_utc", "ts_taipei", "event", "correlation_id", "workflow_id"}
+        }
+        steps.append(
+            AuditTimelineStep(int(seq), str(ts_utc), str(severity), str(source), str(event), fields)
+        )
+    return tuple(steps)
+
+
 def export_reversal_chain(audit_path: Path, workflow_id: str, destination: Path) -> int:
     """Export one workflow in global sequence order as UTF-8 JSON Lines."""
     connection = sqlite3.connect(audit_path)
@@ -117,4 +166,10 @@ def export_reversal_chain(audit_path: Path, workflow_id: str, destination: Path)
     return len(rows)
 
 
-__all__ = ["SqliteAuditHandler", "export_reversal_chain", "install_audit_handler"]
+__all__ = [
+    "AuditTimelineStep",
+    "SqliteAuditHandler",
+    "export_reversal_chain",
+    "install_audit_handler",
+    "read_workflow_timeline",
+]

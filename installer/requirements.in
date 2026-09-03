@@ -1,0 +1,13 @@
+# Runtime dependencies bundled into the Windows installer's embedded 32-bit Python.
+# Mirrors [project].dependencies in pyproject.toml (the app itself is installed from
+# the source tree, not from a wheel). Compile with:
+#
+#   installer\..\.venv\Scripts\pip-compile --generate-hashes --strip-extras \
+#       --output-file installer/requirements.lock installer/requirements.in
+#
+# using the 32-bit Python 3.11 interpreter, then commit installer/requirements.lock.
+pydantic>=2.6,<3
+tzdata>=2024.1
+wxPython>=4.2,<5
+comtypes>=1.1,<2
+keyring>=25,<26

@@ -1,24 +1,46 @@
 # TfxQuant
 
 A Windows desktop automated trading system for Yuanta Futures (元大期貨), scoped to
-one instrument at a time (小台指 MXF or 大台指 TXF), max net position 2 lots, no
-overnight positions (flat by 04:55 Asia/Taipei daily). This repository currently
-contains **Feature 01 — Solution Foundation** (layered Python skeleton, domain model,
-event coordination, configuration/validation, safety gate), **Feature 02 — Yuanta API
-Session** (real login/session-lifecycle adapter for the trading + quote OCXs,
-capability model, credentials, preflight checks), and **Feature 03 — Instrument and
-Contract Selection** (controlled 商品主檔, AUTO/MANUAL contract selection with
-mandatory confirmation, guarded instrument/contract switching, quote/position/order
-consistency check). See `implementation prompt/README.md` for the full 16-feature
-roadmap.
+one instrument at a time for trading — **fixed to 小台指 (MXF)** — with a max net
+position of 2 lots and no overnight positions (flat by 04:55 Asia/Taipei daily). The
+UI's MXF/TXF switch only changes which instrument's market data is *watched*, never
+what is *traded*.
 
-**Platform constraint**: the entire project — every layer, not just the Yuanta
-adapter — is **x32 (32-bit) only**, per an explicit client requirement (the quote OCX
-has no 64-bit build). There is no x64 build/dev/test/CI path anywhere in this repo.
-See `docs/adr/0001-python-version-and-runtime.md`.
+Features 01–16 of the roadmap in `implementation prompt/README.md` are implemented:
+layered domain model, Yuanta login/session, instrument/contract selection, real-time
+market data + 60-minute bars, the 60-minute strategy signal engine, the order/fill
+state machine, safe reversal/scaling, position reconciliation, connectivity/safe
+pause, risk supervisor + 04:55/emergency flatten, P&L and trade reports, the wxPython
+desktop UI, structured logging/telemetry/audit, persistence/recovery, the
+simulation (`environment: TEST`) test environment, and (Feature 16) the Windows
+installer, source delivery, and documentation.
+
+See [`docs/`](docs/) for the operator and maintainer manuals — start with
+[`docs/README.md`](docs/README.md). Known gaps between the shipped software and the
+specification (notably: no strategy start/pause/stop UI, and `StartupSafetyGate` is
+not wired as a hard gate) are listed in
+[`docs/operations-manual.md` §10](docs/operations-manual.md) and
+[`docs/maintenance.md` §1](docs/maintenance.md).
+
+## Platform constraint
+
+The entire project — every layer, not just the Yuanta adapter — is **32-bit (x86)
+only**, per an explicit client requirement: the Yuanta quote OCX
+(`YuantaQuote_v2.1.2.9.ocx`) has no 64-bit build, and the trade OCX
+(`YuantaOrd.ocx`) is loaded at the same bitness as the interpreter. There is no
+x64 build/dev/test/CI path anywhere in this repo. The Windows installer bundles a
+fixed 32-bit CPython 3.11.
+
+The broker integration is the **legacy Yuanta COM/ActiveX OCX pair**, hosted via
+`comtypes` + `AtlAxCreateControlEx` on the wx UI thread. (An earlier revision
+pivoted the codebase to the newer "SPARK" .NET API; that pivot was **reverted** —
+no SPARK code exists in `src/`.) The API contract source of truth is the vendor
+material under `交易API元件及說明文件/` (trade) and `行情API元件及說明文件/`
+(quote), which are gitignored and installed locally.
 
 Built in **Python** (mandatory per `implementation prompt/README.md`) —
-`wxPython` + `comtypes` for the desktop UI and future COM/OCX integration.
+`wxPython` + `comtypes` for the desktop UI and COM/OCX integration, `pydantic` for
+validated settings, `keyring` for the optional secure password store.
 
 ## Architecture
 
@@ -27,37 +49,30 @@ tfx_quant.desktop ─────┐
                         ├──> tfx_quant.application ──> tfx_quant.domain
 tfx_quant.persistence ──┘
 tfx_quant.infrastructure (incl. .yuanta) ──> tfx_quant.application ──> tfx_quant.domain
+tfx_quant.telemetry    — importable from any layer
+tfx_quant.packaging    — installer/updater support code (see installer/)
 ```
 
-- `docs/adr/` — the "why": Python version/runtime, UI framework/COM hosting,
-  layering and event/threading model.
-- `docs/modules.md` — the "what's in each package".
-- `docs/secrets-management.md` — how broker credentials are handled (never in
-  source, never in `settings.example.json`, never in general logs).
-- `src/tfx_quant/infrastructure/yuanta/README.md` — the vendor API package
-  inventory (ProgIDs, bitness, endpoints).
+- `docs/maintenance.md` — architecture, databases, settings, logging, the API
+  version matrix, build/test, troubleshooting.
+- `src/tfx_quant/infrastructure/yuanta/README.md` — the vendor OCX inventory
+  (ProgIDs, OCX names, bitness, endpoints).
+- `src/tfx_quant/desktop/composition.py` — the composition root.
+- `installer/` — the repeatable Windows build, installer, and release tooling.
 
 ## Prerequisites
 
-- **Python 3.11, 32-bit (x32)** — pinned via `.python-version` / `requires-python` in
-  `pyproject.toml`. This is the **only** supported interpreter bitness for this
-  project (see the platform constraint above and
-  `docs/adr/0001-python-version-and-runtime.md`) — do not use a 64-bit Python here.
-  If you don't already have a 32-bit Python 3.11 installed:
+- **Python 3.11, 32-bit (x86)** — pinned via `.python-version` / `requires-python`
+  in `pyproject.toml`. This is the **only** supported interpreter bitness. If you
+  don't already have one:
   `winget install --id Python.Python.3.11 --architecture x86` (no admin required;
-  lands at `%LocalAppData%\Programs\Python\Python311-32\python.exe`, and registers as
-  `py -3.11-32` with the `py` launcher if a 64-bit 3.11 isn't already claiming
-  `-3.11`).
-- **Yuanta API packages** (optional — only needed for the real, non-mock gateways).
-  Not committed to this repository; copy the vendor's component folders to
-  `C:\Yuanta\API` and `C:\Yuanta\QAPI` (the vendor's own documented layout) per
+  registers as `py -3.11-32`).
+- **Yuanta API packages** (optional — only for the real, non-mock gateways). Not
+  committed; copy the vendor's component folders to `C:\Yuanta\API` and
+  `C:\Yuanta\QAPI` and run `install_YTFutOrdAP.bat` / `install_ytocx.bat` as
+  Administrator. See `docs/installation-manual.md` §2 and
   `src/tfx_quant/infrastructure/yuanta/README.md`. Nothing in this repository
-  requires them to build or test — see `use_mock: true` in
-  `src/tfx_quant/desktop/settings.example.json`. **Verified working end-to-end**
-  against the real files this session (2026-08-16, including a live network
-  round-trip) — no admin rights needed; `composition.py` registers the components
-  per-user automatically. See `docs/adr/0004-broker-session-architecture.md` for the
-  full trail and what's still unverified (a full login needs real credentials).
+  requires them to build or test — `environment: TEST` uses the mock trade gateway.
 
 ## Install, lint, type-check, test, run
 
@@ -65,84 +80,54 @@ tfx_quant.infrastructure (incl. .yuanta) ──> tfx_quant.application ──> t
 py -3.11-32 -m venv .venv
 .venv\Scripts\pip install -e ".[dev]"
 
-# Lint and format
 .venv\Scripts\ruff check .
 .venv\Scripts\ruff format --check .
-
-# Type-check (src only)
 .venv\Scripts\mypy src
-
-# Architecture/layering check (dependencies point toward domain)
 .venv\Scripts\lint-imports
-
-# Full test suite
 .venv\Scripts\pytest
 
-# Run the desktop diagnostics screen (shows per-module readiness; sends no orders)
+# Run the desktop app (readiness screen; TEST env sends no real orders)
 .venv\Scripts\python -m tfx_quant.desktop
 ```
 
-No Yuanta credentials or OCX installation are required for any of the above — the mock
-gateways (`use_mock: true`, the default in `settings.example.json`) let CI and any dev
-machine build and test without the broker API present, per the acceptance requirement.
-Setting `use_mock: false` wires the real session (`BrokerSessionOrchestrator` + the
-comtypes/wx OCX adapters) instead — see `docs/secrets-management.md` for the
-credential env var/Windows Credential Manager setup it needs, and
-`docs/adr/0004-broker-session-architecture.md` for its current execution status.
-
-## Opt-in real-execution tests
-
-Two test files make real network calls and are skipped by default (never run in CI,
-which has neither the vendor files nor real credentials):
-
-- `tests/infrastructure/test_yuanta_ocx_activation.py` —
-  `TFX_QUANT_OCX_ACTIVATION_TEST=1` (auto-skips if the vendor `.ocx` files aren't
-  present). Uses placeholder credentials; only proves the real activation/
-  registration/invocation/event-delivery pipeline works, not that login succeeds.
-- `tests/infrastructure/test_yuanta_live_smoke.py` —
-  `TFX_QUANT_LIVE_YUANTA_SMOKE_TEST=1`, plus real credentials (see
-  `docs/secrets-management.md`). Asserts a full `BrokerSessionReady`.
+No Yuanta credentials or OCX installation are required for any of the above — the
+mock trade gateway (`environment: TEST` in `settings.example.json`) lets CI and any
+dev machine build and test without the broker API present. `environment:
+PRODUCTION` wires the real `LegacyBroker` OCX adapter (trade) instead; market data
+is the real Yuanta quote OCX in **both** environments.
 
 ## Configuration
 
-`src/tfx_quant/desktop/settings.example.json` is the sample, non-secret configuration
+`src/tfx_quant/desktop/settings.example.json` is the sample, non-secret config
 (`account_alias`, `environment`, `selected_instrument`, `contract_selection_mode`,
-`timezone_id`, `eod_flatten_local_time`, `max_net_lots`). It is validated
-on load (`TradingSettings` + `validate_startup()`) — a misconfigured value (wrong time
-zone, wrong flatten time, lot cap above 2, undefined instrument, incomplete manual
-contract selection) fails immediately with a clear message instead of letting the
-strategy engine run with bad configuration.
+`timezone_id`, `eod_flatten_local_time`, `max_net_lots`, and optional per-database
+paths). It is validated on load (`TradingSettings` + `validate_startup()`); a
+misconfigured value fails immediately with a clear message. Broker credentials are
+never part of this file — they are entered in the login dialog and, only if the
+operator opts in, stored in Windows Credential Manager via `keyring`. See
+`docs/maintenance.md` §3.
 
-Broker credentials are never part of this file — see `docs/secrets-management.md`.
+## Opt-in real-execution tests
 
-## Safety rules this codebase enforces
+Skipped by default (never run in CI):
 
-- `Quantity` refuses to represent more than 2 lots; `NetPosition` refuses a net
-  position above 2 lots in either direction (`domain/quantity.py`).
-- `Price`/`Money` are `decimal.Decimal`-backed value objects; there is no path to
-  store an amount as `float` (`domain/money.py`).
-- `StrategyStateMachine` only allows the exact transition table in
-  `domain/strategy_state.py` — in particular, `Running` is only reachable from
-  `Starting`, never directly from `Stopped` or `PausedSafe`.
-- `StartupSafetyGate.can_enter_running()` additionally requires every item in
-  `SafetyChecklist` (API logged in, account confirmed, market data valid, order
-  query completed, position synced, no unknown orders, user pressed start) before
-  allowing the transition to `Running`.
-- Every order carries a `ClientOrderId` (a UUID-backed idempotency key) independent
-  of whatever order number the broker assigns (`domain/order.py`).
-- `EventCoordinator` serializes all broker-callback/UI/strategy-thread traffic onto a
-  single processing loop so subscriber code never races itself (see ADR 0003).
-- No code path anywhere in this codebase can submit an order yet — the domain layer
-  has no order-sending type or method (that's Feature 06), and the desktop screen's
-  Connect/Disconnect/account-picker controls (Feature 02) are session-lifecycle
-  actions, not order submission.
-- `SessionCapabilities` (Feature 02) keeps login/market-data/trading/order-reports/
-  queries as five independent booleans — logging in is never treated as "can trade"
-  (`application/ports/broker_session.py`).
+- `tests/infrastructure/test_yuanta_ocx_activation.py` —
+  `TFX_QUANT_OCX_ACTIVATION_TEST=1` (auto-skips without the vendor `.ocx` files).
+- `tests/infrastructure/test_yuanta_live_smoke.py` —
+  `TFX_QUANT_LIVE_YUANTA_SMOKE_TEST=1` plus real credentials.
+- Anything marked `real_api` — `TFX_QUANT_REAL_API=1` (never sends orders).
+
+## Installer / release
+
+```powershell
+py -3.11-32 installer\build.py            # stage app + manifests + checksums + licenses
+py -3.11-32 installer\make_installer.py   # compile the .exe (needs Inno Setup 6), optionally sign
+```
+
+See [`installer/README.md`](installer/README.md) and `docs/acceptance-checklist.md`.
 
 ## CI
 
-`.github/workflows/ci.yml` sets up a 32-bit (x32) Python 3.11, installs `.[dev]`, and
-runs `ruff`, `mypy`, `lint-imports`, and `pytest` on `windows-latest` using only the
-mock Yuanta gateways — no broker credentials or OCX installation are configured or
-needed.
+`.github/workflows/ci.yml` runs on `windows-latest` with a **32-bit (x86)** Python
+3.11: `ruff`, `mypy`, `lint-imports`, `pytest` (mock gateways only, no broker
+credentials or OCX), plus a `package` job that runs `installer/build.py`.

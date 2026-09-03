@@ -5,9 +5,11 @@ strategy must already be paused/stopped — this service never drives the state 
 itself, see below), 重新查詢帳戶狀態, 清空 K 棒／訊號狀態; 成功後仍需使用者重新啟動。
 And the hard precondition: 策略執行中或存在持倉、活動委託、未知委託時禁止切換商品／契約。
 This service itself never touches the quote-gateway registration directly — publishing
-`InstrumentSwitchCompleted` (carrying `vendor_symbol`) is what drives
-`desktop.quote_runtime.QuoteRuntime._on_switch` to re-register the live Yuanta quote
-symbol for the newly selected contract; clearing the bar/signal state
+`InstrumentSwitchCompleted` (carrying `vendor_symbol`) is what tells
+`desktop.quote_runtime.QuoteRuntime._on_switch` which of its recorded markets is now
+charted. Both 小台指 and 大台指 are registered and recorded from quote login onwards, so
+a switch changes the live registration only when it also changes a contract month
+(`QuoteRuntime`'s own docstring has the rule); clearing the bar/signal state
 (`bar_signal_state_store.clear()`) is a separate step, resetting Feature 05's
 per-(instrument, contract) engine state.
 

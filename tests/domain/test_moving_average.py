@@ -14,7 +14,7 @@ from tfx_quant.domain.moving_average import (
 
 def test_simple_moving_average_none_when_insufficient_samples() -> None:
     closes = [Decimal(i) for i in range(10)]
-    assert simple_moving_average(closes, window=35) is None
+    assert simple_moving_average(closes, window=20) is None
 
 
 def test_simple_moving_average_exact_mean_of_last_window() -> None:
@@ -23,19 +23,25 @@ def test_simple_moving_average_exact_mean_of_last_window() -> None:
 
 
 def test_moving_average_series_returns_up_to_count_values() -> None:
-    closes = [Decimal(i) for i in range(1, 40)]  # 1..39
-    series = moving_average_series(closes, window=35, count=5)
+    closes = [Decimal(i) for i in range(1, 25)]  # 1..24
+    series = moving_average_series(closes, window=20, count=5)
     assert len(series) == 5
-    # window over closes[:39] (last 35 of 1..39) = mean(5..39) = 22
-    assert series[-1] == Decimal(22)
+    # window over closes[:24] (last 20 of 1..24) = mean(5..24) = 14.5
+    assert series[-1] == Decimal("14.5")
     # each earlier value is exactly one less (arithmetic sequence, step 1)
-    assert series == [Decimal(18), Decimal(19), Decimal(20), Decimal(21), Decimal(22)]
+    assert series == [
+        Decimal("10.5"),
+        Decimal("11.5"),
+        Decimal("12.5"),
+        Decimal("13.5"),
+        Decimal("14.5"),
+    ]
 
 
 def test_moving_average_series_shorter_than_count_when_history_thin() -> None:
-    closes = [Decimal(i) for i in range(1, 37)]  # 36 samples
-    series = moving_average_series(closes, window=35, count=5)
-    assert len(series) == 2  # only positions 35 and 36 have a full window
+    closes = [Decimal(i) for i in range(1, 22)]  # 21 samples
+    series = moving_average_series(closes, window=20, count=5)
+    assert len(series) == 2  # only positions 20 and 21 have a full window
 
 
 def test_determine_slope_exact_decimal_comparison() -> None:

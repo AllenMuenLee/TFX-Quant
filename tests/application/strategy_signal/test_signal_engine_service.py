@@ -34,7 +34,7 @@ from tfx_quant.persistence.sqlite_order_repository import SqliteOrderRepository
 _ACCOUNT = TradingAccount(branch_id="0001", account_no="1234567")
 _INSTRUMENT = Instrument.MXF
 _CONTRACT = ContractMonth(year=2026, month=9)
-_MA_WINDOW = 35
+_MA_WINDOW = 20
 _FLAT_LOOKBACK = 5
 _WARMUP = _MA_WINDOW + _FLAT_LOOKBACK - 1
 
@@ -226,7 +226,7 @@ def test_clear_resets_engine_requiring_a_fresh_warmup() -> None:
     service.clear(_INSTRUMENT, _CONTRACT)
 
     # Only the final (would-be trigger) bar survives the clear — nowhere near a full
-    # 35-bar MA window any more, so it must not enter.
+    # 20-bar MA window any more, so it must not enter.
     _publish_bars(event_bus, [bars[-1]])
     assert len(gateway.submitted_orders) == 0
 

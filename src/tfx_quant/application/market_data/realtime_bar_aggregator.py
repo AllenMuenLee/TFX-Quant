@@ -50,14 +50,28 @@ class RealtimeBarAggregator:
     sessions, trading-day assignment, or bar labels.  A missing boundary rejects the
     event from aggregation. Bars are emitted only after a later event (or ``advance``)
     proves the configured close boundary has passed.
+
+    ``recording_started_at`` is when this aggregator's quote feed actually began
+    delivering events. The boundary that was already in progress at that instant can
+    only ever be observed from its middle, so its open/high/low and volume would be
+    those of a fragment while `LocalClosedBarWriter` would still persist it as a
+    complete bar and publish a `BarClosed` the strategy would treat as real. Such a
+    boundary is therefore dropped whole: aggregation starts at the first boundary whose
+    own open label is at or after ``recording_started_at`` (starting exactly on an open
+    label keeps that boundary — nothing of it was missed). ``None`` disables the rule.
     """
 
     def __init__(
-        self, instrument: Instrument, contract: ContractMonth, boundary_resolver: BoundaryResolver
+        self,
+        instrument: Instrument,
+        contract: ContractMonth,
+        boundary_resolver: BoundaryResolver,
+        recording_started_at: Timestamp | None = None,
     ) -> None:
         self.instrument = instrument
         self.contract = contract
         self._resolve = boundary_resolver
+        self._started_at = recording_started_at
         self._forming: _Forming | None = None
 
     @property
@@ -71,6 +85,9 @@ class RealtimeBarAggregator:
             return []
         boundary = self._resolve(event.matched_at)
         if boundary is None:
+            return []
+        if self._started_at is not None and boundary[0].value < self._started_at.value:
+            # A boundary already under way when recording began — see the class docstring.
             return []
         closed = self.advance(event.matched_at)
         fingerprint = (

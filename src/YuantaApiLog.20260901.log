@@ -1,0 +1,6 @@
+20260901 19:22:33.158 YuantaOrd 1.6.1.3 for ActiveX control
+20260901 19:22:33.158 Create
+20260901 19:22:33.169 SetWaitOrdResult(0)
+20260901 19:22:33.169 SetFutOrdConnection(E123663395,pw,apitest.yuantafutures.com.tw,80)
+20260901 19:22:33.187 return: 3
+20260901 19:22:44.035 OnLogonS(-1,NULL,NULL,NULL)

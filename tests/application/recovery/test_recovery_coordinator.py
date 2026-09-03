@@ -58,7 +58,9 @@ def test_clean_queries_only_unlock_baseline_creation_and_never_submit() -> None:
     gateway = Gateway()
     store = Store()
     coordinator = RecoveryCoordinator(
-        trade_gateway=gateway, order_repository=Orders(), baseline_repository=Baselines(),
+        trade_gateway=gateway,
+        order_repository=Orders(),
+        baseline_repository=Baselines(),
         report_store=store,
     )
     report = coordinator.run()
@@ -72,8 +74,11 @@ def test_clean_queries_only_unlock_baseline_creation_and_never_submit() -> None:
 def test_query_failure_and_unfinished_workflow_keep_recovery_paused() -> None:
     gateway = Gateway(fail_positions=True)
     coordinator = RecoveryCoordinator(
-        trade_gateway=gateway, order_repository=Orders(), baseline_repository=Baselines(),
-        report_store=Store(), workflow_sources=(WorkflowSource((object(),)),),
+        trade_gateway=gateway,
+        order_repository=Orders(),
+        baseline_repository=Baselines(),
+        report_store=Store(),
+        workflow_sources=(WorkflowSource((object(),)),),
     )
     report = coordinator.run()
     assert report.status is RecoveryStatus.PAUSED
@@ -86,7 +91,9 @@ def test_query_failure_and_unfinished_workflow_keep_recovery_paused() -> None:
 def test_unresolved_outbox_checkpoint_never_gets_resent() -> None:
     gateway = Gateway()
     coordinator = RecoveryCoordinator(
-        trade_gateway=gateway, order_repository=Orders(), baseline_repository=Baselines(),
+        trade_gateway=gateway,
+        order_repository=Orders(),
+        baseline_repository=Baselines(),
         report_store=Store(),
         unresolved_outbox=lambda: (("outbox-1", "decision-1", "BROKER_CALL_STARTED"),),
     )

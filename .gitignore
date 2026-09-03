@@ -11,7 +11,10 @@ dist/
 .venv64/
 venv/
 Logs/
-YuantaSparkAPI_win-x64_Python/
+
+# Installer build outputs and download cache (Feature 16)
+installer/_build/
+installer/_cache/
 
 # Tooling caches
 .pytest_cache/
@@ -25,7 +28,7 @@ htmlcov/
 .idea/
 .vscode/
 
-# Vendor API packages (proprietary, installed locally per docs/secrets-management.md)
+# Vendor API packages (proprietary, installed locally per docs/installation-manual.md)
 交易API元件及說明文件/
 行情API元件及說明文件/
 

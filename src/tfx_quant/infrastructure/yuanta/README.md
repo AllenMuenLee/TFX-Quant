@@ -1,167 +1,91 @@
 # infrastructure.yuanta — vendor API inventory
 
-**2026-08-19: this codebase now targets 元大 SPARK API exclusively** — every
-implementation prompt was rewritten to mandate the official online docs
-(`https://www.yuanta.com.tw/file-repository/content/API/page/index.html` and its docs
-site) as the only valid API spec source. The legacy COM/ActiveX OCX pair this file used
-to document is confirmed **legacy, maintenance-only** on the vendor's own portal
-(`YuantaOneAPI_Com.zip`, listed alongside Delphi/WPF). See `docs/adr/0001-python-
-version-and-runtime.md`, `0002-ui-framework-and-com-hosting.md`, and
-`0004-broker-session-architecture.md` for the full rewrite rationale — this file is the
-quick-reference API inventory.
+This codebase integrates the **legacy Yuanta COM/ActiveX OCX pair** (trade + quote).
+An earlier revision pivoted to the newer "SPARK" .NET API (`YuantaSparkAPI.dll` via
+`pythonnet`); **that pivot was reverted** — there is no SPARK code in `src/`, and
+`desktop/composition.py` wires the OCX broker exclusively.
 
-## SPARK API
+**API contract source of truth** (both gitignored, installed locally):
 
-A **.NET 8 C#** component (`YuantaSparkAPI.dll`), driven from Python via `pythonnet`.
-Cross-platform (Windows/Linux/macOS), both bitnesses on Windows (win-x64/win-x86) — no
-bitness constraint, unlike the legacy quote OCX. Official docs site (a client-rendered
-SPA — plain HTTP fetch returns empty; needs a real browser to read):
-`http://www.yuanta.com.tw/file-repository/content/sparkapi_docs/...`.
+- Trade: `交易API元件及說明文件/` — `API/` (32-bit), `API_x64/` (64-bit),
+  `使用說明.txt`, `元大BToCAPI格式.pdf`, `元大API交易PYTHON注意事項.docx`.
+- Quote: `行情API元件及說明文件/` — `QAPI/`, `使用說明.txt`, `元大行情API.pdf`,
+  `YuantaQuoteAPI Sample.py`.
 
-Vendor deliverable (the downloaded component zip, containing `YuantaSparkAPI.dll` and
-its sibling `.dll`/`.so`/`.dylib` files plus `FunctionList.xls`) is proprietary,
-installed locally, and gitignored — never committed. Conventional local path:
-`C:\Yuanta\SparkAPI` (`infrastructure/yuanta/spark_client.py`'s
-`default_dll_directory()` — a codebase convention, not vendor-mandated). Local log
-files default to `C:\Yuanta\YuantaSparkAPI\Log` (Windows), kept 30 days.
+Do not infer API behaviour from the SPARK site, old SPARK SDK, or memory — only what
+those folders document. Anything not documented there is a blocker, isolated in the
+adapter, never invented.
 
-### Session lifecycle (基礎)
+## Bitness
 
-```python
-objYuantaSparkAPI = YuantaSparkAPITrader()
-objYuantaSparkAPI.SetLogType(enumLogType.COMMON)
-objYuantaSparkAPI.OnResponse += on_response  # one unified callback, see below
-objYuantaSparkAPI.Open(enumEnvironmentMode.UAT)  # or .PROD
-objYuantaSparkAPI.Login(account, password)  # Windows: 2 args only
-```
+**32-bit only.** The quote OCX has no 64-bit build; `quote_com_host.py` hard-refuses
+a non-32-bit interpreter. The trade OCX exists in both bitnesses but is loaded at the
+interpreter's bitness. `preflight.py` / `quote_preflight.py` check this.
 
-- `Login(Account: str, Pass: str) -> bool` (Windows) — `Account` is the full account
-  string, not a "歸戶 ID": 證券 `S`+分公司代號(4)+帳號(7) (11 chars), 期貨
-  `F`+分公司代號(7+3)+帳號(7) (17 chars, e.g. `FF021000P001234567`). This codebase only
-  ever logs in with `F`-prefixed futures accounts. The `bool` return only means "call
-  accepted" — the real result (`LoginResult`) arrives via `OnResponse` with
-  `strIndex == 'Login'`.
-- **No certificate path parameter on Windows.** A certificate must be imported into the
-  OS certificate store beforehand (前言 > 測試環境&正式環境說明: "...匯入至電腦即可使
-  用") — see `credentials.ensure_certificate_imported` and `desktop/login_dialog.py`'s
-  certificate import controls. (Linux/Mac's `Login()` *does* take a cert path + cert
-  password as its first two args — irrelevant here, Windows-only codebase.)
-- `OnResponse(intMark, dwIndex, strIndex, objHandle, objValue)` — the **one** callback
-  covering every async result. `intMark`: `0`=系統回應, `1`=查詢回應, `2`=訂閱推播.
-  `strIndex` names the originating function (`'Login'`, `'GetRealReport'`,
-  `'SubscribeStockTick'`, ...); `objValue`'s shape depends on `strIndex`.
-- `LogOut()`/`Close()`/`Dispose()` — session teardown.
-- Rate limits (前言 > 使用限制說明, load-bearing for any future throttling work):
-  repeat login on an already-logged-in account is rejected; failed-login retry capped
-  at 1/4s; ≤10 subscribe calls/sec/FunctionID, ≤200 symbols/subscribe call, ≤3
-  quote/account calls/sec/FunctionID (`GetKLine` excluded, capped at 1/sec separately),
-  ≤10 trade calls/sec/FunctionID, ≤30 orders/call; per-account ≤10 concurrent
-  connections, ≤1000 logins/day, ≤3000 total subscribed symbols, 1200/600/3000
-  calls-per-minute for quote/account/trade categories (exceeding → 1-min pause; 10
-  pauses/hour → API access revoked for the account).
+## Trade API — `YuantaOrd` ActiveX (`infrastructure/yuanta/legacy_ocx_host.py`)
 
-### Futures trading (交易 > 國內期貨下單) — Feature 06's job, not wired up yet
+| | |
+|---|---|
+| Component folder | `C:\Yuanta\API` (32-bit) — override with `TFX_QUANT_YUANTA_API_DIR` |
+| OCX | `YuantaOrd.ocx` (`YuantaOrd64.ocx` for 64-bit) |
+| Dependent DLLs | `YuantaOrdLib.dll` (`YuantaOrdLibX64.dll`), `YuantaCAPIDLL.dll` |
+| ProgID | `Yuanta.YuantaOrdCtrl.1` (`Yuanta.YuantaOrdCtrl.64`) |
+| Registration | `install_YTFutOrdAP.bat` as Administrator; do not move files afterward |
+| VC++ runtime | `vcredist_x86.exe` if the MFC/CRT runtime is missing |
+| Endpoints | test `apitest.yuantafutures.com.tw:80`, prod `api.yuantafutures.com.tw:80/443` |
+| Hosting | `AtlAxCreateControlEx` against a real wx window handle on the UI thread (not windowless `CreateObject`), via `ocx_hosting.create_activex_control` + `preload_control` |
+| Events | `OnLogonS`, `OnOrdResult`, `OnOrdRptF`, `OnOrdMatF`, `OnReportQuery`, `OnDealQuery`, `OnUserDefinsFuncResult` |
+| Account format | futures account, `F` prefix |
+| `OnLogonS` `TLinkStatus` | `-1` = lsLinkBroken, `4` = lsCAError (certificate), `5` = lsPassError (password) |
 
-`SendFutureOrder(LoginAcno, List[FutureOrder], lng=Normal) -> bool`. Cancel/modify
-reuse this same method with a different `FunctionCode` on `FutureOrder` (00=新單,
-04=取消, 05=改量, 07=改價) — no separate cancel/modify method. Key `FutureOrder`
-fields: `Identity` (caller-assigned correlation id), `Account`, `OrderNo` (blank for
-new), `TradeDate` ("yyyy/MM/dd"), `CommodityID1` (order-side product code, e.g.
-`"FITX"` for TXF — **a separate code space from the real-time quote symbol**, see
-below), `SettlementMonth1` (int `YYYYMM`), `Price`, `OrderQty1`, `BuySell1` ("B"/"S"),
-`OpenOffsetKind` ("0"=新倉/"1"=平倉/"2"=自動), `OrderType` ("1"=市價/"2"=限價/"3"=範圍
-市價), `OrderCond` (ROD/FOK/IOC). Result arrives via `OnResponse` with
-`strIndex == 'SendFutureOrder'`, `objValue.ResultList[i].ReplyCode` (0=success).
+Adapters: `legacy_broker.py` (`IBrokerSession` + `TradeGatewayPort`),
+`legacy_order_api.py`, `event_publisher.py`. Mock equivalents:
+`mock_broker_session.py`, `mock_trade_gateway.py`.
 
-### Futures quote-symbol encoding (前言 > 期貨報價代碼7xxx變更規則) — now a real formula
+Yuanta's trade test host is retired — `environment: TEST` uses the local mock, not a
+UAT login.
 
-`<root(3 chars)><month-code(1 char)><year-digit(1 char)>`. Month code:
-`"1ABCDEFGHIJKL"[month]` (near-month alias `1`, then 一月=A...十二月=L); year-digit is
-the calendar year's last digit. Worked example: `2021年台指期6月:TXFF1`. Implemented as
-`domain.instrument_master.futures_quote_symbol()`, tested against that exact example.
-This resolves the previous `-UNCONFIRMED` placeholder problem for `vendor_symbol` in
-`instrument_master.example.json` — see `docs/adr/0005-*.md`'s addendum.
+## Quote API — `YuantaQuote` ActiveX (`infrastructure/yuanta/quote_com_host.py`)
 
-**`order_commodity_code` (`SendFutureOrder.CommodityID1`) is a separate, unconfirmed
-code space** — only TXF's `"FITX"` is confirmed (from the 國內期貨下單 docs page's own
-worked example); other instruments need confirmation against the vendor's
-`FunctionList.xls` before Feature 06 can place orders for them.
+| | |
+|---|---|
+| Component folder | `C:\Yuanta\QAPI` — override with `TFX_QUANT_YUANTA_QAPI_DIR` |
+| OCX | `YuantaQuote_v2.1.2.9.ocx` |
+| ProgID | `YUANTAQUOTE.YuantaQuoteCtrl.1` |
+| Registration | `install_ytocx.bat` as Administrator |
+| Access | requires a separate "行情 API" application on top of the trade API |
+| Endpoint | `apiquote.yuantafutures.com.tw`; T-line port 80/443, T+1-line port 82/442 |
+| Connect | `SetMktLogon(User, pass, IP, PORT, ReqType, SetMap)` — `PORT` as a string, `SetMap=0`; `ReqType=1` = T-line, `ReqType=2` = T+1-line |
+| Register symbol | `AddMktReg(Symbol, UpdMode, ReqType, SetMap)` — `UpdMode` `"1"`/`"2"`/`"4"` as strings; `SnapshotUpd (4)` for current + updates |
+| Unregister | `DelMktReg(Symbol, ReqType)` |
+| Events (sink) | `OnMktStatusChange(Status, Msg, ReqType)`, `OnRegError(Symbol, UpdMode, ErrorCode, ReqType)`, `OnGetMktAll(...)` — no leading COM `this` (comtypes strips it via the explicit `_DYuantaQuoteEvents` interface) |
+| History | **not available** — the OCX only pushes live quotes. All 60-minute bars are aggregated from live quotes actually received after login, persisted first; disconnection gaps are preserved, never backfilled. |
 
-### Market data — not part of this API
+Adapters: `quote_adapter.py` (`YuantaQuoteAdapter`), `quote_com_host.py`
+(`YuantaQuoteComHost`). The quote runtime lives at `desktop/quote_runtime.py`.
+`YuantaQuoteAPI Sample.py`'s sample used Python 3.9 / wxPython 4.1.1 / comtypes
+1.1.11; a live session is confirmed on 32-bit Python 3.11 / comtypes 1.4.16 (the
+pinned requirement that matters is the 32-bit interpreter).
 
-This codebase has no market-data path through the SPARK API at all: no
-`SubscribeStockTick`, no `GetKLine`, no tick/quote pushes of any kind. Every OHLCV bar —
-both the near-real-time bar builder and the two-month history backfill — comes from the
-third-party `yfinance` package instead (see `infrastructure/market_data/
-yfinance_history_adapter.py`, `application/market_data/bar_service.py`, and
-`implementation prompt/00-spark-to-futures-api-migration/implementation-prompt.md`). An
-earlier revision of this codebase did wrap `SubscribeStockTick`/`GetKLine` here; both were
-deleted once the implementation prompt was rewritten to forbid any Yuanta/SPARK
-market-data path, not left in place unused.
+## Credentials (`infrastructure/yuanta/credentials.py`)
 
-### Reports (回報)
+Never in `TradingSettings` or any JSON file. Entered in `desktop/login_dialog.py`
+each session; the password is stored (opt-in only, after a successful login) in
+Windows Credential Manager via `keyring` (DPAPI). Keyring service names:
 
-`RR_RealReport` — order/fill push, **auto-subscribed on login** ("登入即訂閱，結果請從
-回應事件OnResponse接收" — no separate subscribe call). Arrives via `OnResponse` with
-`intMark == 2`, `strIndex == 'RR_RealReport'`, one `RealReport` object per push.
-`GetRealReport(Account, lng) -> bool` is the poll-based equivalent (`intMark == 1`,
-`RealReportResult.RealReportList`) — replaces the legacy API's separate
-`ReportQuery`/`DealQuery` pair with one unified call. `RptType` distinguishes
-order/fill/etc. (`2`=期貨委託, `3`=期貨成交, ...); `OrderStatus` carries the full
-status code table (0=委託成功, 8=已成交, 24=委託失效, 25=價穩失效, ...). Neither push
-nor query result is parsed into a typed `Order`/`Fill` yet — Feature 06's job (needs an
-idempotency-key mapping), same posture the legacy design always took.
+- `tfx_quant.yuanta` — trade login password
+- `tfx_quant.yuanta.quote` — quote login password (TEST env)
+- key `certificate-import-password` under `tfx_quant.yuanta` — the PFX password
 
-### Account/position queries (帳務)
-
-`GetFutStoreSummary(Account, lng) -> bool` — 期貨庫存總表查詢, a fully documented
-futures position query (`FutStoreSummaryResult.FutStoreList`, fields include
-`Trid`/`Commodity1`/`SettlementMonth1`/`BS1`/`Qty`/...). Replaces the legacy API's
-undocumented `RA003` mechanism (`UserDefinsFunc`), which had no worked example for its
-row layout. Not parsed into a typed `Position` yet — Feature 08's job.
+Certificate import: `ensure_certificate_imported` shells out to
+`certutil -importpfx -user` (per-user, no admin), password piped via stdin so it
+never appears in the process argument list.
 
 ## Python setup notes
 
-Official 前言 > Python設定 page's Windows/Mac setup:
-
-```python
-from pythonnet import load
-
-load("coreclr")
-import clr, sys, os, pathlib
-
-sys.path.append(str(pathlib.Path(__file__).parent.resolve()))
-if sys.platform == "win32":
-    os.add_dll_directory(str(pathlib.Path(__file__).parent.resolve()))
-clr.AddReference("YuantaSparkAPI")  # no file extension
-from YuantaOneAPI import YuantaSparkAPITrader, enumEnvironmentMode, enumLogType
-```
-
-`infrastructure/yuanta/spark_client.py` implements exactly this pattern, pointed at
-`default_dll_directory()` (`C:\Yuanta\SparkAPI` by convention) instead of the script's
-own folder. Requires the **.NET 8 SDK** installed system-wide (not a pip package) —
-`infrastructure/yuanta/preflight.py` checks for it via `dotnet --list-runtimes`.
-
-## Session/login (Feature 02)
-
-`session_orchestrator.py`'s `BrokerSessionOrchestrator` is the login/session-lifecycle
-implementation (`IBrokerSession`), driven by `spark_api_adapter.py`'s
-`SparkApiSessionAdapter` (the real `pythonnet`-backed `SparkAdapterPort`). **Not yet
-executed against a real login this session** — no .NET 8 SDK/vendor DLL/real futures
-account available in this environment; written strictly from the documented API
-signatures. See `docs/adr/0004-broker-session-architecture.md`'s "What's confirmed vs.
-what's not verified" for the honest status — check there before assuming any of this
-has been exercised against a live server.
-
-To actually run the real (non-mock) gateway: download the SPARK API component from the
-official portal, extract it to `C:\Yuanta\SparkAPI` (or point
-`spark_client.default_dll_directory()` elsewhere), install the .NET 8 SDK, then set
-`use_mock: false`.
-
-## Legacy OCX API (superseded, historical reference only)
-
-The retired COM/ActiveX pair (`YuantaOrd.ocx` trading, `YuantaQuote_v2.1.2.9.ocx`
-quote) and its 32-bit-only bitness constraint, ProgID/CLSID registration, and
-`AtlAxCreateControlEx` hosting mechanism are fully documented in git history (see the
-pre-2026-08-19 revisions of this file and `docs/adr/0002`/`0004`) — not reproduced
-here since none of it applies to SPARK API. Don't build on any of it going forward.
+- 32-bit Python 3.11, `comtypes`, `wxPython`. `comtypes.client.GetModule(<ocx>)`
+  generates the typed wrappers under `comtypes.gen` at runtime.
+- The OCX's own directory must be on the DLL search path — `preload_control` does
+  this with `LoadLibraryExW(..., LOAD_WITH_ALTERED_SEARCH_PATH)`.
+- CI installs no OCX and needs none: the real adapters only touch the vendor
+  components at runtime, and every test uses the mock/fake gateways.

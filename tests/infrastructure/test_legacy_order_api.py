@@ -223,19 +223,11 @@ def test_missing_or_malformed_broker_fields_fail_closed() -> None:
         broker_fill_key({"Oseq_No": "SEQ1"})
 
 
-@pytest.mark.parametrize(
-    ("environment", "expected_endpoint"),
-    [
-        # Both ports come from the vendor's 使用說明.txt 連線位置 section:
-        # 測試環境 Port:80, 正式環境 Port:80/443 — production may use either, and 80
-        # is the configured choice.
-        (Environment.TEST, ("apitest.yuantafutures.com.tw", 80)),
-        (Environment.PRODUCTION, ("api.yuantafutures.com.tw", 80)),
-    ],
-)
-def test_login_environment_selects_documented_simulation_or_live_endpoint(
-    environment: Environment, expected_endpoint: tuple[str, int]
-) -> None:
+def test_login_always_connects_the_single_production_trade_endpoint() -> None:
+    """There is no "UAT/test trade server" any more — `LegacyBroker` connects the one
+    production endpoint (`api.yuantafutures.com.tw:443`) regardless of the
+    `LoginRequest.environment` field. `build_services` only ever constructs this adapter
+    for `Environment.PRODUCTION`; a TEST login is served by the local broker simulator."""
     host = FakeHost()
     broker = LegacyBroker(
         event_publisher=FakePublisher(),
@@ -243,11 +235,9 @@ def test_login_environment_selects_documented_simulation_or_live_endpoint(
         host_factory=lambda: host,  # type: ignore[arg-type]
     )
 
-    broker.start(LoginRequest(environment, "TEST-ID", SecretStr("secret")))
+    broker.start(LoginRequest(Environment.PRODUCTION, "TEST-ID", SecretStr("secret")))
 
-    assert host.control.connections == [
-        ("TEST-ID", "secret", expected_endpoint[0], expected_endpoint[1])
-    ]
+    assert host.control.connections == [("TEST-ID", "secret", "api.yuantafutures.com.tw", 443)]
 
 
 def test_failed_connection_closes_host_and_allows_retry() -> None:
@@ -502,9 +492,7 @@ def test_reconnect_after_invalidation_replaces_the_dead_host_silently() -> None:
     # attempt against a dropped session silently did nothing.
     assert len(hosts) == 2
     assert closed == [hosts[0]]
-    assert hosts[1].control.connections == [
-        ("TEST-ID", "secret", "apitest.yuantafutures.com.tw", 80)
-    ]
+    assert hosts[1].control.connections == [("TEST-ID", "secret", "api.yuantafutures.com.tw", 443)]
     # `BrokerLoggedOut` would cancel the very reconnect episode driving this call.
     assert _of_type(publisher, BrokerLoggedOut) == []
 
@@ -549,7 +537,7 @@ def test_start_off_the_ui_thread_is_marshalled_onto_it() -> None:
 
     dispatched[0]()
 
-    assert host.control.connections == [("TEST-ID", "secret", "apitest.yuantafutures.com.tw", 80)]
+    assert host.control.connections == [("TEST-ID", "secret", "api.yuantafutures.com.tw", 443)]
 
 
 def test_start_on_the_ui_thread_is_not_marshalled() -> None:

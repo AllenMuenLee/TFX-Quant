@@ -11,6 +11,7 @@ instrument, incomplete manual contract selection).
 from __future__ import annotations
 
 from datetime import time
+from decimal import Decimal
 from enum import StrEnum
 from typing import Any
 
@@ -37,11 +38,51 @@ class SettingsValidationError(ValueError):
     surface as, independent of the underlying validation library."""
 
 
+class SimulationFeeModelSettings(BaseModel):
+    """The configurable, versioned cost model the local broker simulator applies to a
+    simulated fill (測試環境). Never consulted for a real Yuanta
+    fill — those carry `provisional` costs until the broker's own fee data is confirmed.
+    A missing field (`None`) leaves that cost unknown, so the simulated fill is itself
+    flagged `provisional` rather than silently priced at zero."""
+
+    model_config = {"frozen": True, "extra": "forbid"}
+
+    version: str
+    """Stamped onto every simulated fill's audit log so a P&L number can be tied to the
+    exact cost model that produced it (Feature 15: "成交模型…須…具版本並完整記錄")."""
+    commission_per_lot: Decimal | None = None
+    """TWD commission charged per filled lot, each side."""
+    tax_rate: Decimal | None = None
+    """TAIFEX 期交稅 rate applied to contract notional (price × multiplier × lots) on the
+    closing side, e.g. `0.00002` (十萬分之二) for index futures."""
+    slippage_ticks: Decimal | None = None
+    """Adverse price movement, in ticks, applied against the order side at fill time.
+    `None` or `0` means fills are simulated at the reference price with no slippage."""
+
+    @field_validator("version")
+    @classmethod
+    def _version_not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("simulation_fee_model.version must not be blank")
+        return v
+
+    @field_validator("commission_per_lot", "tax_rate", "slippage_ticks")
+    @classmethod
+    def _non_negative(cls, v: Decimal | None) -> Decimal | None:
+        if v is not None and v < 0:
+            raise ValueError("simulation_fee_model cost fields must not be negative")
+        return v
+
+
 class TradingSettings(BaseModel):
     model_config = {"frozen": True, "extra": "forbid"}
 
     account_alias: str
     """A non-secret label (e.g. "primary"), never the raw broker account number."""
+    quote_account_alias: str | None = None
+    """A non-secret label for the quote-API login used by UAT 交易模擬模式 (keyed separately
+    from the trade credential — see `infrastructure.yuanta.credentials.
+    QUOTE_KEYRING_SERVICE_NAME`). `None` in 正式環境."""
     environment: Environment
     selected_instrument: Instrument
     contract_selection_mode: ContractSelectionMode = ContractSelectionMode.AUTO
@@ -98,6 +139,25 @@ class TradingSettings(BaseModel):
     see `desktop.composition._resolve_eod_flatten_workflow_db_path`. Deliberately a
     separate file from every other `*_db_path`, never the same connection — same
     lock-hazard reasoning as every other dedicated workflow database in this codebase."""
+    fill_ledger_db_path: str | None = None
+    """Path to the SQLite database file `application.trade_reports.fill_ledger_service.
+    FillLedgerService` persists the append-only execution ledger to (see `application.
+    ports.fill_ledger_repository` and `persistence.sqlite_fill_ledger_repository`).
+    `None` falls back to a per-user data directory
+    (`%LOCALAPPDATA%/tfx_quant/fill_ledger.sqlite3` on Windows) — see
+    `desktop.composition._resolve_fill_ledger_db_path`. Deliberately a separate file
+    from every other `*_db_path`, never the same connection — same lock-hazard reasoning
+    as every other dedicated database in this codebase."""
+    audit_db_path: str | None = None
+    """Path to the SQLite audit-event database (`telemetry.audit.SqliteAuditHandler`), read
+    back by the trade-report drill-down to reconstruct a workflow's decision→fill→P&L
+    timeline. `None` falls back to `%LOCALAPPDATA%/tfx_quant/logs/audit.sqlite3` — the path
+    `desktop.__main__` installs the handler at."""
+    simulation_fee_model: SimulationFeeModelSettings | None = None
+    """The versioned cost model the local broker simulator applies to simulated fills
+    (測試環境). `None` in 正式環境 — real fills never consult
+    it. Required for a 測試環境 settings file that wants realistic simulated P&L; absent, the
+    simulator marks every simulated fill's costs `provisional`."""
 
     @field_validator("account_alias")
     @classmethod

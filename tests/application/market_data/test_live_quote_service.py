@@ -67,22 +67,32 @@ def _service() -> tuple[LiveQuoteService, list[Gateway], Clock]:
     return LiveQuoteService(factory, clock), gateways, clock
 
 
-def test_switches_from_t_to_t_plus_1_port_and_resubscribes() -> None:
+def test_switches_from_t_to_t_plus_1_port_and_resubscribes_every_symbol() -> None:
     service, gateways, clock = _service()
-    service.start("A123456789", SecretStr("secret"), "TXFI6")
+    service.start("A123456789", SecretStr("secret"), ("TXFI6", "MXFI6"))
     assert gateways[0].connections == [("apiquote.yuantafutures.com.tw", 80, 1)]
-    assert gateways[0].subscriptions == [("TXFI6", 1)]
+    assert gateways[0].subscriptions == [("TXFI6", 1), ("MXFI6", 1)]
 
     clock.value = datetime(2026, 8, 24, 15, 0, tzinfo=TAIPEI_TZ)
     service.refresh()
     assert gateways[0].stopped
     assert gateways[1].connections == [("apiquote.yuantafutures.com.tw", 82, 2)]
-    assert gateways[1].subscriptions == [("TXFI6", 2)]
+    assert gateways[1].subscriptions == [("TXFI6", 2), ("MXFI6", 2)]
 
 
-def test_symbol_switch_unregisters_with_the_active_session_request_type() -> None:
+def test_dropped_symbol_unregisters_with_the_active_session_request_type() -> None:
     service, gateways, _clock = _service()
-    service.start("A123456789", SecretStr("secret"), "TXFI6")
-    service.select_symbol("MXFI6")
+    service.start("A123456789", SecretStr("secret"), ("TXFI6", "MXFI6"))
+    service.select_symbols(("MXFI6", "TXFL6"))
     assert gateways[0].unsubscriptions == [("TXFI6", 1)]
-    assert gateways[0].subscriptions == [("MXFI6", 1)]
+    assert gateways[0].subscriptions == [("MXFI6", 1), ("TXFL6", 1)]
+
+
+def test_reselecting_an_unchanged_set_never_touches_the_running_registrations() -> None:
+    """An instrument switch that only changes the charted market must not interrupt
+    either feed — see `desktop.quote_runtime.QuoteRuntime._on_switch`."""
+    service, gateways, _clock = _service()
+    service.start("A123456789", SecretStr("secret"), ("TXFI6", "MXFI6"))
+    service.select_symbols(("MXFI6", "TXFI6"))
+    assert gateways[0].unsubscriptions == []
+    assert gateways[0].subscriptions == [("TXFI6", 1), ("MXFI6", 1)]

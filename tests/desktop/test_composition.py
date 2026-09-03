@@ -94,21 +94,18 @@ def test_build_services_wires_a_real_broker_session_without_connecting(
     assert readiness["Market data: Yuanta quote login"] is False
 
 
-def test_build_services_raises_actionable_preflight_error_when_use_mock_false(
+def test_production_env_build_services_raises_actionable_preflight_error(
     valid_settings_raw: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The real branch must fail loudly at startup with an aggregated, actionable
+    """The 正式環境 branch must fail loudly at startup with an aggregated, actionable
     message for whatever preflight check fails, never silently fall back to a fake —
-    per docs/adr/0004-broker-session-architecture.md. The DLL-directory check is forced
-    to fail here (pointed at an empty tmp dir, guaranteed to lack the YuantaOrd files)
-    so the assertion is deterministic regardless of host state. Credentials are no
-    longer checked at startup at all (they're entered on the login screen, not
-    available until then — see docs/secrets-management.md)."""
+    per docs/adr/0004-broker-session-architecture.md. The 測試環境 branch skips trade
+    preflight entirely (it uses the local broker simulator)."""
     import tfx_quant.infrastructure.yuanta.preflight as preflight
 
     monkeypatch.setattr(preflight, "default_api_directory", lambda: tmp_path)
 
-    settings = validate_startup(valid_settings_raw)
+    settings = validate_startup({**valid_settings_raw, "environment": "PRODUCTION"})
 
     with pytest.raises(PreflightCheckFailed) as exc_info:
         build_services(settings)
@@ -116,6 +113,26 @@ def test_build_services_raises_actionable_preflight_error_when_use_mock_false(
     message = str(exc_info.value)
     assert "password" not in message.lower()
     assert "hunter2" not in message
+
+
+def test_test_env_build_services_uses_the_local_broker_simulator(
+    valid_settings_raw: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`environment: TEST` → mock broker, no trade preflight, no trade server."""
+    import tfx_quant.infrastructure.yuanta.preflight as preflight
+    from tfx_quant.infrastructure.yuanta.mock_broker_session import MockBrokerSession
+    from tfx_quant.infrastructure.yuanta.mock_trade_gateway import MockTradeGateway
+
+    # even a guaranteed-failing trade preflight is never reached in TEST
+    monkeypatch.setattr(preflight, "default_api_directory", lambda: tmp_path)
+
+    services = build_services(validate_startup(valid_settings_raw))
+
+    assert services.simulation is True
+    inner_gateway = getattr(services.trade_gateway, "_inner", services.trade_gateway)
+    inner_session = getattr(services.broker_session, "_inner", services.broker_session)
+    assert isinstance(inner_gateway, MockTradeGateway)
+    assert isinstance(inner_session, MockBrokerSession)
 
 
 def test_compute_readiness_never_includes_account_number_or_secrets(
@@ -300,6 +317,112 @@ def test_broker_session_and_trade_gateway_are_connectivity_tracking_wrappers(
     services = build_services(settings)
     assert isinstance(services.broker_session, ConnectivityTrackingBrokerSession)
     assert isinstance(services.trade_gateway, ConnectivityTrackingTradeGateway)
+
+
+def test_trade_report_services_are_wired_into_service_container(
+    valid_settings_raw: dict[str, Any],
+) -> None:
+    from tfx_quant.application.trade_reports import (
+        FillLedgerService,
+        TradeReportFacade,
+        TradeReportService,
+    )
+
+    settings = validate_startup(valid_settings_raw)
+    services = build_services(settings)
+    assert isinstance(services.trade_report_service, TradeReportService)
+    assert isinstance(services.trade_report_facade, TradeReportFacade)
+    assert isinstance(services.fill_ledger_service, FillLedgerService)
+    # TEST env (the fixture default) — simulated fills.
+    assert services.fill_ledger_service.simulation is True
+    assert services.fill_ledger_service.source == "SIMULATION"
+
+
+def test_fill_ledger_db_path_resolves_to_its_own_isolated_file(
+    valid_settings_raw: dict[str, Any], tmp_path: Path
+) -> None:
+    """Mirrors every other `*_db_path` — a dedicated, separate SQLite file, never shared
+    with another repository's connection."""
+    settings = validate_startup(valid_settings_raw)
+    build_services(settings)
+    assert (tmp_path / "fill_ledger.sqlite3").exists()
+    for other in ("orders.sqlite3", "market_data.sqlite3", "reversal_workflows.sqlite3"):
+        assert settings.fill_ledger_db_path != str(tmp_path / other)
+
+
+def test_a_fill_flows_into_the_execution_ledger_via_composition(
+    valid_settings_raw: dict[str, Any],
+) -> None:
+    """The `FillReceived` -> `LedgerFill` translation is actually wired: submit an order
+    through the composed `OrderManager`, ack + fill it, and the composed
+    `TradeReportFacade` reports the realized trade."""
+    from datetime import date
+
+    settings = validate_startup(valid_settings_raw)
+    services = build_services(settings)
+    resolved = services.instrument_selection.resolve_near_month(Instrument.MXF)
+    account = TradingAccount(branch_id="0001", account_no="1234567")
+
+    def _submit(idempotency_key: str, side: Side, kind: OrderKind) -> Any:
+        return services.order_manager.submit(
+            OrderRequest(
+                account=account,
+                instrument=resolved.instrument,
+                contract=resolved.contract,
+                side=side,
+                quantity=Quantity(1),
+                price=Price(Decimal("18500")),
+                kind=kind,
+                time_in_force=TimeInForce.ROD,
+                idempotency_key=idempotency_key,
+                workflow_id="ledger-wiring",
+                reason="composition wiring test",
+            )
+        )
+
+    open_intent = _submit("open", Side.BUY, OrderKind.OPEN)
+    now = services.clock.now()
+    services.event_coordinator.publish(
+        _OrderReportReceived_ack(open_intent.client_order_id, "B-open", now)
+    )
+    services.event_coordinator.publish(
+        FillReceived(
+            at=now,
+            fill=Fill(
+                client_order_id=open_intent.client_order_id,
+                instrument=resolved.instrument,
+                side=Side.BUY,
+                quantity=Quantity(1),
+                price=Price(Decimal("18500")),
+                at=now,
+                broker_fill_no="F-open",
+                broker_seq_no=2,
+            ),
+        )
+    )
+    services.event_coordinator.start()
+    services.event_coordinator.stop(timeout=2)
+
+    report = services.trade_report_facade.build_report(date(2020, 1, 1), date(2100, 1, 1))
+    assert len(report.fills) == 1
+    assert report.fills[0].fill_id == "F-open"
+    assert report.fills[0].simulation is True  # fixture default env is TEST
+
+
+def _OrderReportReceived_ack(client_id: Any, broker_order_no: str, at: Any) -> Any:
+    from tfx_quant.application.events.events import OrderReportReceived
+    from tfx_quant.domain.order_state_machine import OrderReport, OrderStatus
+
+    return OrderReportReceived(
+        at=at,
+        report=OrderReport(
+            client_order_id=client_id,
+            status=OrderStatus.ACKNOWLEDGED,
+            broker_seq_no=1,
+            at=at,
+            broker_order_no=broker_order_no,
+        ),
+    )
 
 
 def test_full_disconnect_after_login_drives_a_connectivity_safe_pause_via_composition(

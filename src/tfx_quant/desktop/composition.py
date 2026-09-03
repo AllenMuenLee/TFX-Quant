@@ -10,8 +10,9 @@ import json
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import date
+from decimal import Decimal
 from pathlib import Path
-from typing import Protocol
 
 from tfx_quant.application.connectivity.connectivity_monitor import ConnectivityMonitor
 from tfx_quant.application.connectivity.gateway_tracking import (
@@ -29,6 +30,7 @@ from tfx_quant.application.ports.broker_session import IBrokerSession
 from tfx_quant.application.ports.clock import Clock
 from tfx_quant.application.ports.identity import IdGenerator
 from tfx_quant.application.ports.instrument_master import InstrumentMasterRepository
+from tfx_quant.application.ports.order_repository import OrderRepository
 from tfx_quant.application.ports.quote_gateway import QuoteGateway
 from tfx_quant.application.ports.trading_calendar import TradingCalendarRepository
 from tfx_quant.application.ports.yuanta_gateways import TradeGatewayPort
@@ -38,9 +40,20 @@ from tfx_quant.application.position_reconciliation.reconciliation_service import
 from tfx_quant.application.reversal_scaling.reversal_service import ReversalWorkflowService
 from tfx_quant.application.reversal_scaling.scaling_service import ScalingService
 from tfx_quant.application.risk.risk_supervisor import RiskSupervisor
-from tfx_quant.application.settings.trading_settings import TradingSettings, validate_startup
+from tfx_quant.application.settings.trading_settings import (
+    Environment,
+    TradingSettings,
+    validate_startup,
+)
 from tfx_quant.application.strategy_signal.signal_engine_service import (
     StrategySignalEngineService,
+)
+from tfx_quant.application.trade_reports import (
+    FillLedgerService,
+    PositionValuationService,
+    TradeReportFacade,
+    TradeReportService,
+    fee_model_from_settings,
 )
 from tfx_quant.desktop.quote_runtime import QuoteRuntime
 from tfx_quant.domain.contract import ContractMonth
@@ -48,6 +61,8 @@ from tfx_quant.domain.instrument import Instrument
 from tfx_quant.domain.market_data import MarketDataGap, RawMarketEvent
 from tfx_quant.domain.quantity import NetPosition
 from tfx_quant.domain.strategy_state import StrategyStateMachine
+from tfx_quant.domain.timestamp import Timestamp
+from tfx_quant.domain.trading_calendar import TradingCalendar
 from tfx_quant.infrastructure.clock import SystemClock
 from tfx_quant.infrastructure.identity import UuidIdGenerator
 from tfx_quant.infrastructure.market_data.trading_calendar_repository import (
@@ -62,6 +77,7 @@ from tfx_quant.persistence.sqlite_connection import create_connection
 from tfx_quant.persistence.sqlite_eod_flatten_workflow_repository import (
     SqliteEodFlattenWorkflowRepository,
 )
+from tfx_quant.persistence.sqlite_fill_ledger_repository import SqliteFillLedgerRepository
 from tfx_quant.persistence.sqlite_market_event_repository import SqliteMarketEventRepository
 from tfx_quant.persistence.sqlite_order_repository import SqliteOrderRepository
 from tfx_quant.persistence.sqlite_position_baseline_repository import (
@@ -71,6 +87,7 @@ from tfx_quant.persistence.sqlite_reversal_workflow_repository import (
     SqliteReversalWorkflowRepository,
 )
 from tfx_quant.telemetry import get_logger, log_error, log_info, log_warning
+from tfx_quant.telemetry.audit import AuditTimelineStep, read_workflow_timeline
 
 _logger = get_logger(__name__)
 
@@ -110,15 +127,6 @@ class _CompositeBarSignalStateStore:
             store.clear(instrument, contract)
 
 
-class SimulationMarketDataControl(Protocol):
-    @property
-    def source(self) -> str: ...
-
-    def use_mock_data(self) -> None: ...
-
-    def use_real_data(self, user_id: str, password: str) -> None: ...
-
-
 @dataclass
 class ServiceContainer:
     settings: TradingSettings
@@ -138,27 +146,35 @@ class ServiceContainer:
     connectivity_monitor: ConnectivityMonitor
     signal_engine_service: StrategySignalEngineService
     risk_supervisor: RiskSupervisor
+    trade_report_service: TradeReportService
+    trade_report_facade: TradeReportFacade
+    fill_ledger_service: FillLedgerService
+    position_valuation_service: PositionValuationService
+    order_repository: OrderRepository
+    audit_timeline_reader: Callable[[str], tuple[AuditTimelineStep, ...]]
     simulation: bool = False
-    simulation_market_data: SimulationMarketDataControl | None = None
+    """`True` in the 測試環境 (`settings.environment is Environment.TEST`): the trade
+    adapter is the local simulator and never sends anything to a server; market data is
+    still the real Yuanta quote feed. `False` in 正式環境 (`PRODUCTION`)."""
 
 
 @dataclass(frozen=True, slots=True)
 class RuntimeOverrides:
-    """Adapter seam used only by the separately packaged simulation runtime.
-
-    Normal startup never supplies this object, so it still performs Yuanta preflight
-    and constructs real adapters.  Domain and application services remain unaware of
-    whether their ports are backed by a simulator.
+    """Test-only adapter seam. Normal startup never supplies this — `build_services`
+    picks the trade adapter from `settings.environment` (mock in TEST, real
+    `LegacyBroker` in PRODUCTION) and the real `YuantaQuoteComHost` for market data.
+    Tests inject a fake quote host / fake clock / a scripted mock broker here instead.
     """
 
-    clock: Clock
-    id_generator: IdGenerator
-    broker_factory: Callable[[EventCoordinator], tuple[TradeGatewayPort, IBrokerSession]]
-    quote_gateway_factory: Callable[
-        [Callable[[RawMarketEvent], None], Callable[[MarketDataGap], None]], QuoteGateway
-    ]
-    simulation: bool = False
-    simulation_market_data: SimulationMarketDataControl | None = None
+    clock: Clock | None = None
+    id_generator: IdGenerator | None = None
+    broker_factory: Callable[[EventCoordinator], tuple[TradeGatewayPort, IBrokerSession]] | None = (
+        None
+    )
+    quote_gateway_factory: (
+        Callable[[Callable[[RawMarketEvent], None], Callable[[MarketDataGap], None]], QuoteGateway]
+        | None
+    ) = None
 
 
 def load_settings(path: Path) -> TradingSettings:
@@ -188,6 +204,8 @@ def load_settings(path: Path) -> TradingSettings:
         reversal_workflow_db_path_configured=settings.reversal_workflow_db_path is not None,
         position_baseline_db_path_configured=settings.position_baseline_db_path is not None,
         eod_flatten_workflow_db_path_configured=settings.eod_flatten_workflow_db_path is not None,
+        fill_ledger_db_path_configured=settings.fill_ledger_db_path is not None,
+        simulation_fee_model_configured=settings.simulation_fee_model is not None,
     )
     return settings
 
@@ -268,6 +286,25 @@ def _resolve_eod_flatten_workflow_db_path(settings: TradingSettings) -> Path:
     return base / "tfx_quant" / "eod_flatten_workflows.sqlite3"
 
 
+def _resolve_audit_db_path(settings: TradingSettings) -> Path:
+    if settings.audit_db_path is not None:
+        return Path(settings.audit_db_path)
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    base = Path(local_app_data) if local_app_data else Path.home()
+    return base / "tfx_quant" / "logs" / "audit.sqlite3"
+
+
+def _resolve_fill_ledger_db_path(settings: TradingSettings) -> Path:
+    """Mirrors `_resolve_order_db_path` — a separate per-user data file for the
+    append-only execution ledger (`application.trade_reports.fill_ledger_service`), never
+    the same connection as any other `*_db_path`."""
+    if settings.fill_ledger_db_path is not None:
+        return Path(settings.fill_ledger_db_path)
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    base = Path(local_app_data) if local_app_data else Path.home()
+    return base / "tfx_quant" / "fill_ledger.sqlite3"
+
+
 def _current_expected_net(
     instrument_selection: InstrumentSelectionService,
     broker_session: IBrokerSession,
@@ -290,14 +327,19 @@ def _current_expected_net(
 def build_services(
     settings: TradingSettings, *, runtime_overrides: RuntimeOverrides | None = None
 ) -> ServiceContainer:
-    broker_mode = "simulation" if runtime_overrides is not None else "yuanta_ocx"
-    log_info(_logger, "module_load_started", broker_mode=broker_mode)
-    clock: Clock = runtime_overrides.clock if runtime_overrides is not None else SystemClock()
-    id_generator: IdGenerator = (
-        runtime_overrides.id_generator
-        if runtime_overrides is not None
-        else UuidIdGenerator()
+    overrides = runtime_overrides or RuntimeOverrides()
+    is_test_env = settings.environment is Environment.TEST
+    broker_mode = (
+        "test_simulator" if (is_test_env or overrides.broker_factory is not None) else "yuanta_ocx"
     )
+    log_info(
+        _logger,
+        "module_load_started",
+        broker_mode=broker_mode,
+        environment=settings.environment.value,
+    )
+    clock: Clock = overrides.clock or SystemClock()
+    id_generator: IdGenerator = overrides.id_generator or UuidIdGenerator()
     event_coordinator = EventCoordinator()
     strategy_state_machine = StrategyStateMachine()
     instrument_master: InstrumentMasterRepository = JsonInstrumentMasterRepository(
@@ -322,12 +364,22 @@ def build_services(
 
     trade_gateway: TradeGatewayPort
     broker_session: IBrokerSession
-    # Always the real broker — never a silent mock fallback, per
-    # docs/adr/0004-broker-session-architecture.md. A preflight failure must fail
-    # loudly and actionably here, not be masked by quietly falling back to
-    # `MockBrokerSession`/`MockTradeGateway` (those remain usable directly by tests
-    # that want to script session-lifecycle scenarios without the real OCX).
-    if runtime_overrides is None:
+    # Trade adapter selection is driven purely by `settings.environment`:
+    #   PRODUCTION -> the real Yuanta OCX broker (real trade server). A preflight failure
+    #                 fails loudly here, never a silent mock fallback (ADR 0004).
+    #   TEST       -> the local broker simulator: it never sends anything to any server.
+    #                 This *replaces* the old "log in to the trading API's UAT/test
+    #                 environment" flow — there is no test trade server any more.
+    # `runtime_overrides.broker_factory` is a test-only seam that pre-empts both.
+    if overrides.broker_factory is not None:
+        trade_gateway, broker_session = overrides.broker_factory(event_coordinator)
+    elif is_test_env:
+        from tfx_quant.infrastructure.yuanta.mock_broker_session import MockBrokerSession
+        from tfx_quant.infrastructure.yuanta.mock_trade_gateway import MockTradeGateway
+
+        trade_gateway = MockTradeGateway(event_publisher=event_coordinator)
+        broker_session = MockBrokerSession(event_publisher=event_coordinator)
+    else:
         log_info(_logger, "preflight_checks_started")
         raise_if_any_failed(run_preflight_checks())
         log_info(_logger, "preflight_checks_passed")
@@ -346,8 +398,8 @@ def build_services(
         )
         trade_gateway = adapter
         broker_session = adapter
-    else:
-        trade_gateway, broker_session = runtime_overrides.broker_factory(event_coordinator)
+    if is_test_env and overrides.broker_factory is None:
+        _assert_test_env_broker_is_local_simulator(trade_gateway, broker_session)
     log_info(_logger, "module_loaded", module="broker_session", kind=broker_mode)
 
     bar_signal_state_store = _CompositeBarSignalStateStore()
@@ -390,8 +442,10 @@ def build_services(
     def quote_gateway_factory(
         on_event: Callable[[RawMarketEvent], None], on_gap: Callable[[MarketDataGap], None]
     ) -> QuoteGateway:
-        if runtime_overrides is not None:
-            return runtime_overrides.quote_gateway_factory(on_event, on_gap)
+        # Market data is the real Yuanta quote feed in BOTH environments — only the trade
+        # adapter differs. Tests substitute a fake host via `runtime_overrides`.
+        if overrides.quote_gateway_factory is not None:
+            return overrides.quote_gateway_factory(on_event, on_gap)
         from tfx_quant.infrastructure.yuanta.quote_com_host import YuantaQuoteComHost
 
         return YuantaQuoteComHost(on_event, on_gap)
@@ -472,6 +526,70 @@ def build_services(
     # own `BrokerSessionReady` handlers — see `ConnectivityMonitor.
     # attach_reconnect_reconciliation_watcher`'s docstring.
     connectivity_monitor.attach_reconnect_reconciliation_watcher()
+
+    # Feature 11 — the append-only execution ledger and P&L reporting. `FillLedgerService`
+    # subscribes to `FillReceived` *after* `OrderManager` (built just above) so it always
+    # reads an order intent whose `broker_order_no` is already set; it never mutates order
+    # state. Its own dedicated SQLite file/connection, never shared with any other
+    # repository (same lock-hazard reasoning as every other `*_db_path`).
+    fill_ledger_db_path = _resolve_fill_ledger_db_path(settings)
+    fill_ledger_connection = create_connection(fill_ledger_db_path, check_same_thread=False)
+    log_info(
+        _logger,
+        "module_loaded",
+        module="fill_ledger_db",
+        path_configured=settings.fill_ledger_db_path is not None,
+        path_basename=fill_ledger_db_path.name,
+    )
+    fill_ledger_repository = SqliteFillLedgerRepository(fill_ledger_connection)
+    trade_report_service = TradeReportService(fill_ledger_repository)
+    report_calendar = TradingCalendar(
+        trading_calendar.get_holidays(), trading_calendar.get_early_closes()
+    )
+
+    def _multiplier_lookup(instrument: Instrument, contract: ContractMonth) -> Decimal:
+        entry = instrument_master.get(instrument, contract)
+        if entry is None:
+            raise ValueError(
+                f"instrument master has no entry for {instrument.value} {contract.code}"
+            )
+        return entry.multiplier
+
+    def _trading_day_for(
+        instant: Timestamp, instrument: Instrument, contract: ContractMonth
+    ) -> date:
+        entry = instrument_master.get(instrument, contract)
+        if entry is not None:
+            resolved = report_calendar.boundary_containing(instant, entry)
+            if resolved is not None:
+                return resolved[2]
+        return instant.value.date()
+
+    simulation_flag = is_test_env
+    trade_report_facade = TradeReportFacade(
+        trade_report_service, fill_ledger_repository, _multiplier_lookup
+    )
+    fill_ledger_service = FillLedgerService(
+        report_service=trade_report_service,
+        order_repository=order_repository,
+        trading_day_resolver=_trading_day_for,
+        multiplier_lookup=_multiplier_lookup,
+        fee_model=fee_model_from_settings(settings.simulation_fee_model),
+        event_bus=event_coordinator,
+        simulation=simulation_flag,
+        source="SIMULATION" if simulation_flag else "YUANTA_OCX",
+    )
+    position_valuation_service = PositionValuationService(
+        fill_ledger=fill_ledger_repository,
+        multiplier_lookup=_multiplier_lookup,
+        clock=clock,
+        event_bus=event_coordinator,
+        simulation=simulation_flag,
+    )
+    _audit_db_path = _resolve_audit_db_path(settings)
+
+    def _audit_timeline_reader(workflow_id: str) -> tuple[AuditTimelineStep, ...]:
+        return read_workflow_timeline(_audit_db_path, workflow_id)
 
     eod_flatten_workflow_db_path = _resolve_eod_flatten_workflow_db_path(settings)
     eod_flatten_workflow_connection = create_connection(
@@ -554,12 +672,13 @@ def build_services(
         connectivity_monitor=connectivity_monitor,
         signal_engine_service=signal_engine_service,
         risk_supervisor=risk_supervisor,
-        simulation=(runtime_overrides.simulation if runtime_overrides is not None else False),
-        simulation_market_data=(
-            runtime_overrides.simulation_market_data
-            if runtime_overrides is not None
-            else None
-        ),
+        trade_report_service=trade_report_service,
+        trade_report_facade=trade_report_facade,
+        fill_ledger_service=fill_ledger_service,
+        position_valuation_service=position_valuation_service,
+        order_repository=order_repository,
+        audit_timeline_reader=_audit_timeline_reader,
+        simulation=simulation_flag,
     )
 
 
@@ -605,13 +724,6 @@ def compute_readiness(services: ServiceContainer) -> list[tuple[str, bool]]:
     connection has its own readiness row and is never inferred from trading login.
     """
     capabilities = services.broker_session.capabilities
-    market_data_label = "Market data: Yuanta quote login"
-    if (
-        services.simulation
-        and services.simulation_market_data is not None
-        and services.simulation_market_data.source == "MOCK"
-    ):
-        market_data_label = "Market data: offline mock source"
     rows = [
         ("Settings loaded and validated", True),
         ("Event coordinator running", services.event_coordinator.is_running),
@@ -619,12 +731,107 @@ def compute_readiness(services: ServiceContainer) -> list[tuple[str, bool]]:
         ("Broker session: trading", capabilities.trading),
         ("Broker session: order reports", capabilities.order_reports),
         ("Broker session: queries", capabilities.queries),
-        (market_data_label, services.quote_runtime.state.value == "LOGGED_ON"),
+        ("Market data: Yuanta quote login", services.quote_runtime.state.value == "LOGGED_ON"),
         ("Connectivity: no unresolved safe-pause", _connectivity_pause_resolved(services)),
     ]
     if services.simulation:
-        rows.insert(0, ("SIMULATION MODE: fake data and orders only", True))
+        rows.insert(0, ("測試環境：模擬下單（不會送出真單）・真實行情", True))
+        rows.insert(1, ("交易 adapter：本機模擬（fail-closed 已驗證）", True))
     return rows
+
+
+class TestEnvStartupError(RuntimeError):
+    """測試環境 startup refused because a real-order path could not be ruled out."""
+
+    __test__ = False  # not a pytest test class despite the name
+
+
+_TEST_ENV_LOGIN_USER_ID = "TEST-SIMULATION"
+
+
+def environment_switch_blocked_reason(services: ServiceContainer) -> str | None:
+    """`None` when it is safe to tear the container down and rebuild it for the other
+    執行環境 (模擬下單 ↔ 正式下單), otherwise a human-readable reason it is refused.
+
+    A rebuild is only safe while nothing is actually trading: the strategy must be
+    stopped/faulted and there must be no active order occupying a workflow slot. Open
+    positions are covered transitively — a position cannot exist without a fill, and the
+    operator cannot have logged the broker in without first being on the readiness
+    screen where this check runs."""
+    state = services.strategy_state_machine.state.value
+    if state not in ("STOPPED", "FAULTED"):
+        return f"策略目前為 {state}，請先停止策略再切換執行環境"
+    if services.order_repository.list_active():
+        return "尚有活動委託，請先處理完畢再切換執行環境"
+    return None
+
+
+def _assert_test_env_broker_is_local_simulator(
+    trade_gateway: TradeGatewayPort, broker_session: IBrokerSession
+) -> None:
+    """Fail closed: in the 測試環境 the trade adapter must be the local simulator that
+    never opens a socket. `MockBrokerSession`/`MockTradeGateway` are the only broker
+    objects with no network path at all."""
+    from tfx_quant.infrastructure.yuanta.mock_broker_session import MockBrokerSession
+    from tfx_quant.infrastructure.yuanta.mock_trade_gateway import MockTradeGateway
+
+    trade = getattr(trade_gateway, "_inner", trade_gateway)
+    session = getattr(broker_session, "_inner", broker_session)
+    if not isinstance(trade, MockTradeGateway) or not isinstance(session, MockBrokerSession):
+        raise TestEnvStartupError(
+            "測試環境 fail-closed: trade adapter is "
+            f"{type(trade).__name__}/{type(session).__name__}, not the local simulator"
+        )
+
+
+def assert_test_env_fail_closed(services: ServiceContainer) -> None:
+    """Public re-check used by startup and the acceptance tests."""
+    if not services.simulation:
+        raise TestEnvStartupError("測試環境 fail-closed: services.simulation is False")
+    _assert_test_env_broker_is_local_simulator(services.trade_gateway, services.broker_session)
+    session = getattr(services.broker_session, "_inner", services.broker_session)
+    bad = [
+        r.user_id
+        for r in getattr(session, "start_calls", [])
+        if r.user_id != _TEST_ENV_LOGIN_USER_ID
+    ]
+    if bad:
+        raise TestEnvStartupError(f"測試環境 fail-closed: non-simulator login user id {bad!r}")
+
+
+def start_test_env_broker_session(services: ServiceContainer) -> None:
+    """Start the local mock broker session. The reserved `TEST-SIMULATION` user id is the
+    only login it ever sees — there are no real trade credentials in the 測試環境."""
+    from pydantic import SecretStr
+
+    from tfx_quant.application.ports.broker_session import LoginRequest
+
+    assert_test_env_fail_closed(services)
+    services.broker_session.start(
+        LoginRequest(
+            environment=Environment.TEST,
+            user_id=_TEST_ENV_LOGIN_USER_ID,
+            password=SecretStr("TEST-SIMULATION-ONLY"),
+        )
+    )
+    assert_test_env_fail_closed(services)
+
+
+def start_test_env_quote_login(services: ServiceContainer, user_id: str, password: str) -> None:
+    """Log the *real* Yuanta quote feed in for the 測試環境. The credentials reach the
+    quote OCX only; a failure re-raises after stopping the runtime (fail-closed)."""
+    from pydantic import SecretStr
+
+    assert_test_env_fail_closed(services)
+    user_id = user_id.strip()
+    if not user_id or not password:
+        raise ValueError("行情登入帳號與密碼為必填")
+    services.quote_runtime.stop()
+    try:
+        services.quote_runtime.start(user_id, SecretStr(password))
+    except Exception:
+        services.quote_runtime.stop()
+        raise
 
 
 def _connectivity_pause_resolved(services: ServiceContainer) -> bool:

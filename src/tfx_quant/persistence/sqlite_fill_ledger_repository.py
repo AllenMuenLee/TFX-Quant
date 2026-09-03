@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS fill_ledger (
  masked_account TEXT NOT NULL, instrument TEXT NOT NULL, contract_year INTEGER NOT NULL,
  contract_month INTEGER NOT NULL, side TEXT NOT NULL, position_effect TEXT NOT NULL,
  quantity INTEGER NOT NULL, price TEXT NOT NULL, filled_at TEXT NOT NULL,
- trading_day TEXT NOT NULL, commission TEXT, tax TEXT, source TEXT NOT NULL
+ trading_day TEXT NOT NULL, commission TEXT, tax TEXT, source TEXT NOT NULL,
+ simulation INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_fill_ledger_day ON fill_ledger(trading_day, filled_at);
 """
@@ -32,12 +33,26 @@ class SqliteFillLedgerRepository:
         self._lock = threading.Lock()
         with self._lock:
             connection.executescript(_SCHEMA)
+            self._migrate_simulation_column()
             connection.commit()
+
+    def _migrate_simulation_column(self) -> None:
+        """A ledger file created before the `simulation` provenance column existed keeps
+        every pre-existing row (defaulting them to `0` / real) — the column is only ever
+        added, never dropped, so an older row can never masquerade as simulated."""
+        columns = {
+            str(row[1])
+            for row in self._connection.execute("PRAGMA table_info(fill_ledger)").fetchall()
+        }
+        if "simulation" not in columns:
+            self._connection.execute(
+                "ALTER TABLE fill_ledger ADD COLUMN simulation INTEGER NOT NULL DEFAULT 0"
+            )
 
     def append(self, fill: LedgerFill) -> FillAppendOutcome:
         with self._lock:
             cursor = self._connection.execute(
-                "INSERT OR IGNORE INTO fill_ledger VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT OR IGNORE INTO fill_ledger VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     fill.fill_id,
                     fill.broker_order_no,
@@ -55,6 +70,7 @@ class SqliteFillLedgerRepository:
                     None if fill.commission is None else str(fill.commission),
                     None if fill.tax is None else str(fill.tax),
                     fill.source,
+                    1 if fill.simulation else 0,
                 ),
             )
             self._connection.commit()
@@ -93,6 +109,7 @@ def _row(row: tuple[object, ...]) -> LedgerFill:
         commission=None if row[13] is None else Decimal(str(row[13])),
         tax=None if row[14] is None else Decimal(str(row[14])),
         source=str(row[15]),
+        simulation=bool(row[16]),
     )
 
 

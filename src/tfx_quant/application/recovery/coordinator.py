@@ -140,8 +140,14 @@ class RecoveryCoordinator:
                         f"expected={expected}:actual={position.net.lots}"
                     )
         safe = (
-            orders_ok and fills_ok and positions_ok and not errors and not unresolved
-            and not unknown_broker and not differences and workflow_count == 0
+            orders_ok
+            and fills_ok
+            and positions_ok
+            and not errors
+            and not unresolved
+            and not unknown_broker
+            and not differences
+            and workflow_count == 0
         )
         report = RecoveryReport(
             recovery_id=str(uuid4()),
@@ -162,7 +168,10 @@ class RecoveryCoordinator:
         _logger.warning(
             "recovery_completed recovery_id=%s status=%s unresolved=%d unknown=%d "
             "differences=%d automatic_resubmissions=0",
-            report.recovery_id, report.status.value, len(unresolved), len(unknown_broker),
+            report.recovery_id,
+            report.status.value,
+            len(unresolved),
+            len(unknown_broker),
             len(differences),
         )
         return report

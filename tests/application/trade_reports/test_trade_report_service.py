@@ -25,6 +25,7 @@ def fill(
     *,
     commission: str | None = "20",
     tax: str | None = "5",
+    simulation: bool = False,
 ) -> LedgerFill:
     return LedgerFill(
         fill_id=fill_id,
@@ -42,6 +43,7 @@ def fill(
         commission=None if commission is None else Decimal(commission),
         tax=None if tax is None else Decimal(tax),
         source="yuanta_fill_report",
+        simulation=simulation,
     )
 
 
@@ -93,6 +95,46 @@ def test_short_reversal_cross_month_and_duplicate_report(tmp_path) -> None:
     assert len(report.monthly) == 1
     assert report.monthly[0].period == date(2026, 9, 1)
     assert report.realized_trades[0].open_fill_ids == ("short",)
+
+
+def test_simulated_report_marks_every_layer_and_the_csv(tmp_path) -> None:
+    reports, _ = service(tmp_path)
+    day = date(2026, 8, 25)
+    reports.record_fill(
+        fill("open", Side.BUY, 1, "100", datetime(2026, 8, 25, 9), day, simulation=True)
+    )
+    reports.record_fill(
+        fill("close", Side.SELL, 1, "110", datetime(2026, 8, 25, 10), day, simulation=True)
+    )
+
+    report = reports.query(day, day, multipliers=MULTIPLIERS)
+
+    assert report.simulation is True
+    assert report.realized_trades[0].simulation is True
+    assert report.daily[0].simulation is True
+    csv_text = reports.export_csv(report).decode("utf-8-sig")
+    assert "simulation,true" in csv_text
+    header, *rows = [line for line in csv_text.splitlines() if line.startswith("2026-08-25,MXF")]
+    assert header.endswith(",true")
+    assert rows == []
+
+
+def test_mixed_simulated_and_real_fills_never_read_as_simulated(tmp_path) -> None:
+    reports, _ = service(tmp_path)
+    day = date(2026, 8, 25)
+    reports.record_fill(
+        fill("open", Side.BUY, 1, "100", datetime(2026, 8, 25, 9), day, simulation=True)
+    )
+    reports.record_fill(
+        fill("close", Side.SELL, 1, "110", datetime(2026, 8, 25, 10), day, simulation=False)
+    )
+
+    report = reports.query(day, day, multipliers=MULTIPLIERS)
+
+    assert report.simulation is False
+    assert report.realized_trades[0].simulation is False
+    assert "mixed_simulation_and_real_fills" in report.warnings
+    assert "mixed_simulation_fills" in report.realized_trades[0].provisional_reasons
 
 
 def test_unknown_fees_and_reconciliation_mismatch_are_provisional(tmp_path) -> None:

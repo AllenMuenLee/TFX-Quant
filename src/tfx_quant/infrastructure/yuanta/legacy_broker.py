@@ -24,7 +24,6 @@ from tfx_quant.application.ports.broker_session import (
     SessionCapabilities,
 )
 from tfx_quant.application.ports.yuanta_gateways import OrderQueryNotReadyError
-from tfx_quant.application.settings.trading_settings import Environment
 from tfx_quant.domain.account import TradingAccount
 from tfx_quant.domain.fill import Fill
 from tfx_quant.domain.order import ClientOrderId, Order
@@ -39,10 +38,12 @@ from tfx_quant.infrastructure.yuanta.legacy_order_api import (
     parse_pipe_rows,
 )
 
-_ENDPOINTS = {
-    Environment.TEST: ("apitest.yuantafutures.com.tw", 80),
-    Environment.PRODUCTION: ("api.yuantafutures.com.tw", 443),
-}
+# The only real trade endpoint. There is no "UAT/test trade server" flow any more — the
+# 測試環境 uses the local broker simulator (`MockBrokerSession`/`MockTradeGateway`), which
+# `desktop.composition.build_services` wires whenever `settings.environment` is TEST, so
+# this adapter is only ever constructed for PRODUCTION and `LoginRequest.environment` no
+# longer routes the connection.
+_PRODUCTION_ENDPOINT = ("api.yuantafutures.com.tw", 443)
 
 _LOGON_OK = 2
 """`OnLogonS`'s `TLinkStatus` = `lsLogonOK`, the only value that means "session up"."""
@@ -208,7 +209,11 @@ class LegacyBroker(IBrokerSession):
                 host.bind("OnReportQuery", self._on_report_query)
                 host.bind("OnDealQuery", self._on_deal_query)
                 host.bind("OnUserDefinsFuncResult", self._on_position_query)
-                ip, port = _ENDPOINTS[request.environment]
+                # `request.environment` no longer routes the connection: there is exactly
+                # one real trade endpoint. `build_services` only ever constructs this
+                # adapter for `Environment.PRODUCTION`; a TEST `LoginRequest` is served by
+                # the local broker simulator and never reaches here.
+                ip, port = _PRODUCTION_ENDPOINT
                 host.control.SetFutOrdConnection(
                     request.user_id, request.password.get_secret_value(), ip, port
                 )

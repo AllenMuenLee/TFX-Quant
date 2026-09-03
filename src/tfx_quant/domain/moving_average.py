@@ -1,4 +1,4 @@
-"""35MA — simple-moving-average and slope helpers for the 60-minute strategy engine.
+"""20MA — simple-moving-average and slope helpers for the 60-minute strategy engine.
 
 Slope is defined as an exact one-bar Decimal delta between the current closed bar's MA
 value and the immediately preceding closed bar's MA value — never an implicit float
@@ -50,8 +50,8 @@ def moving_average_series(closes: Sequence[Decimal], window: int, count: int) ->
 
 
 def determine_slope(current: Decimal | None, previous: Decimal | None) -> MaSlope:
-    """Exact Decimal comparison between the current bar's 35MA and the immediately
-    preceding bar's 35MA. `None` (either value missing) is `NONE`, same as an exact tie."""
+    """Exact Decimal comparison between the current bar's 20MA and the immediately
+    preceding bar's 20MA. `None` (either value missing) is `NONE`, same as an exact tie."""
     if current is None or previous is None:
         return MaSlope.NONE
     if current > previous:

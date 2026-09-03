@@ -25,6 +25,10 @@ from tfx_quant.telemetry.masking import mask_account
 _logger = get_logger(__name__)
 
 KEYRING_SERVICE_NAME = "tfx_quant.yuanta"
+QUOTE_KEYRING_SERVICE_NAME = "tfx_quant.yuanta.quote"
+"""A *separate* keyring namespace for the quote-only credential used by the 測試環境,
+so a stored quote password can never be picked up as a trade-login password (and the
+reverse)."""
 CERTIFICATE_KEYRING_USER = "certificate-import-password"
 
 
@@ -84,6 +88,41 @@ def clear_stored_password(user_id: str) -> None:
     with contextlib.suppress(keyring.errors.PasswordDeleteError):
         keyring.delete_password(KEYRING_SERVICE_NAME, user_id)
     log_info(_logger, "stored_password_cleared", user_id_masked=mask_account(user_id))
+
+
+def load_stored_quote_password(user_id: str) -> str | None:
+    """Quote-only counterpart of `load_stored_password`, keyed under
+    `QUOTE_KEYRING_SERVICE_NAME`. Used by the 測試環境's quote-login dialog."""
+    try:
+        import keyring
+    except ImportError:
+        return None
+    password = keyring.get_password(QUOTE_KEYRING_SERVICE_NAME, user_id)
+    log_info(
+        _logger,
+        "stored_quote_password_load_result",
+        user_id_masked=mask_account(user_id),
+        found=password is not None,
+    )
+    return password
+
+
+def store_quote_password(user_id: str, password: str) -> None:
+    import keyring
+
+    keyring.set_password(QUOTE_KEYRING_SERVICE_NAME, user_id, password)
+    log_info(_logger, "stored_quote_password_saved", user_id_masked=mask_account(user_id))
+
+
+def clear_stored_quote_password(user_id: str) -> None:
+    import contextlib
+
+    import keyring
+    import keyring.errors
+
+    with contextlib.suppress(keyring.errors.PasswordDeleteError):
+        keyring.delete_password(QUOTE_KEYRING_SERVICE_NAME, user_id)
+    log_info(_logger, "stored_quote_password_cleared", user_id_masked=mask_account(user_id))
 
 
 def store_certificate_password(password: str) -> None:

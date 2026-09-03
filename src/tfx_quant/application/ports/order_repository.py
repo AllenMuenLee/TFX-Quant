@@ -67,5 +67,11 @@ class OrderRepository(Protocol):
         reconciliation sweep's input set."""
         ...
 
+    def list_all(self) -> Sequence[OrderIntent]:
+        """Every intent ever persisted, oldest first — the read-only order blotter the
+        desktop UI renders. Terminal (`FILLED`/`CANCELLED`/`REJECTED`) intents included,
+        unlike `list_active`."""
+        ...
+
 
 __all__ = ["OrderIntentSaveOutcome", "OrderRepository", "OrderRepositoryError"]

@@ -77,8 +77,9 @@ class InstrumentMasterEntry:
     vendor_symbol: str
     """The Yuanta quote-API real-time quote symbol for this exact contract (e.g.
     "TXFF1") — this is what `desktop.quote_runtime.QuoteRuntime` actually registers
-    with the live quote gateway on login and on every instrument/contract switch (see
-    `LiveQuoteService.start`/`.select_symbol`). Stored as a literal field rather than
+    with the live quote gateway, for every recorded instrument at once, on quote login
+    and whenever a recorded contract month changes (see `LiveQuoteService.start`/
+    `.select_symbols`). Stored as a literal field rather than
     always recomputed inline, but every value in `instrument_master.example.json` is
     `futures_quote_symbol()`'s actual output — see this module's docstring."""
     broker_product_code: str

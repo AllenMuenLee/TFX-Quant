@@ -16,94 +16,93 @@ from argparse import ArgumentParser
 from pathlib import Path
 
 from tfx_quant import __version__
+from tfx_quant.application.settings.trading_settings import Environment, TradingSettings
 from tfx_quant.desktop.app import TfxQuantApp
 from tfx_quant.desktop.composition import (
+    ServiceContainer,
     auto_select_startup_instrument,
     build_services,
     load_settings,
     log_startup_readiness,
+    start_test_env_broker_session,
 )
 from tfx_quant.domain.strategy_state import attempt_safe_pause
 from tfx_quant.telemetry import get_logger, log_critical, log_info
-from tfx_quant.telemetry.audit import install_audit_handler
 from tfx_quant.telemetry.setup import configure_logging
 
 _DEFAULT_SETTINGS_PATH = Path(__file__).parent / "settings.example.json"
 _DEFAULT_LOG_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "tfx_quant" / "logs"
+AUDIT_DB_PATH = _DEFAULT_LOG_DIR / "audit.sqlite3"
 
 _logger = get_logger(__name__)
 
 
-def _parse_args(argv: list[str]) -> tuple[Path, bool]:
+def _parse_args(argv: list[str]) -> Path:
     parser = ArgumentParser(prog="tfx-quant-desktop")
     parser.add_argument("settings", nargs="?", type=Path, default=_DEFAULT_SETTINGS_PATH)
-    parser.add_argument(
-        "--mock",
-        action="store_true",
-        help="run the isolated offline simulator; never load Yuanta OCX adapters",
-    )
-    args = parser.parse_args(argv)
-    return args.settings, bool(args.mock)
+    return parser.parse_args(argv).settings
 
 
-def main(argv: list[str] | None = None) -> int:
-    settings_path, mock = _parse_args(sys.argv[1:] if argv is None else argv)
-    configure_logging(_DEFAULT_LOG_DIR)
+def build_and_start_services(settings: TradingSettings) -> ServiceContainer:
+    """Build the whole container for `settings.environment` and start every runtime.
+
+    `TfxQuantApp` calls this again with a different environment when the operator flips
+    the 執行環境 selector (模擬下單 ↔ 正式下單) on the readiness screen.
+    """
+    is_test_env = settings.environment is Environment.TEST
     log_info(
         _logger,
         "application_start",
         app_version=__version__,
         python_version=platform.python_version(),
-        simulation=mock,
+        environment=settings.environment.value,
+        simulation=is_test_env,
     )
-    settings = load_settings(settings_path)
-    if mock:
-        # Kept out of normal startup's import graph: the simulator is reachable only
-        # through this explicit CLI switch.
-        from tfx_quant.simulation.composition import build_simulation_services
-
-        services = build_simulation_services(settings)
-    else:
-        services = build_services(settings)
-    install_audit_handler(
-        _DEFAULT_LOG_DIR / "audit.sqlite3",
-        on_critical_failure=lambda exc: _handle_audit_failure(services, exc),
-    )
+    services = build_services(settings)
     services.event_coordinator.start()
     auto_select_startup_instrument(services)
-    if mock:
-        from tfx_quant.simulation.composition import start_simulation_sessions
-
-        start_simulation_sessions(services)
+    if is_test_env:
+        # 測試環境: start the local broker simulator now; the real quote login is entered
+        # by the operator from the readiness screen (quote-only dialog).
+        start_test_env_broker_session(services)
     services.order_manager.start()
     services.reconciliation_service.start()
     services.connectivity_monitor.start()
     services.risk_supervisor.start()
     services.signal_engine_service.start()
     log_startup_readiness(services)
+    return services
+
+
+def stop_services(services: ServiceContainer) -> None:
+    services.signal_engine_service.stop()
+    services.risk_supervisor.stop()
+    services.connectivity_monitor.stop()
+    services.reconciliation_service.stop()
+    services.order_manager.stop()
+    services.quote_runtime.stop()
+    services.event_coordinator.stop(timeout=5)
+
+
+def main(argv: list[str] | None = None) -> int:
+    settings_path = _parse_args(sys.argv[1:] if argv is None else argv)
+    configure_logging(_DEFAULT_LOG_DIR)
+    settings = load_settings(settings_path)
+
+    app = TfxQuantApp(settings)
     try:
-        app = TfxQuantApp(services)
         app.MainLoop()
     except Exception as exc:
-        _handle_uncaught_exception(services, exc)
+        _handle_uncaught_exception(app.services, exc)
         raise
-    finally:
-        services.signal_engine_service.stop()
-        services.risk_supervisor.stop()
-        services.connectivity_monitor.stop()
-        services.reconciliation_service.stop()
-        services.order_manager.stop()
-        services.quote_runtime.stop()
-        services.event_coordinator.stop(timeout=5)
     return 0
 
 
 def _handle_uncaught_exception(services: object, exc: BaseException) -> None:
     """Per the global safety rule: any uncaught exception must be routed toward a
     safe pause, never silently swallowed or left to crash without a trace."""
-    from tfx_quant.desktop.composition import ServiceContainer
-
-    assert isinstance(services, ServiceContainer)
+    if not isinstance(services, ServiceContainer):
+        return
     # PAUSED_SAFE is only reachable from RUNNING (see `domain/strategy_state.py`'s
     # transition table) — anywhere else, FAULTED is the state machine's actual
     # "stop trading, needs operator attention" terminal for an unexpected failure.
@@ -118,11 +117,10 @@ def _handle_uncaught_exception(services: object, exc: BaseException) -> None:
     )
 
 
-def _handle_audit_failure(services: object, exc: Exception) -> None:
+def handle_audit_failure(services: object, exc: Exception) -> None:
     """A critical trading event that cannot be persisted stops automated trading."""
-    from tfx_quant.desktop.composition import ServiceContainer
-
-    assert isinstance(services, ServiceContainer)
+    if not isinstance(services, ServiceContainer):
+        return
     resulting_state = attempt_safe_pause(services.strategy_state_machine)
     log_critical(
         _logger,

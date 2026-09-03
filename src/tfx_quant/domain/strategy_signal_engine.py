@@ -16,8 +16,8 @@ the new basis, only carried forward and compared against future evaluations unde
 whatever basis is currently active. This was an explicit product decision (implementation
 prompt 05 flags this formula as a blocker otherwise) — not one to change without asking.
 
-**35MA slope**: an exact Decimal one-bar delta between the current and immediately
-preceding closed bar's 35MA (see `domain.moving_average.determine_slope`) — also an
+**20MA slope**: an exact Decimal one-bar delta between the current and immediately
+preceding closed bar's 20MA (see `domain.moving_average.determine_slope`) — also an
 explicit product decision, not an implicit float sign check.
 
 **Entry/EOD time gate**: a single recurring daily band, `[eod_flatten_local_time,
@@ -53,7 +53,7 @@ from tfx_quant.domain.timestamp import Timestamp
 
 STRATEGY_VERSION = "1"
 
-_DEFAULT_MA_WINDOW = 35
+_DEFAULT_MA_WINDOW = 20
 _DEFAULT_FLAT_LOOKBACK = 5
 _DEFAULT_FLAT_THRESHOLD_POINTS = Decimal("10")
 _DEFAULT_STOP_LOSS_POINTS = Decimal("300")
@@ -456,7 +456,7 @@ class StrategySignalEngine:
                 rule="no_signal",
                 passed=False,
                 signal_kind=None,
-                reason="35MA樣本不足（未滿35根）",
+                reason="20MA樣本不足（未滿20根）",
             )
         if ctx.ma_is_choppy:
             return self._make(
@@ -465,7 +465,7 @@ class StrategySignalEngine:
                 passed=False,
                 signal_kind=None,
                 reason=(
-                    f"均線走平（近5根35MA幅度 {ctx.ma_range} < "
+                    f"均線走平（近5根20MA幅度 {ctx.ma_range} < "
                     f"{self._config.flat_threshold_points}）"
                 ),
             )
@@ -522,14 +522,14 @@ class StrategySignalEngine:
                     rule="enter_long",
                     passed=True,
                     signal_kind=SignalKind.ENTER_LONG,
-                    reason="連續兩根紅K且35MA向上",
+                    reason="連續兩根紅K且20MA向上",
                 )
             return self._make(
                 ctx,
                 rule="no_signal",
                 passed=False,
                 signal_kind=None,
-                reason="連續兩根紅K，但35MA非向上",
+                reason="連續兩根紅K，但20MA非向上",
             )
         if self._streak.color is CandleColor.BLACK and self._streak.length >= 2:
             if ctx.ma_slope is MaSlope.DOWN:
@@ -538,14 +538,14 @@ class StrategySignalEngine:
                     rule="enter_short",
                     passed=True,
                     signal_kind=SignalKind.ENTER_SHORT,
-                    reason="連續兩根黑K且35MA向下",
+                    reason="連續兩根黑K且20MA向下",
                 )
             return self._make(
                 ctx,
                 rule="no_signal",
                 passed=False,
                 signal_kind=None,
-                reason="連續兩根黑K，但35MA非向下",
+                reason="連續兩根黑K，但20MA非向下",
             )
         return self._make(
             ctx, rule="no_signal", passed=False, signal_kind=None, reason="未滿足連續兩根同色K"

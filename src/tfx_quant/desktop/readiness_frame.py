@@ -13,34 +13,61 @@ from tfx_quant.application.events.events import (
     MarketDataFreshnessChanged,
 )
 from tfx_quant.application.ports.quote_gateway import QuoteConnectionState
-from tfx_quant.desktop.composition import ServiceContainer
+from tfx_quant.application.settings.trading_settings import Environment
+from tfx_quant.desktop.composition import ServiceContainer, start_test_env_quote_login
 from tfx_quant.desktop.emergency_flatten_panel import EmergencyFlattenPanel
 from tfx_quant.desktop.instrument_selection_panel import InstrumentSelectionPanel
 from tfx_quant.desktop.log_viewer import LogViewerFrame
 from tfx_quant.desktop.login_dialog import LoginDialog
 from tfx_quant.desktop.market_data_panel import MarketDataPanel
 from tfx_quant.desktop.reconciliation_panel import ReconciliationPanel
+from tfx_quant.desktop.simulation_banner import SimulationBanner
+from tfx_quant.desktop.trading_activity_panel import TradingActivityPanel
 from tfx_quant.infrastructure.yuanta import login_preferences
 
 _BG = wx.Colour(15, 23, 42)
 _TEXT = wx.Colour(203, 213, 225)
 
+_ENVIRONMENT_CHOICES: tuple[Environment, ...] = (Environment.TEST, Environment.PRODUCTION)
+_ENVIRONMENT_LABELS = ("模擬下單（真實行情）", "正式下單（PRODUCTION）")
+_PRODUCTION_SWITCH_CONFIRM = (
+    "即將切換到「正式下單」執行環境。之後的委託將經由元大 API 送出到正式主機，\n"
+    "可能影響真實帳戶與交易資料。確定要切換嗎？"
+)
+
 
 class ReadinessFrame(wx.Frame):
     def __init__(self, parent: wx.Window | None, services: ServiceContainer) -> None:
-        title = "TfxQuant — SIMULATION / NO REAL ORDERS" if services.simulation else "TfxQuant"
+        title = "TfxQuant — 測試環境（真實行情・模擬下單）" if services.simulation else "TfxQuant"
         super().__init__(parent, title=title, size=(1180, 760))
         self._services = services
         panel = wx.Panel(self)
         panel.SetBackgroundColour(_BG)
         root = wx.BoxSizer(wx.VERTICAL)
 
+        if services.simulation:
+            root.Add(SimulationBanner(panel, services), 0, wx.EXPAND)
+
         top = wx.BoxSizer(wx.HORIZONTAL)
-        brand_label = "TfxQuant  [SIMULATION — FAKE ORDERS]" if services.simulation else "TfxQuant"
+        brand_label = (
+            "TfxQuant  [測試環境 — 真實行情・模擬下單]" if services.simulation else "TfxQuant"
+        )
         brand = wx.StaticText(panel, label=brand_label)
         brand.SetForegroundColour(wx.WHITE)
         brand.SetFont(brand.GetFont().Bold().Scale(1.6))
         top.Add(brand, 0, wx.ALIGN_CENTER_VERTICAL)
+        top.AddSpacer(16)
+        self._environment_radio = wx.RadioBox(
+            panel, label="執行環境", choices=list(_ENVIRONMENT_LABELS), style=wx.RA_SPECIFY_COLS
+        )
+        self._environment_radio.SetSelection(
+            _ENVIRONMENT_CHOICES.index(services.settings.environment)
+        )
+        self._environment_radio.Bind(wx.EVT_RADIOBOX, self._on_environment_changed)
+        for child in self._environment_radio.GetChildren():
+            child.SetForegroundColour(_TEXT)
+        self._environment_radio.SetForegroundColour(_TEXT)
+        top.Add(self._environment_radio, 0, wx.ALIGN_CENTER_VERTICAL)
         top.AddStretchSpacer()
         self._login_state = wx.StaticText(panel, label="交易與行情未登入")
         self._login_state.SetForegroundColour(_TEXT)
@@ -48,12 +75,7 @@ class ReadinessFrame(wx.Frame):
         self._log_button = wx.Button(panel, label="查看所有日誌")
         self._log_button.Bind(wx.EVT_BUTTON, self._on_show_logs)
         top.Add(self._log_button, 0, wx.RIGHT, 8)
-        self._login_button = wx.Button(panel, label="登入")
-        self._mock_data_button: wx.Button | None = None
-        if services.simulation:
-            self._mock_data_button = wx.Button(panel, label="Use mock data")
-            self._mock_data_button.Bind(wx.EVT_BUTTON, self._on_use_mock_data)
-            top.Insert(top.GetItemCount() - 1, self._mock_data_button, 0, wx.RIGHT, 8)
+        self._login_button = wx.Button(panel, label="行情登入" if services.simulation else "登入")
         self._login_button.Bind(wx.EVT_BUTTON, self._on_login)
         top.Add(self._login_button, 0)
         root.Add(top, 0, wx.EXPAND | wx.ALL, 20)
@@ -67,6 +89,13 @@ class ReadinessFrame(wx.Frame):
 
         self._market = MarketDataPanel(panel, services)
         root.Add(self._market, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 20)
+
+        self._activity = TradingActivityPanel(panel, services)
+        self._activity.SetBackgroundColour(_BG)
+        for child in self._activity.GetChildren():
+            if isinstance(child, wx.StaticText):
+                child.SetForegroundColour(_TEXT)
+        root.Add(self._activity, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 20)
 
         self._reconciliation = ReconciliationPanel(panel, services)
         self._reconciliation.SetBackgroundColour(_BG)
@@ -99,9 +128,41 @@ class ReadinessFrame(wx.Frame):
     def _on_show_logs(self, _event: wx.CommandEvent) -> None:
         LogViewerFrame(self).Show()
 
+    # -- environment selector --------------------------------------------------------
+
+    def _on_environment_changed(self, _event: wx.CommandEvent) -> None:
+        chosen = _ENVIRONMENT_CHOICES[self._environment_radio.GetSelection()]
+        if chosen is self._services.settings.environment:
+            return
+        app = wx.GetApp()
+        blocked = app.can_switch_environment()
+        if blocked is not None:
+            wx.MessageBox(blocked, "無法切換執行環境", wx.OK | wx.ICON_WARNING, self)
+            self.sync_environment_selector(self._services.settings.environment)
+            return
+        if chosen is Environment.PRODUCTION:
+            confirmed = (
+                wx.MessageBox(
+                    _PRODUCTION_SWITCH_CONFIRM, "切換到正式環境", wx.YES_NO | wx.ICON_WARNING, self
+                )
+                == wx.YES
+            )
+            if not confirmed:
+                self.sync_environment_selector(self._services.settings.environment)
+                return
+        app.switch_environment(chosen)
+
+    def sync_environment_selector(self, environment: Environment) -> None:
+        self._environment_radio.SetSelection(_ENVIRONMENT_CHOICES.index(environment))
+
+    def open_login_dialog(self) -> None:
+        """Public — `TfxQuantApp` calls this on the freshly rebuilt frame after an
+        environment switch so the operator's login flow continues without a second click."""
+        self._on_login(wx.CommandEvent())
+
     def _on_login(self, _event: wx.CommandEvent) -> None:
         if self._services.simulation:
-            self._prompt_for_real_quote_login()
+            self._prompt_for_test_env_quote_login()
             return
         if self._services.broker_session.capabilities.is_session_ready:
             self._services.broker_session.stop()
@@ -113,45 +174,22 @@ class ReadinessFrame(wx.Frame):
         finally:
             dialog.Destroy()
 
-    def _on_use_mock_data(self, _event: wx.CommandEvent) -> None:
-        control = self._services.simulation_market_data
-        if control is None:
-            return
-        try:
-            control.use_mock_data()
-        except Exception as exc:
-            wx.MessageBox(str(exc), "Mock data error", wx.OK | wx.ICON_ERROR, self)
-        self._refresh()
+    def _prompt_for_test_env_quote_login(self) -> None:
+        from tfx_quant.desktop.quote_login_dialog import QuoteLoginDialog
 
-    def _prompt_for_real_quote_login(self) -> None:
-        control = self._services.simulation_market_data
-        if control is None:
-            return
-        user_dialog = wx.TextEntryDialog(
-            self, "Yuanta quote user ID", "Real quote data login"
-        )
+        remembered = login_preferences.load().remembered_user_id
+        dialog = QuoteLoginDialog(self, remembered_user_id=remembered)
         try:
-            if user_dialog.ShowModal() != wx.ID_OK:
+            if dialog.ShowModal() != wx.ID_OK or dialog.credentials is None:
                 return
-            user_id = user_dialog.GetValue()
+            user_id, password = dialog.credentials
         finally:
-            user_dialog.Destroy()
-        password_dialog = wx.TextEntryDialog(
-            self,
-            "Yuanta quote password",
-            "Real quote data login",
-            style=wx.OK | wx.CANCEL | wx.TE_PASSWORD,
-        )
+            dialog.Destroy()
+        login_preferences.save_remembered_user_id(user_id)
         try:
-            if password_dialog.ShowModal() != wx.ID_OK:
-                return
-            password = password_dialog.GetValue()
-        finally:
-            password_dialog.Destroy()
-        try:
-            control.use_real_data(user_id, password)
+            start_test_env_quote_login(self._services, user_id, password)
         except Exception as exc:
-            wx.MessageBox(str(exc), "Real quote login failed", wx.OK | wx.ICON_ERROR, self)
+            wx.MessageBox(str(exc), "行情登入失敗", wx.OK | wx.ICON_ERROR, self)
         self._refresh()
 
     def _on_login_succeeded(self, event: BrokerLoginSucceeded) -> None:
@@ -170,10 +208,12 @@ class ReadinessFrame(wx.Frame):
 
     def _refresh(self) -> None:
         if self._services.simulation:
-            control = self._services.simulation_market_data
-            source = "UNKNOWN" if control is None else control.source
-            self._login_state.SetLabel(f"Trade: OFFLINE SIMULATOR | Data: {source}")
-            self._login_button.SetLabel("Real quote login")
+            quote_ready = self._services.quote_runtime.state is QuoteConnectionState.LOGGED_ON
+            self._login_state.SetLabel(
+                "交易：本機模擬　·　行情：元大即時（真實）"
+                f"{'　已登入' if quote_ready else '　未登入'}"
+            )
+            self._login_button.SetLabel("行情登入")
             self._selector.refresh()
             self._market.refresh()
             return
@@ -183,8 +223,7 @@ class ReadinessFrame(wx.Frame):
         trading_ready = self._services.broker_session.capabilities.is_session_ready
         quote_ready = self._services.quote_runtime.state is QuoteConnectionState.LOGGED_ON
         self._login_state.SetLabel(
-            f"交易{'已' if trading_ready else '未'}登入"
-            f" · 行情{'已' if quote_ready else '未'}登入"
+            f"交易{'已' if trading_ready else '未'}登入 · 行情{'已' if quote_ready else '未'}登入"
         )
         self._login_button.SetLabel("登出" if trading_ready else "登入")
         self._selector.refresh()

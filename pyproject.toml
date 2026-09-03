@@ -24,6 +24,11 @@ dev = [
     "ruff>=0.6",
     "import-linter>=2.0",
 ]
+# Tools for regenerating installer/requirements.lock (Feature 16). Not needed to
+# build the installer itself — see installer/README.md.
+packaging = [
+    "pip-tools>=7.4",
+]
 
 [project.scripts]
 tfx-quant-desktop = "tfx_quant.desktop.__main__:main"
@@ -34,6 +39,32 @@ packages = ["src/tfx_quant"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+addopts = "--strict-markers"
+markers = [
+    "test_env: 測試環境 acceptance — real quote SHAPE (fake host), local broker simulator, no trade API",
+    "real_api: touches a real Yuanta OCX; skipped unless TFX_QUANT_REAL_API=1; never sends orders",
+]
+
+[tool.coverage.run]
+source = ["src/tfx_quant"]
+branch = true
+omit = [
+    "src/tfx_quant/desktop/*_panel.py",
+    "src/tfx_quant/desktop/app.py",
+    "src/tfx_quant/desktop/__main__.py",
+    "src/tfx_quant/desktop/*_dialog.py",
+    "src/tfx_quant/desktop/*_frame.py",
+    "src/tfx_quant/desktop/simulation_banner.py",
+    "src/tfx_quant/desktop/log_viewer.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]
 
 [tool.ruff]
 line-length = 100
@@ -107,3 +138,4 @@ name = "Persistence does not depend on infrastructure or desktop"
 type = "forbidden"
 source_modules = ["tfx_quant.persistence"]
 forbidden_modules = ["tfx_quant.infrastructure", "tfx_quant.desktop"]
+
