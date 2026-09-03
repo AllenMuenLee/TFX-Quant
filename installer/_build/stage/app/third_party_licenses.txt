@@ -1,0 +1,25 @@
+第三方套件授權清單 / Third-party license inventory
+產生時間 (UTC): 2026-09-03T13:43:09.382850+00:00
+本安裝檔另含 Microsoft VC++ x86 可轉散發套件，以及元大期貨「交易 API / 行情 API」
+專有元件（OCX/DLL）。元大元件由發行者聲明具備向終端客戶散布之授權；
+其著作權仍屬元大期貨股份有限公司，未列於下方開源清單。
+========================================================================
+
+- annotated-types 0.8.0 — MIT License (licenses)
+- backports.tarfile 1.2.0 — MIT License (LICENSE)
+- comtypes 1.4.16 — see package (licenses)
+- importlib_metadata 9.0.1 — see package (licenses)
+- jaraco.classes 3.4.0 — MIT License (LICENSE)
+- jaraco.context 6.1.2 — see package (licenses)
+- jaraco.functools 4.6.0 — see package (licenses)
+- keyring 25.7.0 — see package (licenses)
+- more-itertools 11.1.0 — see package (licenses)
+- numpy 2.4.6 — see package (licenses)
+- pydantic 2.13.5 — see package (licenses)
+- pydantic_core 2.46.5 — see package (licenses)
+- pywin32-ctypes 0.2.3 — BSD-3-Clause (LICENSE.txt)
+- typing_extensions 4.16.0 — see package (licenses)
+- typing-inspection 0.4.4 — see package (licenses)
+- tzdata 2026.3 — Apache-2.0 (licenses)
+- wxPython 4.3.1 — OSI Approved (licenses)
+- zipp 4.1.0 — see package (licenses)

@@ -1,0 +1,134 @@
+"""IBrokerSession — the Yuanta login/session-lifecycle port.
+
+Distinct from `TradeGatewayPort` (Feature 01's narrow query surface, which stays as-is):
+this is the richer session-management surface Feature 02 adds — login, account
+discovery/selection, capability tracking, and graceful shutdown. A concrete adapter may
+satisfy both Protocols at once, but callers that only need query access should keep
+depending on the narrower port.
+
+Market data is deliberately absent from this port. Yuanta's documented quote OCX uses
+its own `SetMktLogon` connection, independently of the order OCX session represented
+here. `SessionCapabilities` therefore describes only order/trading readiness.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from dataclasses import dataclass, fields
+from enum import StrEnum
+from typing import Protocol
+
+from pydantic import SecretStr
+
+from tfx_quant.application.settings.trading_settings import Environment
+from tfx_quant.domain.account import TradingAccount
+
+
+@dataclass(frozen=True, slots=True)
+class LoginRequest:
+    """The UI-built login request/credentials DTO the implementation prompt asks
+    for (`login-input-implementation-prompt.md`): everything a login screen collects
+    from the operator, handed to `IBrokerSession.start()` as a single call. `password`
+    is a `SecretStr` so `repr()`/`str()`/logging never print the raw value — same rule
+    as `infrastructure.yuanta.credentials.BrokerCredentials`, which this is
+    deliberately kept separate from (that type is infrastructure-layer; this port must
+    not depend on it — see the "Application does not depend on infrastructure"
+    import-linter contract).
+
+    `user_id` is the operator's identity ID. It is supplied to both the documented
+    order OCX call `SetFutOrdConnection(ID, Pass, IP, Port)` and the separate quote OCX
+    call `SetMktLogon(User, pass, IP, PORT)`.
+
+    Neither documented login signature accepts a certificate path or certificate
+    password, so neither belongs in this DTO."""
+
+    environment: Environment
+    user_id: str
+    password: SecretStr
+
+
+@dataclass(frozen=True, slots=True)
+class SessionCapabilities:
+    """Independent readiness flags. See module docstring — never collapse these."""
+
+    login: bool = False
+    trading: bool = False
+    order_reports: bool = False
+    queries: bool = False
+
+    @property
+    def is_session_ready(self) -> bool:
+        """True only once every capability listed above is independently true."""
+        return all(getattr(self, f.name) for f in fields(self))
+
+
+class LogoutReason(StrEnum):
+    USER_REQUESTED = "USER_REQUESTED"
+    PASSIVE_DISCONNECT = "PASSIVE_DISCONNECT"
+    """The broker side dropped the connection without a local logout request."""
+    SESSION_INVALIDATED = "SESSION_INVALIDATED"
+    """A login/session error occurred that leaves the session unusable (bad state,
+    duplicate login rejection, etc.) — not necessarily a network-level disconnect."""
+    SHUTDOWN = "SHUTDOWN"
+    """Local orderly application shutdown."""
+
+
+class IBrokerSession(Protocol):
+    """Login/session lifecycle for the Yuanta trading + quote APIs together.
+
+    Never sends orders — order submission is Feature 06's job and has no code path
+    anywhere in this codebase yet. Implementations must publish `Broker*` events
+    (`application.events.events`) onto the injected `EventCoordinator` rather than
+    returning results synchronously, since the underlying vendor callbacks are
+    themselves asynchronous.
+    """
+
+    @property
+    def capabilities(self) -> SessionCapabilities: ...
+
+    @property
+    def accounts(self) -> Sequence[TradingAccount]:
+        """Futures accounts returned by the most recent successful login.
+
+        Empty before login succeeds.
+        """
+        ...
+
+    @property
+    def selected_account(self) -> TradingAccount | None:
+        """The account queries/subscriptions apply to. None until resolved — see
+        `application.ports.broker_session` module docstring and
+        `docs/adr/0004-broker-session-architecture.md` for how a unique account is
+        resolved (auto-select, env var, or explicit `select_account()` call)."""
+        ...
+
+    def start(self, request: LoginRequest) -> None:
+        """Begin the login → safety-query sequence (async; publishes events).
+
+        `request` carries the operator-entered environment and credentials — built by
+        the login UI, never guessed/defaulted by this layer (see
+        `desktop/login_dialog.py`). Safe to call again after a terminal failure to
+        retry manually; while a login or capped-backoff retry is already in progress,
+        calling this again is a no-op.
+        """
+        ...
+
+    def select_account(self, account: TradingAccount) -> None:
+        """Explicitly resolve the target account when more than one was returned.
+
+        Raises if `account` is not one of `accounts`. Required before the session can
+        reach `BrokerSessionReady` whenever more than one account is present and no
+        other disambiguation mechanism resolved it.
+        """
+        ...
+
+    def cancel_start(self) -> None:
+        """Cancel an in-progress login attempt or backoff wait. Idempotent."""
+        ...
+
+    def stop(self) -> None:
+        """Orderly shutdown: verify no order is left in an unknown state, log out
+        (`Logout()`), and tear down the underlying session/client. Blocks until
+        complete. See `docs/adr/0004-broker-session-architecture.md` for the exact
+        ordering."""
+        ...
