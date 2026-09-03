@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 import subprocess
 import urllib.request
 from collections.abc import Iterator, Mapping
@@ -32,6 +33,24 @@ EMBED_PYTHON_VERSION = "3.11.9"
 EMBED_PYTHON_URL = "https://www.python.org/ftp/python/{version}/python-{version}-embed-win32.zip"
 # SHA-256 of python-3.11.9-embed-win32.zip as published on python.org.
 EMBED_PYTHON_SHA256 = "daf24de7fb3b173e94e56a201d3f38dfedebbdc7ed1925f7aeb8ed588e2b4189"
+
+# --- Microsoft VC++ 2015-2022 x86 redistributable --------------------------------
+# Redistribution permitted by Microsoft's Visual C++ redistributable licence.
+VCREDIST_URL = "https://aka.ms/vs/17/release/vc_redist.x86.exe"
+VCREDIST_SHA256 = "0c09f2611660441084ce0df425c51c11e147e6447963c3690f97e0b25c55ed64"
+# Microsoft refreshes the aka.ms target periodically. When this hash stops matching,
+# download the current vc_redist.x86.exe, verify it, and update this constant (or
+# pass --vcredist <path> for a one-off build).
+
+# --- Yuanta vendor payload (proprietary; only bundled when explicitly supplied) --
+# The trade OCX bat hardcodes C:\Yuanta\API; the quote bat hardcodes C:\Yuanta\QAPI.
+YUANTA_INSTALL_TARGET_API = r"C:\Yuanta\API"
+YUANTA_INSTALL_TARGET_QAPI = r"C:\Yuanta\QAPI"
+# Trace artifacts, docs and the sample script are not runtime files.
+_VENDOR_SKIP_SUFFIXES = (".etl", ".pdf", ".jpg", ".jpeg", ".png", ".py")
+# Microsoft *debug* CRT/MFC DLLs are NOT redistributable; the vendor zip ships some
+# by accident. The release OCX does not load them.
+_VENDOR_SKIP_NAMES = frozenset({"msvcrtd.dll", "mfc42d.dll", "mfco42d.dll"})
 
 
 class BuildError(RuntimeError):
@@ -87,6 +106,44 @@ def resolve_python_embed_zip(
         cached,
         expected_sha256=EMBED_PYTHON_SHA256,
     )
+
+
+def resolve_vcredist(
+    *, cache_dir: Path, explicit_path: Path | None = None, allow_download: bool = True
+) -> Path:
+    """Return a verified ``vc_redist.x86.exe``. Same resolution order as
+    :func:`resolve_python_embed_zip`. An explicit path is trusted (not hash-checked)
+    so a locally staged, newer redistributable can be used deliberately."""
+    if explicit_path is not None:
+        return explicit_path
+    cached = cache_dir / "vc_redist.x86.exe"
+    if cached.is_file():
+        verify_sha256(cached, VCREDIST_SHA256)
+        return cached
+    if not allow_download:
+        raise BuildError(
+            f"offline build: {cached} is missing and downloads are disabled; "
+            "supply --vcredist <path> or populate the cache directory"
+        )
+    return download_file(VCREDIST_URL, cached, expected_sha256=VCREDIST_SHA256)
+
+
+def copy_vendor_tree(src: Path, dest: Path) -> int:
+    """Copy a Yuanta component folder verbatim (minus trace/junk artifacts).
+    Returns the file count."""
+    if not src.is_dir():
+        raise BuildError(f"vendor folder not found: {src}")
+    count = 0
+    for item in sorted(src.rglob("*")):
+        if item.is_dir() or item.suffix.lower() in _VENDOR_SKIP_SUFFIXES:
+            continue
+        if item.name.lower() in _VENDOR_SKIP_NAMES:
+            continue
+        target = dest / item.relative_to(src)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(item, target)
+        count += 1
+    return count
 
 
 # --- source revision -------------------------------------------------------------
@@ -200,11 +257,18 @@ def collect_license_inventory(site_packages: Path) -> list[dict[str, str]]:
     return inventory
 
 
-def render_license_text(inventory: list[dict[str, str]]) -> str:
+def render_license_text(inventory: list[dict[str, str]], *, vendor_bundled: bool = False) -> str:
+    if vendor_bundled:
+        vendor_line = (
+            "本安裝檔另含 Microsoft VC++ x86 可轉散發套件，以及元大期貨「交易 API / 行情 API」\n"
+            "專有元件（OCX/DLL）。元大元件由發行者聲明具備向終端客戶散布之授權；\n"
+            "其著作權仍屬元大期貨股份有限公司，未列於下方開源清單。\n"
+        )
+    else:
+        vendor_line = "元大交易/行情 API 元件不在此清單內，且不隨本安裝檔散布。\n"
     header = (
         "第三方套件授權清單 / Third-party license inventory\n"
-        f"產生時間 (UTC): {datetime.now(UTC).isoformat()}\n"
-        "元大交易/行情 API 元件不在此清單內，且不隨本安裝檔散布。\n" + "=" * 72 + "\n\n"
+        f"產生時間 (UTC): {datetime.now(UTC).isoformat()}\n" + vendor_line + "=" * 72 + "\n\n"
     )
     body = "\n".join(
         f"- {item['name']} {item['version']} — {item['license']}"
@@ -233,9 +297,10 @@ def build_manifest(
     python_embed_zip: Path,
     requirements_lock_text: str,
     stage_dir: Path,
+    vendor_bundle: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     return {
-        "schema": "tfx-quant/build-manifest/1",
+        "schema": "tfx-quant/build-manifest/2",
         "app_version": app_version,
         "built_at_utc": datetime.now(UTC).isoformat(),
         "source_revision": source_revision,
@@ -251,6 +316,7 @@ def build_manifest(
             "sha256": sha256_file(python_embed_zip),
         },
         "dependencies": parse_requirements_lock(requirements_lock_text),
+        "vendor_bundle": dict(vendor_bundle) if vendor_bundle is not None else None,
         "staged_file_count": sum(1 for _ in iter_staged_files(stage_dir)),
     }
 

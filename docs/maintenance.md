@@ -125,6 +125,12 @@ tfx_quant.packaging     — 安裝／升級支援碼，可依賴 persistence + t
 - 應用程式本身固定 Python 3.11（32 位元）+ `installer/requirements.lock`（釘死並附
   hash 的相依套件）。安裝檔內含 embeddable CPython，客戶端不需自行配置。
 - 交易 API 已無獨立測試主機；測試以 `environment: TEST`（本機模擬器）進行。
+- **內含元件版**安裝檔（`build-manifest.json` 的 `vendor_bundle` 非 null）另含
+  `vc_redist.x86.exe`（Microsoft，可散布）與元大交易／行情 OCX（`installer/build.py`
+  的 `--yuanta-api-dir` / `--yuanta-qapi-dir`，預設取自 gitignored 的
+  `交易API元件及說明文件/API`、`行情API元件及說明文件/.../QAPI`）。安裝時的
+  `vendorinstall` 工作以一次 UAC 提示執行 `<安裝目錄>\vendor\install-vendor.cmd`。
+  以 `installer/build.py --no-vendor` 產生純程式版。
 
 ## 7. 建置與測試
 

@@ -68,7 +68,54 @@ def test_license_inventory_and_text(tmp_path: Path) -> None:
     ]
     text = bs.render_license_text(inventory)
     assert "wombat 1.2.3 — MIT" in text
-    assert "元大" in text  # the "not redistributed" note
+    assert "不隨本安裝檔散布" in text  # default: nothing proprietary bundled
+
+    bundled = bs.render_license_text(inventory, vendor_bundled=True)
+    assert "專有元件" in bundled and "散布之授權" in bundled
+    assert "wombat 1.2.3 — MIT" in bundled
+
+
+def test_copy_vendor_tree_filters_debug_and_docs(tmp_path: Path) -> None:
+    src = tmp_path / "API"
+    (src / "sub").mkdir(parents=True)
+    for name in (
+        "YuantaOrd.ocx",
+        "YuantaOrdLib.dll",
+        "install_YTFutOrdAP.bat",
+        "msvcrtd.dll",  # debug CRT -> skipped
+        "元大行情API.pdf",  # doc -> skipped
+        "sample.py",  # -> skipped
+        "sub/libns.dll",
+    ):
+        p = src / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"x")
+    dest = tmp_path / "out"
+    n = bs.copy_vendor_tree(src, dest)
+    got = {p.relative_to(dest).as_posix() for p in dest.rglob("*") if p.is_file()}
+    assert got == {
+        "YuantaOrd.ocx",
+        "YuantaOrdLib.dll",
+        "install_YTFutOrdAP.bat",
+        "sub/libns.dll",
+    }
+    assert n == 4
+
+
+def test_copy_vendor_tree_missing_src_raises(tmp_path: Path) -> None:
+    with pytest.raises(bs.BuildError):
+        bs.copy_vendor_tree(tmp_path / "nope", tmp_path / "out")
+
+
+def test_resolve_vcredist_offline_without_cache(tmp_path: Path) -> None:
+    with pytest.raises(bs.BuildError):
+        bs.resolve_vcredist(cache_dir=tmp_path, allow_download=False)
+
+
+def test_resolve_vcredist_explicit_path_is_trusted(tmp_path: Path) -> None:
+    p = tmp_path / "vc_redist.x86.exe"
+    p.write_bytes(b"anything")
+    assert bs.resolve_vcredist(cache_dir=tmp_path, explicit_path=p, allow_download=False) == p
 
 
 def test_render_release_notes_substitutes_and_preserves_unknown() -> None:
@@ -132,8 +179,31 @@ def test_build_manifest_shape(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     assert manifest["source_revision"] == "deadbeef"
     assert manifest["python_embed"]["sha256"] == hashlib.sha256(b"zip").hexdigest()
     assert manifest["staged_file_count"] == 1
+    assert manifest["vendor_bundle"] is None
     assert {d["name"] for d in manifest["dependencies"]} == {"annotated-types", "comtypes"}
     # must be JSON-serialisable
+    json.dumps(manifest)
+
+
+def test_build_manifest_records_vendor_bundle(tmp_path: Path) -> None:
+    stage = tmp_path / "app"
+    stage.mkdir()
+    embed = tmp_path / "e.zip"
+    embed.write_bytes(b"z")
+    manifest = bs.build_manifest(
+        app_version="0.1.0",
+        source_revision="x",
+        source_dirty=True,
+        tools=bs.ToolVersions(python="3.11.9", pip="24.0"),
+        python_embed_zip=embed,
+        requirements_lock_text="",
+        stage_dir=stage,
+        vendor_bundle={
+            "redistribution_right_asserted_by_distributor": True,
+            "yuanta_trade_api": {},
+        },
+    )
+    assert manifest["vendor_bundle"]["redistribution_right_asserted_by_distributor"] is True
     json.dumps(manifest)
 
 

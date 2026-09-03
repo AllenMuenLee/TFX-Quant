@@ -121,10 +121,15 @@ Skipped by default (never run in CI):
 
 ```powershell
 py -3.11-32 installer\build.py            # stage app + manifests + checksums + licenses
-py -3.11-32 installer\make_installer.py   # compile the .exe (needs Inno Setup 6), optionally sign
+py -3.11-32 installer\make_installer.py   # compile tfx-quant-setup.exe (needs Inno Setup 6), optionally sign
 ```
 
-See [`installer/README.md`](installer/README.md) and `docs/acceptance-checklist.md`.
+`build.py` also bundles a **vendor payload** (Microsoft VC++ x86 redistributable +
+the Yuanta 交易/行情 OCX, when their folders are present) so the installer can set
+up `C:\Yuanta` and register the OCX behind one UAC prompt. Bundling Yuanta's
+proprietary components requires a redistribution right from Yuanta; use
+`build.py --no-vendor` for a components-free installer. See
+[`installer/README.md`](installer/README.md) and `docs/acceptance-checklist.md`.
 
 ## CI
 

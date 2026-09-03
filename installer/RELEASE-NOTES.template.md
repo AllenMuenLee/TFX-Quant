@@ -3,6 +3,8 @@
 - 發行日期：{{ date }}
 - 原始碼版本：`{{ source_revision }}`
 - 建置時工作目錄有未提交變更：{{ dirty }}
+- 安裝檔類型：見 `build-manifest.json` 的 `vendor_bundle`（非 null = 內含元大元件版，
+  須具備元大再散布授權方可交付；null = 純程式版）。
 
 ## 本次變更
 

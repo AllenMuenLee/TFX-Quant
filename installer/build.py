@@ -10,13 +10,17 @@ Run with a **32-bit Python 3.11** interpreter (the same one the app ships), e.g.
 
     py -3.11-32 installer\\build.py --output installer\\_build
 
-Network is used only to fetch the embeddable Python archive and the wheels, both
-checksum-pinned. For a clean-room / offline rebuild, pre-populate
-``installer\\_cache`` (or pass ``--python-embed``) and a wheelhouse
-(``--wheelhouse <dir> --offline``).
+Network is used only to fetch the embeddable Python archive, the wheels, and the
+Microsoft VC++ x86 redistributable — all checksum-pinned. For a clean-room /
+offline rebuild, pre-populate ``installer\\_cache`` (or pass ``--python-embed`` /
+``--vcredist``) and a wheelhouse (``--wheelhouse <dir> --offline``).
 
-The vendor Yuanta OCX components are never staged or redistributed — the client
-installs the 交易 API / 行情 API separately (see ``docs/installation-manual.md``).
+Vendor payload (opt-out with ``--no-vendor``): when the Yuanta component folders
+are present (``交易API元件及說明文件/API`` and ``行情API元件及說明文件/.../QAPI``, or
+``--yuanta-api-dir`` / ``--yuanta-qapi-dir``), they are staged under
+``stage/app/vendor`` so the installer can copy them to ``C:\\Yuanta`` and register
+the OCX. These are Yuanta's proprietary components — bundling them asserts that the
+distributor holds a redistribution right from Yuanta.
 """
 
 from __future__ import annotations
@@ -37,11 +41,14 @@ from tfx_quant.packaging.build_support import (  # noqa: E402
     ToolVersions,
     build_manifest,
     collect_license_inventory,
+    copy_vendor_tree,
     render_license_text,
     render_release_notes,
     resolve_python_embed_zip,
     resolve_source_revision,
+    resolve_vcredist,
     rewrite_embed_pth,
+    sha256_file,
     write_build_manifest,
     write_sha256sums,
 )
@@ -75,6 +82,40 @@ runpy.run_module("tfx_quant.desktop", run_name="__main__")
 
 _LAUNCHER_CMD = '@echo off\r\nstart "" "%~dp0runtime\\pythonw.exe" "%~dp0launcher.pyw" %*\r\n'
 
+# Runs elevated (installer.iss ShellExec 'runas'). %1 = log file path (optional).
+_INSTALL_VENDOR_CMD = """\
+@echo off
+setlocal EnableExtensions
+set "SRC=%~dp0"
+set "LOG=%~1"
+if "%LOG%"=="" set "LOG=%TEMP%\\tfx-quant-vendor-install.log"
+echo [%DATE% %TIME%] vendor install started>>"%LOG%"
+
+if exist "%SRC%vc_redist.x86.exe" (
+  echo [%DATE% %TIME%] vc_redist.x86.exe /install /quiet /norestart>>"%LOG%"
+  "%SRC%vc_redist.x86.exe" /install /quiet /norestart>>"%LOG%" 2>&1
+  echo [%DATE% %TIME%] vc_redist exit %ERRORLEVEL%>>"%LOG%"
+)
+
+if exist "%SRC%API\\YuantaOrd.ocx" (
+  if not exist "C:\\Yuanta\\API" mkdir "C:\\Yuanta\\API"
+  xcopy /e /i /y /q "%SRC%API\\*" "C:\\Yuanta\\API\\">>"%LOG%" 2>&1
+  regsvr32 /s "C:\\Yuanta\\API\\YuantaOrd.ocx"
+  echo [%DATE% %TIME%] regsvr32 YuantaOrd.ocx exit %ERRORLEVEL%>>"%LOG%"
+)
+
+if exist "%SRC%QAPI\\YuantaQuote_v2.1.2.9.ocx" (
+  if not exist "C:\\Yuanta\\QAPI" mkdir "C:\\Yuanta\\QAPI"
+  xcopy /e /i /y /q "%SRC%QAPI\\*" "C:\\Yuanta\\QAPI\\">>"%LOG%" 2>&1
+  regsvr32 /s "C:\\Yuanta\\QAPI\\YuantaQuote_v2.1.2.9.ocx"
+  echo [%DATE% %TIME%] regsvr32 YuantaQuote exit %ERRORLEVEL%>>"%LOG%"
+)
+
+echo [%DATE% %TIME%] vendor install finished>>"%LOG%"
+endlocal
+exit /b 0
+"""
+
 
 def _run(cmd: list[str]) -> None:
     print("  $", " ".join(cmd))
@@ -86,6 +127,81 @@ def _pip_version() -> str:
         [sys.executable, "-m", "pip", "--version"], capture_output=True, text=True, check=True
     ).stdout
     return out.split()[1] if out.split() else "unknown"
+
+
+def _default_yuanta_dir(*parts: str) -> Path | None:
+    candidate = REPO_ROOT.joinpath(*parts)
+    return candidate if candidate.is_dir() else None
+
+
+def _stage_vendor(app: Path, args: argparse.Namespace) -> dict[str, object] | None:
+    """Stage the VC++ redistributable + (optionally) the Yuanta OCX payload under
+    ``app/vendor``. Returns the manifest fragment, or ``None`` when nothing was
+    bundled."""
+    if args.no_vendor:
+        print("[vendor] skipped (--no-vendor)")
+        return None
+
+    vendor = app / "vendor"
+    fragment: dict[str, object] = {
+        "redistribution_right_asserted_by_distributor": True,
+        "note": (
+            "Yuanta components are proprietary to 元大期貨股份有限公司; bundling them "
+            "asserts a redistribution right held by whoever runs this build."
+        ),
+    }
+    staged_any = False
+
+    try:
+        vcredist = resolve_vcredist(
+            cache_dir=Path(args.cache_dir).resolve(),
+            explicit_path=Path(args.vcredist).resolve() if args.vcredist else None,
+            allow_download=not args.offline,
+        )
+        vendor.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(vcredist, vendor / "vc_redist.x86.exe")
+        fragment["vcredist"] = {
+            "filename": "vc_redist.x86.exe",
+            "sha256": sha256_file(vendor / "vc_redist.x86.exe"),
+        }
+        staged_any = True
+        print("[vendor] vc_redist.x86.exe staged")
+    except BuildError as exc:
+        print(f"[vendor] vc_redist not bundled: {exc}")
+
+    api_dir = (
+        Path(args.yuanta_api_dir).resolve()
+        if args.yuanta_api_dir
+        else _default_yuanta_dir("交易API元件及說明文件", "API")
+    )
+    qapi_dir = (
+        Path(args.yuanta_qapi_dir).resolve()
+        if args.yuanta_qapi_dir
+        else _default_yuanta_dir("行情API元件及說明文件", "行情API元件及說明文件", "QAPI")
+    )
+
+    if api_dir is not None and (api_dir / "YuantaOrd.ocx").is_file():
+        n = copy_vendor_tree(api_dir, vendor / "API")
+        fragment["yuanta_trade_api"] = {"source": api_dir.name, "file_count": n}
+        staged_any = True
+        print(f"[vendor] Yuanta trade API staged ({n} files) from {api_dir}")
+    else:
+        print("[vendor] Yuanta trade API not bundled (folder absent)")
+
+    if qapi_dir is not None and (qapi_dir / "YuantaQuote_v2.1.2.9.ocx").is_file():
+        n = copy_vendor_tree(qapi_dir, vendor / "QAPI")
+        fragment["yuanta_quote_api"] = {"source": qapi_dir.name, "file_count": n}
+        staged_any = True
+        print(f"[vendor] Yuanta quote API staged ({n} files) from {qapi_dir}")
+    else:
+        print("[vendor] Yuanta quote API not bundled (folder absent)")
+
+    if not staged_any:
+        return None
+    (vendor / "install-vendor.cmd").write_text(
+        _INSTALL_VENDOR_CMD, encoding="ascii", newline="\r\n"
+    )
+    return fragment
 
 
 def build(args: argparse.Namespace) -> Path:
@@ -105,7 +221,7 @@ def build(args: argparse.Namespace) -> Path:
     lock = REPO_ROOT / "installer" / "requirements.lock"
     lock_text = lock.read_text(encoding="utf-8")
 
-    print("[1/7] embedded CPython")
+    print("[1/8] embedded CPython")
     embed_zip = resolve_python_embed_zip(
         cache_dir=Path(args.cache_dir).resolve(),
         explicit_path=Path(args.python_embed).resolve() if args.python_embed else None,
@@ -116,7 +232,7 @@ def build(args: argparse.Namespace) -> Path:
     with zipfile.ZipFile(embed_zip) as archive:
         archive.extractall(runtime)
 
-    print("[2/7] locked dependencies -> Lib/site-packages")
+    print("[2/8] locked dependencies -> Lib/site-packages")
     site_packages = app / "Lib" / "site-packages"
     site_packages.mkdir(parents=True)
     pip_cmd = [
@@ -137,23 +253,29 @@ def build(args: argparse.Namespace) -> Path:
         pip_cmd += ["--no-index", "--find-links", str(Path(args.wheelhouse).resolve())]
     _run(pip_cmd)
 
-    print("[3/7] application source (bundled *.example.json data files come with it)")
+    print("[3/8] application source (bundled *.example.json data files come with it)")
     shutil.copytree(
         REPO_ROOT / "src" / "tfx_quant",
         app / "src" / "tfx_quant",
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
     )
 
-    print("[4/7] launcher + path file")
+    print("[4/8] launcher + path file")
     (app / "launcher.pyw").write_text(_LAUNCHER_PYW, encoding="utf-8")
     (app / "tfx-quant-desktop.cmd").write_text(_LAUNCHER_CMD, encoding="utf-8", newline="")
     rewrite_embed_pth(runtime, ["..\\Lib\\site-packages", "..\\src"])
 
-    print("[5/7] third-party license inventory")
-    inventory = collect_license_inventory(site_packages)
-    (app / "third_party_licenses.txt").write_text(render_license_text(inventory), encoding="utf-8")
+    print("[5/8] vendor payload (VC++ redist + Yuanta OCX)")
+    vendor_fragment = _stage_vendor(app, args)
 
-    print("[6/7] build manifest + release notes")
+    print("[6/8] third-party license inventory")
+    inventory = collect_license_inventory(site_packages)
+    (app / "third_party_licenses.txt").write_text(
+        render_license_text(inventory, vendor_bundled=vendor_fragment is not None),
+        encoding="utf-8",
+    )
+
+    print("[7/8] build manifest + release notes")
     revision, dirty = resolve_source_revision(REPO_ROOT)
     manifest = build_manifest(
         app_version=APP_VERSION,
@@ -163,6 +285,7 @@ def build(args: argparse.Namespace) -> Path:
         python_embed_zip=embed_zip,
         requirements_lock_text=lock_text,
         stage_dir=app,
+        vendor_bundle=vendor_fragment,
     )
     write_build_manifest(manifest, app / "build-manifest.json")
     built_at = manifest["built_at_utc"]
@@ -178,10 +301,15 @@ def build(args: argparse.Namespace) -> Path:
     )
     (app / f"RELEASE-NOTES-{APP_VERSION}.md").write_text(notes, encoding="utf-8")
 
-    print("[7/7] SHA256SUMS")
+    print("[8/8] SHA256SUMS")
     count = write_sha256sums(app, app / "SHA256SUMS")
     if dirty:
         print("  WARNING: working tree is dirty; this is not a clean release build")
+    if vendor_fragment is not None:
+        print(
+            "  NOTE: this build BUNDLES Yuanta proprietary OCX components — it must "
+            "only be distributed if you hold a redistribution right from Yuanta."
+        )
     print(f"\nStaged {count} files -> {app}")
     print(f"  source revision : {revision}{' (dirty)' if dirty else ''}")
     print(f"  app version     : {APP_VERSION}")
@@ -194,6 +322,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cache-dir", default=str(REPO_ROOT / "installer" / "_cache"))
     parser.add_argument("--wheelhouse", default=None, help="offline wheel directory")
     parser.add_argument("--python-embed", default=None, help="path to python-*-embed-win32.zip")
+    parser.add_argument("--vcredist", default=None, help="path to vc_redist.x86.exe")
+    parser.add_argument("--yuanta-api-dir", default=None, help="folder holding YuantaOrd.ocx")
+    parser.add_argument(
+        "--yuanta-qapi-dir", default=None, help="folder holding YuantaQuote_v2.1.2.9.ocx"
+    )
+    parser.add_argument(
+        "--no-vendor",
+        action="store_true",
+        help="do not bundle the VC++ redistributable or any Yuanta component",
+    )
     parser.add_argument("--offline", action="store_true", help="never download")
     parser.add_argument(
         "--allow-any-bitness",

@@ -130,8 +130,12 @@ def main(argv: list[str] | None = None) -> int:
         f"/DAppVersion={app_version}",
         f"/DStageApp={stage_app}",
         f"/DOutputDir={output}",
-        str(iss),
     ]
+    vendor_bundled = (stage_app / "vendor" / "install-vendor.cmd").is_file()
+    if vendor_bundled:
+        cmd.append("/DBundleVendor")
+        print("  vendor payload present -> installer will offer elevated Yuanta/VC++ setup")
+    cmd.append(str(iss))
     print("[1/3] compile installer")
     print("  $", " ".join(cmd))
     subprocess.run(cmd, check=True)

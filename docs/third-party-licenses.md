@@ -28,8 +28,20 @@ CPython 3.11（Python Software Foundation License）— python.org 的
 `python-3.11.x-embed-win32.zip`，SHA-256 釘死於
 `src/tfx_quant/packaging/build_support.py` 並於每次建置驗證。
 
-## 不隨本專案散布的元件
+## Microsoft VC++ x86 可轉散發套件
+
+`vc_redist.x86.exe`（Microsoft）。Microsoft 的 Visual C++ 可轉散發套件授權允許隨附用戶端
+應用程式散布。內含元件版的安裝檔會附帶並於缺少時自動安裝。
+
+## 元大專有元件
 
 元大期貨**交易 API**（`YuantaOrd.ocx`、`YuantaOrdLib.dll`、`YuantaCAPIDLL.dll` 等）與
-**行情 API**（`YuantaQuote_v2.1.2.9.ocx`）為元大提供的專有元件，**無再散布權**，
-不包含在安裝檔內，由客戶依[安裝手冊](installation-manual.md)另行向元大取得並安裝。
+**行情 API**（`YuantaQuote_v2.1.2.9.ocx`）為元大提供的專有元件，著作權屬元大期貨股份
+有限公司。
+
+- **純程式版**安裝檔**不含**這些元件，由客戶依[安裝手冊第 2 節](installation-manual.md)
+  另行向元大取得並安裝。
+- **內含元件版**安裝檔隨附這些元件並可自動安裝；此散布方式僅在發行者具備元大授予之
+  再散布授權時方可為之，並記錄於 `build-manifest.json` 的 `vendor_bundle`
+  （`redistribution_right_asserted_by_distributor`）。Microsoft 的**除錯版** CRT/MFC
+  DLL（`msvcrtd.dll`、`MFC42D.DLL`、`mfco42d.dll`）不可散布，建置時已排除。

@@ -4,16 +4,19 @@
 ;   /DAppVersion=<x.y.z>  /DStageApp=<...\stage\app>  /DOutputDir=<...\dist>
 ;
 ; Design notes (see docs/installation-manual.md, docs/maintenance.md):
-;  * Per-user install, no administrator rights. Only the *vendor* Yuanta 交易/行情
-;    API needs admin to register its OCX, and that is installed separately by the
-;    client -- this installer never bundles or registers those components.
+;  * The tfx-quant app installs per-user with no administrator rights.
+;  * When the build bundled a vendor payload (stage/app/vendor exists ->
+;    make_installer.py passes /DBundleVendor), the finish step offers a single
+;    elevated action that installs the Microsoft VC++ x86 redistributable and
+;    copies + registers the Yuanta 交易/行情 OCX to C:\Yuanta (one UAC prompt).
+;    Declining leaves the payload at {app}\vendor for a manual run. The Yuanta
+;    components are Yuanta's property -- bundling them requires a redistribution
+;    right, asserted by whoever produced the build.
 ;  * Blocking pre-checks (Windows version, disk space) are done here in Pascal.
-;    The Yuanta API / VC++ redist checks are warnings, not blocks.
 ;  * Upgrades stop a running instance (AppMutex), back up every SQLite database and
 ;    run an integrity check via the *previous* build's bundled Python before any
 ;    file is replaced; a failed check aborts the upgrade with the old version intact.
-;  * Uninstall keeps %LOCALAPPDATA%\tfx_quant (trading data, logs, settings) unless
-;    the operator ticks the removal task.
+;  * Uninstall keeps %LOCALAPPDATA%\tfx_quant AND C:\Yuanta by default.
 ;  * Code signing is applied to the finished .exe by make_installer.py (opt-in).
 
 #ifndef AppVersion
@@ -77,13 +80,10 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\tfx-quant-desktop.cmd"; Worki
 
 [Tasks]
 Name: "desktopicon"; Description: "建立桌面捷徑"; Flags: unchecked
-
-[Run]
-; Informational post-install environment report -> the installer log. Never blocks.
-Filename: "{app}\runtime\python.exe"; \
-  Parameters: "-m tfx_quant.packaging.prechecks --log ""{code:GetInstallLog}"""; \
-  WorkingDir: "{app}"; Flags: runhidden skipifdoesntexist; \
-  StatusMsg: "檢查執行環境..."
+#ifdef BundleVendor
+Name: "vendorinstall"; \
+  Description: "安裝並註冊元大 API 元件與 Microsoft VC++ x86 執行環境（需要系統管理員權限，會出現一次 UAC 提示）"
+#endif
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}"
@@ -229,11 +229,59 @@ begin
   end;
 end;
 
+procedure RunVendorInstall();
+var
+  cmd, script, logPath: string;
+  resultCode: Integer;
+begin
+  script := ExpandConstant('{app}\vendor\install-vendor.cmd');
+  if not FileExists(script) then
+  begin
+    LogEvent(UpgradeLogPath, 'vendor_install_skipped', ',"reason":"no_payload"');
+    Exit;
+  end;
+  logPath := ExpandConstant('{#DataDir}\logs\vendor-install-') +
+             GetDateTimeString('yyyymmddhhnnss', #0, #0) + '.log';
+  ForceDirectories(ExtractFileDir(logPath));
+  cmd := ExpandConstant('{sys}\cmd.exe');
+  LogEvent(UpgradeLogPath, 'vendor_install_started', '');
+  // 'runas' -> one UAC prompt; regsvr32 + copy to C:\Yuanta + vc_redist all need admin.
+  if ShellExec('runas', cmd, '/c ""' + script + '" "' + logPath + '""',
+       ExpandConstant('{app}\vendor'), SW_SHOW, ewWaitUntilTerminated, resultCode) then
+    LogEvent(UpgradeLogPath, 'vendor_install_finished',
+             ',"exit_code":' + IntToStr(resultCode))
+  else
+  begin
+    LogEvent(UpgradeLogPath, 'vendor_install_declined', '');
+    MsgBox(
+      '未安裝元大 API 元件與 VC++ 執行環境（可能是取消了系統管理員授權）。' + #13#10#13#10
+      + '稍後可用系統管理員身分執行：' + #13#10
+      + '  ' + script + #13#10#13#10
+      + '或依安裝手冊手動安裝。程式仍可先以「模擬」環境啟動。',
+      mbInformation, MB_OK);
+  end;
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
+var
+  py: string;
+  resultCode: Integer;
 begin
   if CurStep = ssPostInstall then
   begin
     LogEvent(UpgradeLogPath, 'files_installed', ',"install_dir_present":true');
+
+#ifdef BundleVendor
+    if WizardIsTaskSelected('vendorinstall') then
+      RunVendorInstall();
+#endif
+
+    // Informational environment report -> the installer log (never blocks).
+    py := ExpandConstant('{app}\runtime\python.exe');
+    if FileExists(py) then
+      Exec(py, '-m tfx_quant.packaging.prechecks --log "' + GetInstallLog('') + '"',
+           ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, resultCode);
+
     LogEvent(UpgradeLogPath, 'run_finished', ',"exit_code":0,"rollback_result":"none"');
   end;
 end;

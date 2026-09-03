@@ -6,11 +6,11 @@
 
 | # | 項目 | 通過 | 備註 |
 |---|---|---|---|
-| A1 | VM 為全新 Windows 10/11，未安裝過本程式 | ☐ | |
-| A2 | 已依[安裝手冊第 2 節](installation-manual.md)安裝並以系統管理員註冊元大**交易** API（`Yuanta.YuantaOrdCtrl.1`） | ☐ | |
-| A3 | 已安裝並註冊元大**行情** API（`YUANTAQUOTE.YuantaQuoteCtrl.1`） | ☐ | |
-| A4 | 已安裝 VC++ 2015–2022 x86 執行環境 | ☐ | |
-| A5 | 取得安裝檔 `tfx-quant-setup.exe` 與 `release-manifest.json` | ☐ | |
+| A1 | VM 為全新 Windows 10/11，未安裝過本程式，`C:\Yuanta` 不存在 | ☐ | |
+| A2 | 已向元大取得交易＋行情 API 使用權限（帳號／憑證） | ☐ | |
+| A3 | 取得安裝檔 `tfx-quant-setup.exe` 與 `release-manifest.json` | ☐ | |
+| A4 | 確認安裝檔類型：`build-manifest.json` 的 `vendor_bundle` — 內含元件版（非 null）或純程式版（null） | ☐ | |
+| A5 | 純程式版才需要：已依[安裝手冊第 2 節](installation-manual.md)以系統管理員註冊元大交易（`Yuanta.YuantaOrdCtrl.1`）、行情（`YUANTAQUOTE.YuantaQuoteCtrl.1`）API 與 VC++ x86 執行環境 | ☐ | |
 
 ## B. 版本一致性核對
 
@@ -32,6 +32,9 @@
 | C3 | 安裝後存在 `%LOCALAPPDATA%\tfx_quant\{config,logs,backup,data}` 四個目錄 | ☐ | |
 | C4 | 安裝程式**未**預填任何帳號或密碼 | ☐ | |
 | C5 | `%LOCALAPPDATA%\tfx_quant\logs\installer-*.log` 內含 `run_started` … `run_finished`（`exit_code:0`），且無明文帳密或完整使用者路徑 | ☐ | |
+| C6 | 內含元件版：安裝時勾選「元件安裝」→ 出現一次 UAC → `C:\Yuanta\API\YuantaOrd.ocx` 與 `C:\Yuanta\QAPI\YuantaQuote_v2.1.2.9.ocx` 存在且 ProgID 已註冊；`vendor-install-*.log` 內 `regsvr32 … exit 0` | ☐ | |
+| C7 | 內含元件版：取消 UAC → 安裝仍完成，元件留在 `<安裝目錄>\vendor\`，log 記 `vendor_install_declined`，程式可以 `TEST` 環境啟動 | ☐ | |
+| C8 | 內含元件版：`<安裝目錄>\vendor\` **不含**除錯 DLL（`msvcrtd.dll` / `MFC42D.DLL` / `mfco42d.dll`） | ☐ | |
 
 ## D. 首次啟動
 
@@ -73,6 +76,7 @@
 | G3 | 重新安裝後沿用既有資料 | ☐ | |
 | G4 | 靜默解除安裝（`/VERYSILENT`，不加 `/REMOVEUSERDATA`）→ `%LOCALAPPDATA%\tfx_quant` **完整保留** | ☐ | |
 | G5 | 互動式解除安裝選「是」（或加 `/REMOVEUSERDATA`）→ `%LOCALAPPDATA%\tfx_quant` 被移除 | ☐ | |
+| G6 | 任何解除安裝方式 → `C:\Yuanta` 與 OCX 註冊**保留**（不被移除） | ☐ | |
 
 ## H. 交付演練（依 [安全 runbook](safety-runbook.md)）
 

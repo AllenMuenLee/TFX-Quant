@@ -10,7 +10,7 @@ separately (see [`../docs/installation-manual.md`](../docs/installation-manual.m
 |---|---|
 | `build.py` | Stages the app: embedded 32-bit CPython 3.11 + locked deps + source + manifests. |
 | `make_installer.py` | Compiles `installer.iss` with Inno Setup, optionally signs, writes `release-manifest.json`. |
-| `installer.iss` | Inno Setup 6 script (per-user install, pre-checks, safe upgrade, safe uninstall). |
+| `installer.iss` | Inno Setup 6 script (per-user install, pre-checks, safe upgrade, safe uninstall, optional elevated vendor-component setup). |
 | `requirements.in` / `requirements.lock` | Pinned, hashed runtime dependency set (mirrors `pyproject.toml`). |
 | `RELEASE-NOTES.template.md` | Rendered per release by `build.py`. |
 | `_cache/`, `_build/` | Download cache and build output — git-ignored. |
@@ -28,6 +28,25 @@ separately (see [`../docs/installation-manual.md`](../docs/installation-manual.m
 py -3.11-32 installer\build.py --output installer\_build
 py -3.11-32 installer\make_installer.py
 ```
+
+### Vendor payload (bundled Yuanta OCX + VC++ redistributable)
+
+`build.py` bundles a vendor payload under `stage/app/vendor` when it can find the
+Yuanta component folders — by default the gitignored
+`交易API元件及說明文件/API` and `行情API元件及說明文件/…/QAPI`, or explicit
+`--yuanta-api-dir` / `--yuanta-qapi-dir`. It also stages `vc_redist.x86.exe`
+(Microsoft, redistributable; pinned in `build_support.py`, `--vcredist` to override).
+
+When the payload is present, `make_installer.py` passes `/DBundleVendor` and the
+installer gains a default-checked task that runs `vendor\install-vendor.cmd`
+elevated (one UAC prompt): installs VC++ if missing, copies the OCX to
+`C:\Yuanta`, and registers them. Debug CRT/MFC DLLs are filtered out (not
+redistributable).
+
+**Bundling Yuanta's proprietary components requires a redistribution right from
+Yuanta.** The build records the assertion in `build-manifest.json`
+(`vendor_bundle.redistribution_right_asserted_by_distributor`). Use
+`build.py --no-vendor` for a components-free installer.
 
 Outputs under `installer\_build`:
 
