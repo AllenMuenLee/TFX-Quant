@@ -2,17 +2,20 @@
 rem ===========================================================================
 rem  tfx-quant launcher
 rem
-rem  Checks the two machine prerequisites (Microsoft VC++ 2015-2022 x86 runtime
-rem  and the Yuanta trade/quote OCX), tells you how to get anything that is
-rem  missing, then starts the desktop app.
+rem  - checks the machine prerequisites (Microsoft VC++ 2015-2022 x86 runtime,
+rem    Yuanta trade/quote OCX) and tells you how to get anything missing;
+rem  - on first run, creates .venv with 32-bit Python 3.11 and installs the app
+rem    (needs an internet connection that first time);
+rem  - starts the desktop app.
 rem
-rem  Run from the project folder (this .bat sits next to pyproject.toml).
+rem  Just double-click this file. It lives next to pyproject.toml.
 rem ===========================================================================
-setlocal EnableExtensions
+setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 
 set "MISSING=0"
-set "VCREDIST_URL=https://aka.ms/vs/17/release/vc_redist.x86.exe"
+set "VENV=%~dp0.venv"
+set "VENVPY=%VENV%\Scripts\python.exe"
 
 echo Checking prerequisites...
 echo.
@@ -24,7 +27,7 @@ if errorlevel 1 (
   set "MISSING=1"
   echo [MISSING] Microsoft Visual C++ 2015-2022 Redistributable ^(x86^)
   echo           Download and install:
-  echo             %VCREDIST_URL%
+  echo             https://aka.ms/vs/17/release/vc_redist.x86.exe
   echo.
 ) else (
   echo [ ok    ] Microsoft Visual C++ x86 runtime
@@ -54,21 +57,26 @@ if errorlevel 1 (
   echo [ ok    ] Yuanta quote API
 )
 
-rem --- pick a 32-bit Python 3.11 -----------------------------------------
-set "PY="
-set "PYQUOTE=1"
-if exist "%~dp0.venv\Scripts\python.exe" set "PY=%~dp0.venv\Scripts\python.exe"
-if not defined PY (
-  where py >nul 2>&1 && ( set "PY=py -3.11-32" & set "PYQUOTE=0" )
-)
-if not defined PY if exist "%~dp0.venv64\Scripts\python.exe" set "PY=%~dp0.venv64\Scripts\python.exe"
-if not defined PY (
-  echo [MISSING] 32-bit Python 3.11
-  echo           Create the venv:  py -3.11-32 -m venv .venv ^&^& .venv\Scripts\pip install -e .
-  echo.
-  pause
-  exit /b 1
-)
+rem --- Python environment (32-bit only: the quote OCX is x86) --------------
+if exist "%VENVPY%" goto have_venv
+
+echo [ setup ] first run - preparing the Python environment
+py -3.11-32 --version >nul 2>&1
+if errorlevel 1 goto no_python
+
+echo           creating .venv with 32-bit Python 3.11...
+py -3.11-32 -m venv "%VENV%"
+if errorlevel 1 goto venv_fail
+if not exist "%VENVPY%" goto venv_fail
+
+echo           installing tfx-quant and its dependencies ^(needs internet, ~1-2 min^)...
+"%VENVPY%" -m pip install --disable-pip-version-check --upgrade pip
+"%VENVPY%" -m pip install --disable-pip-version-check -e .
+if errorlevel 1 goto install_fail
+
+:have_venv
+"%VENVPY%" -c "import tfx_quant.desktop" >nul 2>&1
+if errorlevel 1 goto install_broken
 
 echo.
 if "%MISSING%"=="1" (
@@ -82,10 +90,47 @@ if "%MISSING%"=="1" (
 echo Starting tfx-quant...
 echo   ^(close this window to stop the app^)
 echo.
-if "%PYQUOTE%"=="1" ( "%PY%" -m tfx_quant.desktop ) else ( %PY% -m tfx_quant.desktop )
+"%VENVPY%" -m tfx_quant.desktop
 set "RC=%errorlevel%"
 echo.
 echo tfx-quant exited ^(code %RC%^).
 pause
-endlocal
-exit /b %RC%
+endlocal & exit /b %RC%
+
+rem ===========================================================================
+:no_python
+echo.
+echo [MISSING] 32-bit Python 3.11 ^(the "py -3.11-32" launcher was not found^)
+echo.
+echo   Install 32-bit ^(x86^) Python 3.11, then double-click this file again:
+echo     https://www.python.org/ftp/python/3.11.9/python-3.11.9.exe
+echo     - or -   winget install --id Python.Python.3.11 --architecture x86
+echo   ^(during the python.org installer, tick "Add python.exe to PATH"^)
+echo.
+pause
+endlocal & exit /b 1
+
+:venv_fail
+echo.
+echo [ERROR] Could not create the .venv virtual environment.
+echo         Delete the ".venv" folder if it exists and try again.
+echo.
+pause
+endlocal & exit /b 1
+
+:install_fail
+echo.
+echo [ERROR] "pip install" failed (see the messages above - usually no internet
+echo         connection). Connect to the internet, delete the ".venv" folder,
+echo         and run this file again.
+echo.
+pause
+endlocal & exit /b 1
+
+:install_broken
+echo.
+echo [ERROR] The Python environment exists but tfx-quant will not import.
+echo         Delete the ".venv" folder and run this file again to rebuild it.
+echo.
+pause
+endlocal & exit /b 1
