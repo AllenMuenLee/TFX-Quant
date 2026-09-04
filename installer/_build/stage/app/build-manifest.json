@@ -1,6 +1,6 @@
 {
   "app_version": "0.1.0",
-  "built_at_utc": "2026-09-03T13:43:10.403396+00:00",
+  "built_at_utc": "2026-09-04T01:13:47.359930+00:00",
   "dependencies": [
     {
       "hashes": [
@@ -365,8 +365,8 @@
   },
   "schema": "tfx-quant/build-manifest/2",
   "source_dirty": true,
-  "source_revision": "9634a61ea92b8d3e023d0d3d5078082e68e4bafe",
-  "staged_file_count": 4082,
+  "source_revision": "a20106687358c44e375181b981c3960a01690b16",
+  "staged_file_count": 4083,
   "tools": {
     "build_script": "1",
     "pip": "26.2.1",

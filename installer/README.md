@@ -8,9 +8,10 @@ separately (see [`../docs/installation-manual.md`](../docs/installation-manual.m
 
 | Path | What it is |
 |---|---|
-| `build.py` | Stages the app: embedded 32-bit CPython 3.11 + locked deps + source + manifests. |
+| `build.py` | Stages the app: embedded 32-bit CPython 3.11 + locked deps + source + manifests + `install-all.ps1`. |
 | `make_installer.py` | Compiles `installer.iss` with Inno Setup, optionally signs, writes `release-manifest.json`. |
 | `installer.iss` | Inno Setup 6 script (per-user install, pre-checks, safe upgrade, safe uninstall, optional elevated vendor-component setup). |
+| `install-all.ps1` | Staged into the bundle. A no-Inno-Setup alternative that installs the app **and** every dependency (VC++ redist + Yuanta OCX) from the bundle folder. Also the single implementation the `.iss` calls for its dependency step. |
 | `requirements.in` / `requirements.lock` | Pinned, hashed runtime dependency set (mirrors `pyproject.toml`). |
 | `RELEASE-NOTES.template.md` | Rendered per release by `build.py`. |
 | `_cache/`, `_build/` | Download cache and build output — git-ignored. |
@@ -47,6 +48,28 @@ redistributable).
 Yuanta.** The build records the assertion in `build-manifest.json`
 (`vendor_bundle.redistribution_right_asserted_by_distributor`). Use
 `build.py --no-vendor` for a components-free installer.
+
+### install-all.ps1 (bundle-folder installer, no Inno Setup)
+
+Ships at the root of the staged bundle. Copy the whole `stage\app` folder to the
+target machine and run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install-all.ps1
+```
+
+| Mode | Effect |
+|---|---|
+| *(default)* | Installs the app to `%LOCALAPPDATA%\Programs\tfx-quant`, creates data dirs + shortcuts + an Add/Remove Programs entry, then installs VC++ + Yuanta OCX (one UAC prompt). |
+| `-DependenciesOnly` | Only VC++ + Yuanta OCX. |
+| `-AppOnly` | Only the app. |
+| `-DryRun` | Print actions, change nothing. |
+| `-Uninstall` [`-RemoveData`] [`-RemoveYuanta`] | Remove the app; keeps `%LOCALAPPDATA%\tfx_quant` and `C:\Yuanta` unless the extra switches are given. |
+
+Non-admin steps run as the user; the dependency steps self-elevate once. Logs
+newline-JSON to `%LOCALAPPDATA%\tfx_quant\logs\install-all-*.log`. The file is
+UTF-8 **with BOM** (required for Windows PowerShell 5.1 to read its Chinese
+strings) — keep the BOM on any edit.
 
 Outputs under `installer\_build`:
 

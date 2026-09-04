@@ -73,6 +73,17 @@
 
 ## 3. 安裝本程式
 
+有兩種安裝方式，擇一即可：
+
+- **安裝檔**：執行 `tfx-quant-setup.exe`（見下方步驟）。
+- **資料夾 + 指令碼**：把整個 bundle 資料夾複製到目標電腦，以系統管理員或一般使用者
+  執行 `powershell -ExecutionPolicy Bypass -File .\install-all.ps1`。此指令碼會安裝
+  程式、建立資料目錄與捷徑，並（內含元件版）自動安裝 VC++ 與元大 OCX（一次 UAC）。
+  `-DependenciesOnly` 只裝相依元件；`-AppOnly` 只裝程式；`-DryRun` 只顯示不執行；
+  `-Uninstall` 解除安裝（預設保留資料）。
+
+### 3.a 使用 `tfx-quant-setup.exe`
+
 1. 執行 `tfx-quant-setup.exe`。
 2. 安裝程式會先檢查 Windows 版本與磁碟空間（不足才中止）。
 3. 預設安裝至使用者目錄（`%LOCALAPPDATA%\Programs\tfx-quant`），不需系統管理員權限。

@@ -131,6 +131,10 @@ tfx_quant.packaging     — 安裝／升級支援碼，可依賴 persistence + t
   `交易API元件及說明文件/API`、`行情API元件及說明文件/.../QAPI`）。安裝時的
   `vendorinstall` 工作以一次 UAC 提示執行 `<安裝目錄>\vendor\install-vendor.cmd`。
   以 `installer/build.py --no-vendor` 產生純程式版。
+- `installer/install-all.ps1`（隨 bundle 一起 stage 到 `stage/app/`）是相依元件安裝步驟的
+  **唯一實作**：安裝檔的 `vendorinstall` 工作、以及不使用 Inno Setup 的「複製整個
+  bundle 資料夾再執行指令碼」安裝方式，都走這支。UTF-8 **含 BOM**（PowerShell 5.1
+  讀取中文字串所需），編輯時保留 BOM。
 
 ## 7. 建置與測試
 

@@ -82,39 +82,14 @@ runpy.run_module("tfx_quant.desktop", run_name="__main__")
 
 _LAUNCHER_CMD = '@echo off\r\nstart "" "%~dp0runtime\\pythonw.exe" "%~dp0launcher.pyw" %*\r\n'
 
-# Runs elevated (installer.iss ShellExec 'runas'). %1 = log file path (optional).
-_INSTALL_VENDOR_CMD = """\
-@echo off
-setlocal EnableExtensions
-set "SRC=%~dp0"
-set "LOG=%~1"
-if "%LOG%"=="" set "LOG=%TEMP%\\tfx-quant-vendor-install.log"
-echo [%DATE% %TIME%] vendor install started>>"%LOG%"
-
-if exist "%SRC%vc_redist.x86.exe" (
-  echo [%DATE% %TIME%] vc_redist.x86.exe /install /quiet /norestart>>"%LOG%"
-  "%SRC%vc_redist.x86.exe" /install /quiet /norestart>>"%LOG%" 2>&1
-  echo [%DATE% %TIME%] vc_redist exit %ERRORLEVEL%>>"%LOG%"
+# Thin forwarder the installer.iss runs elevated (ShellExec 'runas'). %1 = log path.
+# install-all.ps1 is the single source of truth for the dependency steps.
+_INSTALL_VENDOR_CMD = (
+    "@echo off\r\n"
+    'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0..\\install-all.ps1"'
+    ' -VendorStep -BundleRoot "%~dp0.." -LogFile "%~1"\r\n'
+    "exit /b %ERRORLEVEL%\r\n"
 )
-
-if exist "%SRC%API\\YuantaOrd.ocx" (
-  if not exist "C:\\Yuanta\\API" mkdir "C:\\Yuanta\\API"
-  xcopy /e /i /y /q "%SRC%API\\*" "C:\\Yuanta\\API\\">>"%LOG%" 2>&1
-  regsvr32 /s "C:\\Yuanta\\API\\YuantaOrd.ocx"
-  echo [%DATE% %TIME%] regsvr32 YuantaOrd.ocx exit %ERRORLEVEL%>>"%LOG%"
-)
-
-if exist "%SRC%QAPI\\YuantaQuote_v2.1.2.9.ocx" (
-  if not exist "C:\\Yuanta\\QAPI" mkdir "C:\\Yuanta\\QAPI"
-  xcopy /e /i /y /q "%SRC%QAPI\\*" "C:\\Yuanta\\QAPI\\">>"%LOG%" 2>&1
-  regsvr32 /s "C:\\Yuanta\\QAPI\\YuantaQuote_v2.1.2.9.ocx"
-  echo [%DATE% %TIME%] regsvr32 YuantaQuote exit %ERRORLEVEL%>>"%LOG%"
-)
-
-echo [%DATE% %TIME%] vendor install finished>>"%LOG%"
-endlocal
-exit /b 0
-"""
 
 
 def _run(cmd: list[str]) -> None:
@@ -260,9 +235,10 @@ def build(args: argparse.Namespace) -> Path:
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
     )
 
-    print("[4/8] launcher + path file")
+    print("[4/8] launcher + path file + install-all.ps1")
     (app / "launcher.pyw").write_text(_LAUNCHER_PYW, encoding="utf-8")
     (app / "tfx-quant-desktop.cmd").write_text(_LAUNCHER_CMD, encoding="utf-8", newline="")
+    shutil.copy2(REPO_ROOT / "installer" / "install-all.ps1", app / "install-all.ps1")
     rewrite_embed_pth(runtime, ["..\\Lib\\site-packages", "..\\src"])
 
     print("[5/8] vendor payload (VC++ redist + Yuanta OCX)")
