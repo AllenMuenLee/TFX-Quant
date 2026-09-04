@@ -129,12 +129,13 @@ tfx_quant.packaging     — 安裝／升級支援碼，可依賴 persistence + t
   `vc_redist.x86.exe`（Microsoft，可散布）與元大交易／行情 OCX（`installer/build.py`
   的 `--yuanta-api-dir` / `--yuanta-qapi-dir`，預設取自 gitignored 的
   `交易API元件及說明文件/API`、`行情API元件及說明文件/.../QAPI`）。安裝時的
-  `vendorinstall` 工作以一次 UAC 提示執行 `<安裝目錄>\vendor\install-vendor.cmd`。
+  `vendorinstall` 工作以一次 UAC 提示執行 `<安裝目錄>\install-all.bat -VendorStep`。
   以 `installer/build.py --no-vendor` 產生純程式版。
-- `installer/install-all.ps1`（隨 bundle 一起 stage 到 `stage/app/`）是相依元件安裝步驟的
+- `installer/install-all.bat`（隨 bundle 一起 stage 到 `stage/app/`）是相依元件安裝步驟的
   **唯一實作**：安裝檔的 `vendorinstall` 工作、以及不使用 Inno Setup 的「複製整個
-  bundle 資料夾再執行指令碼」安裝方式，都走這支。UTF-8 **含 BOM**（PowerShell 5.1
-  讀取中文字串所需），編輯時保留 BOM。
+  bundle 資料夾再執行 `install-all.bat`」安裝方式，都走這支。純批次檔（不需
+  PowerShell 執行原則），以 VBS 產生捷徑、`reg` 建立解除安裝項目、`{sys}` 的
+  `regsvr32` 註冊 OCX。非系統管理員步驟以使用者身分執行，相依元件步驟自行提權一次。
 
 ## 7. 建置與測試
 

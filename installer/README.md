@@ -8,10 +8,10 @@ separately (see [`../docs/installation-manual.md`](../docs/installation-manual.m
 
 | Path | What it is |
 |---|---|
-| `build.py` | Stages the app: embedded 32-bit CPython 3.11 + locked deps + source + manifests + `install-all.ps1`. |
+| `build.py` | Stages the app: embedded 32-bit CPython 3.11 + locked deps + source + manifests + `install-all.bat`. |
 | `make_installer.py` | Compiles `installer.iss` with Inno Setup, optionally signs, writes `release-manifest.json`. |
 | `installer.iss` | Inno Setup 6 script (per-user install, pre-checks, safe upgrade, safe uninstall, optional elevated vendor-component setup). |
-| `install-all.ps1` | Staged into the bundle. A no-Inno-Setup alternative that installs the app **and** every dependency (VC++ redist + Yuanta OCX) from the bundle folder. Also the single implementation the `.iss` calls for its dependency step. |
+| `install-all.bat` | Staged into the bundle. A no-Inno-Setup alternative that installs the app **and** every dependency (VC++ redist + Yuanta OCX) from the bundle folder. Also the single implementation the `.iss` calls for its dependency step (`-VendorStep`). |
 | `requirements.in` / `requirements.lock` | Pinned, hashed runtime dependency set (mirrors `pyproject.toml`). |
 | `RELEASE-NOTES.template.md` | Rendered per release by `build.py`. |
 | `_cache/`, `_build/` | Download cache and build output — git-ignored. |
@@ -39,37 +39,36 @@ Yuanta component folders — by default the gitignored
 (Microsoft, redistributable; pinned in `build_support.py`, `--vcredist` to override).
 
 When the payload is present, `make_installer.py` passes `/DBundleVendor` and the
-installer gains a default-checked task that runs `vendor\install-vendor.cmd`
-elevated (one UAC prompt): installs VC++ if missing, copies the OCX to
-`C:\Yuanta`, and registers them. Debug CRT/MFC DLLs are filtered out (not
-redistributable).
+installer gains a default-checked task that runs
+`{app}\install-all.bat -VendorStep` elevated (one UAC prompt): installs VC++ if
+missing, copies the OCX to `C:\Yuanta`, and registers them. Debug CRT/MFC DLLs are
+filtered out (not redistributable).
 
 **Bundling Yuanta's proprietary components requires a redistribution right from
 Yuanta.** The build records the assertion in `build-manifest.json`
 (`vendor_bundle.redistribution_right_asserted_by_distributor`). Use
 `build.py --no-vendor` for a components-free installer.
 
-### install-all.ps1 (bundle-folder installer, no Inno Setup)
+### install-all.bat (bundle-folder installer, no Inno Setup)
 
 Ships at the root of the staged bundle. Copy the whole `stage\app` folder to the
-target machine and run:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\install-all.ps1
-```
+target machine and run `install-all.bat` (double-click works).
 
 | Mode | Effect |
 |---|---|
-| *(default)* | Installs the app to `%LOCALAPPDATA%\Programs\tfx-quant`, creates data dirs + shortcuts + an Add/Remove Programs entry, then installs VC++ + Yuanta OCX (one UAC prompt). |
+| *(default)* | App to `%LOCALAPPDATA%\Programs\tfx-quant` + data dirs + shortcuts + Add/Remove Programs entry, then VC++ + Yuanta OCX (one UAC prompt). |
 | `-DependenciesOnly` | Only VC++ + Yuanta OCX. |
 | `-AppOnly` | Only the app. |
 | `-DryRun` | Print actions, change nothing. |
+| `-InstallDir "C:\path"` | Override the app location. |
 | `-Uninstall` [`-RemoveData`] [`-RemoveYuanta`] | Remove the app; keeps `%LOCALAPPDATA%\tfx_quant` and `C:\Yuanta` unless the extra switches are given. |
 
-Non-admin steps run as the user; the dependency steps self-elevate once. Logs
-newline-JSON to `%LOCALAPPDATA%\tfx_quant\logs\install-all-*.log`. The file is
-UTF-8 **with BOM** (required for Windows PowerShell 5.1 to read its Chinese
-strings) — keep the BOM on any edit.
+Pure batch — no PowerShell execution policy. Non-admin steps run as the user; the
+dependency steps self-elevate once via a generated VBS `runas` (the internal
+`-VendorStep -UserLocalAppData <path>` re-entry carries the user's profile path so
+the elevated child logs to the right place). Shortcuts via a generated VBS,
+Add/Remove entry via `reg`, OCX registration via `%SystemRoot%\SysWOW64\regsvr32`.
+Logs newline-JSON to `%LOCALAPPDATA%\tfx_quant\logs\install-all-*.log`.
 
 Outputs under `installer\_build`:
 

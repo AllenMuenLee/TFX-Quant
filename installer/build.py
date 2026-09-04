@@ -82,15 +82,6 @@ runpy.run_module("tfx_quant.desktop", run_name="__main__")
 
 _LAUNCHER_CMD = '@echo off\r\nstart "" "%~dp0runtime\\pythonw.exe" "%~dp0launcher.pyw" %*\r\n'
 
-# Thin forwarder the installer.iss runs elevated (ShellExec 'runas'). %1 = log path.
-# install-all.ps1 is the single source of truth for the dependency steps.
-_INSTALL_VENDOR_CMD = (
-    "@echo off\r\n"
-    'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0..\\install-all.ps1"'
-    ' -VendorStep -BundleRoot "%~dp0.." -LogFile "%~1"\r\n'
-    "exit /b %ERRORLEVEL%\r\n"
-)
-
 
 def _run(cmd: list[str]) -> None:
     print("  $", " ".join(cmd))
@@ -173,9 +164,6 @@ def _stage_vendor(app: Path, args: argparse.Namespace) -> dict[str, object] | No
 
     if not staged_any:
         return None
-    (vendor / "install-vendor.cmd").write_text(
-        _INSTALL_VENDOR_CMD, encoding="ascii", newline="\r\n"
-    )
     return fragment
 
 
@@ -235,10 +223,10 @@ def build(args: argparse.Namespace) -> Path:
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
     )
 
-    print("[4/8] launcher + path file + install-all.ps1")
+    print("[4/8] launcher + path file + install-all.bat")
     (app / "launcher.pyw").write_text(_LAUNCHER_PYW, encoding="utf-8")
     (app / "tfx-quant-desktop.cmd").write_text(_LAUNCHER_CMD, encoding="utf-8", newline="")
-    shutil.copy2(REPO_ROOT / "installer" / "install-all.ps1", app / "install-all.ps1")
+    shutil.copy2(REPO_ROOT / "installer" / "install-all.bat", app / "install-all.bat")
     rewrite_embed_pth(runtime, ["..\\Lib\\site-packages", "..\\src"])
 
     print("[5/8] vendor payload (VC++ redist + Yuanta OCX)")

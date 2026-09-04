@@ -76,11 +76,11 @@
 有兩種安裝方式，擇一即可：
 
 - **安裝檔**：執行 `tfx-quant-setup.exe`（見下方步驟）。
-- **資料夾 + 指令碼**：把整個 bundle 資料夾複製到目標電腦，以系統管理員或一般使用者
-  執行 `powershell -ExecutionPolicy Bypass -File .\install-all.ps1`。此指令碼會安裝
-  程式、建立資料目錄與捷徑，並（內含元件版）自動安裝 VC++ 與元大 OCX（一次 UAC）。
-  `-DependenciesOnly` 只裝相依元件；`-AppOnly` 只裝程式；`-DryRun` 只顯示不執行；
-  `-Uninstall` 解除安裝（預設保留資料）。
+- **資料夾 + 指令碼**：把整個 bundle 資料夾複製到目標電腦，執行 `install-all.bat`
+  （可直接雙擊）。此指令碼會安裝程式、建立資料目錄與捷徑，並（內含元件版）自動安裝
+  VC++ 與元大 OCX（一次 UAC）。參數：`-DependenciesOnly` 只裝相依元件；`-AppOnly`
+  只裝程式；`-DryRun` 只顯示不執行；`-Uninstall [-RemoveData] [-RemoveYuanta]`
+  解除安裝（預設保留資料與 `C:\Yuanta`）。
 
 ### 3.a 使用 `tfx-quant-setup.exe`
 
@@ -93,7 +93,7 @@
      複製元大 OCX 至 `C:\Yuanta` 並註冊。過程記錄於
      `%LOCALAPPDATA%\tfx_quant\logs\vendor-install-*.log`。
    - 取消 UAC 或取消勾選時，元件仍留在 `<安裝目錄>\vendor\`，可稍後以系統管理員執行
-     `<安裝目錄>\vendor\install-vendor.cmd`，或依第 2 節手動安裝。程式仍可先以
+     `<安裝目錄>\install-all.bat -DependenciesOnly`，或依第 2 節手動安裝。程式仍可先以
      「模擬」環境啟動。
 5. 安裝程式會建立下列資料目錄（最小權限，僅目前使用者）：
    - `%LOCALAPPDATA%\tfx_quant\config` — 設定檔

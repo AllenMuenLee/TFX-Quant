@@ -6,12 +6,14 @@
 ; Design notes (see docs/installation-manual.md, docs/maintenance.md):
 ;  * The tfx-quant app installs per-user with no administrator rights.
 ;  * When the build bundled a vendor payload (stage/app/vendor exists ->
-;    make_installer.py passes /DBundleVendor), the finish step offers a single
-;    elevated action that installs the Microsoft VC++ x86 redistributable and
-;    copies + registers the Yuanta 交易/行情 OCX to C:\Yuanta (one UAC prompt).
-;    Declining leaves the payload at {app}\vendor for a manual run. The Yuanta
-;    components are Yuanta's property -- bundling them requires a redistribution
-;    right, asserted by whoever produced the build.
+;    make_installer.py passes /DBundleVendor), the finish step runs
+;    "{app}\install-all.bat -VendorStep" once elevated (one UAC prompt): installs
+;    the Microsoft VC++ x86 redistributable and copies + registers the Yuanta
+;    交易/行情 OCX to C:\Yuanta. Declining -> re-run "{app}\install-all.bat
+;    -DependenciesOnly" as admin later. install-all.bat is the single dependency
+;    implementation, shared with the "copy the folder + run the .bat" install
+;    path. The Yuanta components are Yuanta's property -- bundling them requires a
+;    redistribution right, asserted by whoever produced the build.
 ;  * Blocking pre-checks (Windows version, disk space) are done here in Pascal.
 ;  * Upgrades stop a running instance (AppMutex), back up every SQLite database and
 ;    run an integrity check via the *previous* build's bundled Python before any
@@ -231,10 +233,10 @@ end;
 
 procedure RunVendorInstall();
 var
-  cmd, script, logPath: string;
+  cmd, script, params, logPath, lad: string;
   resultCode: Integer;
 begin
-  script := ExpandConstant('{app}\vendor\install-vendor.cmd');
+  script := ExpandConstant('{app}\install-all.bat');
   if not FileExists(script) then
   begin
     LogEvent(UpgradeLogPath, 'vendor_install_skipped', ',"reason":"no_payload"');
@@ -243,11 +245,16 @@ begin
   logPath := ExpandConstant('{#DataDir}\logs\vendor-install-') +
              GetDateTimeString('yyyymmddhhnnss', #0, #0) + '.log';
   ForceDirectories(ExtractFileDir(logPath));
+  lad := ExpandConstant('{localappdata}');
   cmd := ExpandConstant('{sys}\cmd.exe');
+  // {localappdata} is the *installing user's* here (PrivilegesRequired=lowest); pass it
+  // so the elevated child logs to the right profile, not the admin's.
+  params := '/c ""' + script + '" -VendorStep -UserLocalAppData "' + lad +
+            '" -Log "' + logPath + '""';
   LogEvent(UpgradeLogPath, 'vendor_install_started', '');
   // 'runas' -> one UAC prompt; regsvr32 + copy to C:\Yuanta + vc_redist all need admin.
-  if ShellExec('runas', cmd, '/c ""' + script + '" "' + logPath + '""',
-       ExpandConstant('{app}\vendor'), SW_SHOW, ewWaitUntilTerminated, resultCode) then
+  if ShellExec('runas', cmd, params, ExpandConstant('{app}'),
+       SW_SHOW, ewWaitUntilTerminated, resultCode) then
     LogEvent(UpgradeLogPath, 'vendor_install_finished',
              ',"exit_code":' + IntToStr(resultCode))
   else
@@ -256,7 +263,7 @@ begin
     MsgBox(
       '未安裝元大 API 元件與 VC++ 執行環境（可能是取消了系統管理員授權）。' + #13#10#13#10
       + '稍後可用系統管理員身分執行：' + #13#10
-      + '  ' + script + #13#10#13#10
+      + '  ' + script + ' -DependenciesOnly' + #13#10#13#10
       + '或依安裝手冊手動安裝。程式仍可先以「模擬」環境啟動。',
       mbInformation, MB_OK);
   end;
