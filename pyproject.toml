@@ -24,11 +24,6 @@ dev = [
     "ruff>=0.6",
     "import-linter>=2.0",
 ]
-# Tools for regenerating installer/requirements.lock (Feature 16). Not needed to
-# build the installer itself — see installer/README.md.
-packaging = [
-    "pip-tools>=7.4",
-]
 
 [project.scripts]
 tfx-quant-desktop = "tfx_quant.desktop.__main__:main"

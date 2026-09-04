@@ -42,26 +42,3 @@ jobs:
       # mock/fake gateways. Every feature must keep this property.
       - name: Test (pytest)
         run: pytest
-
-  package:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Python 3.11 (x86)
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          architecture: "x86"
-
-      - name: Install package
-        run: pip install -e .
-
-      # Proves installer/build.py still stages a working tree (embedded Python +
-      # locked deps + source + manifests). ISCC is not on the runner, so the
-      # installer .exe step is skipped; that path is exercised by a release build.
-      - name: Stage the application build
-        run: python installer/build.py --output installer/_build
-
-      - name: Compile installer (skipped without Inno Setup)
-        run: python installer/make_installer.py --skip-if-no-iscc

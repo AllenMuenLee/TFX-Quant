@@ -10,17 +10,10 @@ __pycache__/
 venv/
 Logs/
 
-# Installer build outputs and download cache (Feature 16)
-installer/_cache/
-
 # Tooling caches
 .pytest_cache/
+.pytest-tmp*/
 .mypy_cache/
-.pytest-tmp-full-ocx/
-.pytest-tmp-full-ocx-2/
-.pytest-tmp-ocx/
-.pytest-tmp-ocx-2/
-.pytest-tmp-quote-final/
 .ruff_cache/
 .coverage
 htmlcov/
