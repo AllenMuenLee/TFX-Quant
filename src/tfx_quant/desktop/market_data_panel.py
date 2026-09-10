@@ -186,7 +186,10 @@ class CandlestickCanvas(wx.Panel):
             index = round(i * (count - 1) / max(label_count - 1, 1))
             bar = visible_bars[index]
             x = left + round((index + 0.5) * step)
-            dc.DrawText(bar.start.value.strftime("%m/%d %H:%M"), x - 35, top + plot_h + 10)
+            # Axis label shows the bar's *close* time (its `end`), not its open-time
+            # label: the 08:45–09:45 bar is shown at 09:45. This is display only — the
+            # domain keeps open-time labeling (`Bar.start`); see `domain/bar.py`.
+            dc.DrawText(bar.end.value.strftime("%m/%d %H:%M"), x - 35, top + plot_h + 10)
 
 
 class MarketDataPanel(wx.Panel):
