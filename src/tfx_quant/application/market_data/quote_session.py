@@ -10,6 +10,13 @@ from tfx_quant.domain.timestamp import TAIPEI_TZ
 
 QUOTE_HOST = "apiquote.yuantafutures.com.tw"
 
+# TAIFEX TXF/MXF regular clock (Taipei wall time). The night (T+1) session wraps past
+# midnight and closes at ``NIGHT_SESSION_END`` the next calendar day.
+DAY_SESSION_START = time(8, 45)
+DAY_SESSION_END = time(13, 45)
+NIGHT_SESSION_START = time(15, 0)
+NIGHT_SESSION_END = time(5, 0)
+
 _MATCH_TIME_LENGTH = 12
 _HALF_DAY = timedelta(hours=12)
 
@@ -23,11 +30,25 @@ def quote_session_at(value: datetime) -> QuoteSession | None:
     """Return the active TXF/MXF feed session using Taipei wall-clock time."""
     local = value.astimezone(TAIPEI_TZ)
     wall = local.time().replace(tzinfo=None)
-    if time(8, 45) <= wall < time(13, 45):
+    if DAY_SESSION_START <= wall < DAY_SESSION_END:
         return QuoteSession.T
-    if wall >= time(15, 0) or wall < time(5, 0):
+    if wall >= NIGHT_SESSION_START or wall < NIGHT_SESSION_END:
         return QuoteSession.T_PLUS_1
     return None
+
+
+def next_night_session_open(now: datetime) -> datetime:
+    """The next ``NIGHT_SESSION_START`` (15:00:00 Taipei) strictly after ``now``.
+
+    Used to schedule the daily resume of quote recording after the 13:45–15:00
+    intermission — ``now`` exactly on the open resolves to the following day's open,
+    because that session has already begun.
+    """
+    local = now.astimezone(TAIPEI_TZ)
+    open_at = datetime.combine(local.date(), NIGHT_SESSION_START, tzinfo=TAIPEI_TZ)
+    if open_at <= local:
+        open_at += timedelta(days=1)
+    return open_at
 
 
 def quote_port(session: QuoteSession) -> int:

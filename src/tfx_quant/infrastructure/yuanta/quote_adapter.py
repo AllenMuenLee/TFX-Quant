@@ -327,8 +327,28 @@ class YuantaQuoteAdapter:
         for symbol in tuple(self._subscriptions):
             if request_type is None:
                 self._subscriptions.pop(symbol, None)
-            else:
+                continue
+            try:
                 self.unsubscribe(symbol, request_type)
+            except Exception as exc:  # noqa: BLE001
+                # Best-effort teardown: once the control's link to the quote server
+                # is gone (day-session close at 13:45, night-session switch, a
+                # dropped connection) ``DelMktReg`` returns a non-zero RegErrCode or
+                # raises ``COMError``. Dropping the local registration and moving on
+                # is correct — the session is being closed regardless — and a raise
+                # here would propagate out of the caller's refresh timer and close
+                # the application. This is an expected teardown detail, not a fault
+                # (``LiveQuoteService`` logs the session-aware summary), so it is
+                # info-level only.
+                self._subscriptions.pop(symbol, None)
+                log_info(
+                    _logger,
+                    "quote_unregister_skipped_on_stop",
+                    symbol=symbol,
+                    request_type=int(request_type),
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
         self._state = QuoteConnectionState.STOPPED
         log_info(_logger, "quote_session_stopped", event_count=self._event_count)
 

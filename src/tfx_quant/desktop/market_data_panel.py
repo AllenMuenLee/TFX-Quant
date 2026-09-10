@@ -12,6 +12,9 @@ from tfx_quant.application.ports.quote_gateway import QuoteConnectionState
 from tfx_quant.desktop.composition import ServiceContainer
 from tfx_quant.domain.bar import Bar
 from tfx_quant.domain.timestamp import TAIPEI_TZ
+from tfx_quant.telemetry import get_logger, log_warning
+
+_logger = get_logger(__name__)
 
 _BG = wx.Colour(15, 23, 42)
 _CARD = wx.Colour(24, 34, 55)
@@ -264,10 +267,23 @@ class MarketDataPanel(wx.Panel):
         self.SetSizer(root)
 
         self._timer = wx.Timer(self)
-        self.Bind(wx.EVT_TIMER, lambda _e: self.refresh(), self._timer)
+        self.Bind(wx.EVT_TIMER, self._on_timer, self._timer)
         self.Bind(wx.EVT_WINDOW_DESTROY, self._on_destroy)
         self._timer.Start(5000)
         self._set_mode(True)
+
+    def _on_timer(self, _event: wx.TimerEvent) -> None:
+        # A periodic refresh must never take the application down — an unhandled
+        # exception in a wx timer handler leaves the main loop and closes the app.
+        try:
+            self.refresh()
+        except Exception as exc:  # noqa: BLE001
+            log_warning(
+                _logger,
+                "market_data_panel_refresh_failed",
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
 
     def _on_destroy(self, event: wx.WindowDestroyEvent) -> None:
         if event.GetEventObject() is self:

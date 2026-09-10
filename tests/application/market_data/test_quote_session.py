@@ -4,6 +4,7 @@ import pytest
 
 from tfx_quant.application.market_data.quote_session import (
     QuoteSession,
+    next_night_session_open,
     parse_match_time,
     quote_port,
     quote_request_type,
@@ -26,6 +27,24 @@ from tfx_quant.domain.timestamp import TAIPEI_TZ
 )
 def test_quote_session_at(hour: int, minute: int, expected: QuoteSession | None) -> None:
     assert quote_session_at(datetime(2026, 8, 24, hour, minute, tzinfo=TAIPEI_TZ)) is expected
+
+
+def _tpe(*args: int) -> datetime:
+    return datetime(*args, tzinfo=TAIPEI_TZ)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("now", "expected"),
+    [
+        (_tpe(2026, 8, 24, 14, 0), _tpe(2026, 8, 24, 15, 0)),  # before open -> today 15:00
+        (_tpe(2026, 8, 24, 14, 59, 59), _tpe(2026, 8, 24, 15, 0)),  # one second before
+        (_tpe(2026, 8, 24, 15, 0), _tpe(2026, 8, 25, 15, 0)),  # on the open -> next day
+        (_tpe(2026, 8, 24, 22, 0), _tpe(2026, 8, 25, 15, 0)),  # mid night session
+        (_tpe(2026, 8, 25, 3, 0), _tpe(2026, 8, 25, 15, 0)),  # after midnight -> same day 15:00
+    ],
+)
+def test_next_night_session_open(now: datetime, expected: datetime) -> None:
+    assert next_night_session_open(now) == expected
 
 
 def test_sample_ports_and_request_types() -> None:

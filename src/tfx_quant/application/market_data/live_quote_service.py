@@ -7,6 +7,8 @@ from collections.abc import Callable, Iterable
 from pydantic import SecretStr
 
 from tfx_quant.application.market_data.quote_session import (
+    DAY_SESSION_END,
+    NIGHT_SESSION_START,
     QUOTE_HOST,
     QuoteSession,
     quote_port,
@@ -15,6 +17,10 @@ from tfx_quant.application.market_data.quote_session import (
 )
 from tfx_quant.application.ports.clock import Clock
 from tfx_quant.application.ports.quote_gateway import QuoteConnectionState, QuoteGateway
+from tfx_quant.domain.timestamp import TAIPEI_TZ
+from tfx_quant.telemetry import get_logger, log_info, log_warning
+
+_logger = get_logger(__name__)
 
 
 class LiveQuoteService:
@@ -89,9 +95,51 @@ class LiveQuoteService:
             self._subscribed += (symbol,)
 
     def stop_connection(self) -> None:
-        if self._gateway is not None:
-            self._gateway.stop()
+        gateway = self._gateway
+        # Drop the local state first so a failing teardown can never leave a stale
+        # gateway wired in (which would make the next `refresh()` skip the reconnect).
         self._gateway, self._session, self._subscribed = None, None, ()
+        if gateway is None:
+            return
+        try:
+            gateway.stop()
+        except Exception as exc:  # noqa: BLE001
+            # Closing the quote feed must never propagate. An earlier version let a
+            # failing teardown bubble up through the market-data panel's refresh
+            # timer and out of the wx main loop, terminating the whole application at
+            # 13:45 instead of idling until the night session opened.
+            self._log_teardown_failure(exc)
+
+    def _log_teardown_failure(self, exc: Exception) -> None:
+        wall = self._clock.now().value.astimezone(TAIPEI_TZ).time().replace(tzinfo=None)
+        if DAY_SESSION_END <= wall < NIGHT_SESSION_START:
+            # The expected daily case: the day session closed at 13:45, the vendor
+            # OCX's own socket to the T server is already gone, so DelMktReg / the
+            # disconnect call fails. This is not a fault — record it plainly and let
+            # the scheduled 15:00 resume take over.
+            log_info(
+                _logger,
+                "quote_connection_closed_past_day_session",
+                note="過了日盤時間",
+                scheduled_resume="15:00:00",
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+        elif quote_session_at(self._clock.now().value) is None:
+            # Any other non-trading interval (e.g. the 05:00–08:45 pre-open gap).
+            log_info(
+                _logger,
+                "quote_connection_closed_outside_session",
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+        else:
+            log_warning(
+                _logger,
+                "quote_connection_stop_failed",
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
 
     def stop(self) -> None:
         self.stop_connection()

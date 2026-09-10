@@ -55,11 +55,13 @@ _TICK = (
 
 
 class FakeControl:
-    def __init__(self, reg_result: int = 0) -> None:
+    def __init__(self, reg_result: int = 0, del_result: int = 0) -> None:
         self.logons: list[tuple[str, str, str, str, int, int]] = []
         self.registrations: list[tuple[str, str, int, int]] = []
         self.deletions: list[tuple[str, int]] = []
         self.reg_result = reg_result
+        self.del_result = del_result
+        self.del_raises: BaseException | None = None
 
     def SetMktLogon(  # noqa: N802
         self, user: str, password: str, ip: str, port: str, req_type: int, set_map: int
@@ -74,7 +76,9 @@ class FakeControl:
 
     def DelMktReg(self, symbol: str, req_type: int) -> int:  # noqa: N802
         self.deletions.append((symbol, req_type))
-        return 0
+        if self.del_raises is not None:
+            raise self.del_raises
+        return self.del_result
 
 
 def _adapter(
@@ -201,6 +205,35 @@ def test_stop_unregisters_on_the_session_it_logged_into() -> None:
     adapter.stop()
 
     assert control.deletions == [("MXFI6", 2)]
+    assert adapter.state is QuoteConnectionState.STOPPED
+
+
+def test_stop_is_best_effort_when_the_feed_is_already_gone() -> None:
+    """13:45 day-session close: the control's socket to the T server is already down,
+    so ``DelMktReg`` fails. ``stop()`` must still finish cleanly — a raise here used
+    to propagate out of the quote refresh timer and close the whole application."""
+    control = FakeControl(del_result=3)
+    adapter = _adapter(control)
+    adapter.connect("E123456789", SecretStr("s"), "apiquote.example", 80, QuoteRequestType.T)
+    adapter.on_mkt_status_change(2, _LOGON_OK, 1)
+    adapter.subscribe("MXFI6", QuoteRequestType.T)
+
+    adapter.stop()
+
+    assert control.deletions == [("MXFI6", 1)]
+    assert adapter.state is QuoteConnectionState.STOPPED
+
+
+def test_stop_swallows_a_com_error_from_the_torn_down_control() -> None:
+    control = FakeControl()
+    control.del_raises = RuntimeError("COMError: the object invoked has disconnected")
+    adapter = _adapter(control)
+    adapter.connect("E123456789", SecretStr("s"), "apiquote.example", 82, QuoteRequestType.T_PLUS_1)
+    adapter.on_mkt_status_change(2, _LOGON_OK, 2)
+    adapter.subscribe("MXFI6", QuoteRequestType.T_PLUS_1)
+
+    adapter.stop()
+
     assert adapter.state is QuoteConnectionState.STOPPED
 
 
