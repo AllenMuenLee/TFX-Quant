@@ -32,7 +32,6 @@ def preload_control(ocx_path: Path) -> None:
 def create_activex_control(progid: str, hwnd: int, dispatch_interface: Any) -> Any:
     """Create ``progid`` inside the window ``hwnd`` and return its dispatch pointer."""
     import comtypes
-    import comtypes.automation
 
     atl = ctypes.OleDLL("atl.dll")
     create = atl.AtlAxCreateControlEx
@@ -40,14 +39,15 @@ def create_activex_control(progid: str, hwnd: int, dispatch_interface: Any) -> A
         wintypes.LPCWSTR,
         wintypes.HWND,
         ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.POINTER(comtypes.IUnknown)),
+        ctypes.POINTER(ctypes.POINTER(comtypes.IUnknown)),
         ctypes.c_void_p,
         ctypes.c_void_p,
     ]
     create.restype = wintypes.LONG
-    container = ctypes.c_void_p()
-    raw_control = ctypes.c_void_p()
+    # Typed output pointers own ATL's references and release them on every exit.
+    container = ctypes.POINTER(comtypes.IUnknown)()
+    raw_control = ctypes.POINTER(comtypes.IUnknown)()
     null_iid = comtypes.GUID()
     result = create(
         progid,
@@ -62,9 +62,9 @@ def create_activex_control(progid: str, hwnd: int, dispatch_interface: Any) -> A
         raise OSError(
             f"AtlAxCreateControlEx({progid!r}) failed, HRESULT=0x{result & 0xFFFFFFFF:08X}"
         )
-    unknown = ctypes.cast(raw_control, ctypes.POINTER(comtypes.IUnknown))
-    dispatch = unknown.QueryInterface(comtypes.automation.IDispatch)
-    return ctypes.cast(dispatch, ctypes.POINTER(dispatch_interface))
+    # QueryInterface supplies a separate reference for the returned owner. Casting
+    # an owning comtypes pointer creates another destructor without an AddRef.
+    return raw_control.QueryInterface(dispatch_interface)
 
 
 __all__ = ["create_activex_control", "preload_control"]
