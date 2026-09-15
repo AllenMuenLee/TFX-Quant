@@ -291,6 +291,17 @@ class QuoteRuntime:
             current.instrument, current.contract, BarPeriod.SIXTY_MINUTE, start
         )
 
+    def validate_history_close(self, close: Timestamp) -> None:
+        """Only closed periods are editable, independently of the displayed UI state."""
+        if close.value > self._clock.now().value:
+            raise ValueError("不可輸入未來或目前尚未收盤的 K 棒，僅可編輯已收盤資料。")
+        self.history_start_for_close(close)
+
+    def latest_editable_history_close(self) -> Timestamp:
+        return self.adjacent_history_close(
+            Timestamp(self._clock.now().value + timedelta(microseconds=1)), -1
+        )
+
     def save_history_hour(
         self, start: Timestamp, *, open: str, close: str, high: str, low: str, volume: str
     ) -> BarRecord:
@@ -302,9 +313,8 @@ class QuoteRuntime:
         if boundary is None or boundary[0] != start:
             raise ValueError("Use a session bar start time (e.g. 08:45 or 15:00), in Taipei time.")
         _, end, trading_day, session = boundary
+        self.validate_history_close(end)
         now = self._clock.now()
-        if end.value > now.value:
-            raise ValueError("Only completed historical hours can be saved.")
         prices = []
         for label, raw in (("Open", open), ("Close", close), ("High", high), ("Low", low)):
             try:

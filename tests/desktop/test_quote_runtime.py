@@ -674,3 +674,61 @@ def test_missed_history_excludes_executed_signals_but_keeps_unfilled_quantity() 
 
     partial = replace(candidate, quantity=2)
     assert missed_trades([partial], [order], account)[0].quantity == 1
+
+
+def test_manual_history_current_and_future_bars_cannot_be_created_or_corrected() -> None:
+    import pytest
+
+    h = _Harness(datetime(2026, 9, 15, 11, tzinfo=TAIPEI_TZ))
+    current = Timestamp(datetime(2026, 9, 15, 10, 45, tzinfo=TAIPEI_TZ))
+    future = Timestamp(datetime(2026, 9, 15, 11, 45, tzinfo=TAIPEI_TZ))
+    values = dict(open="100", close="101", high="102", low="99", volume="10")
+    for start in (current, future):
+        with pytest.raises(ValueError):
+            h.runtime.save_history_hour(start, **values)
+        assert h.runtime.history_hour(start) is None
+    end = Timestamp(datetime(2026, 9, 15, 11, 45, tzinfo=TAIPEI_TZ))
+    # At the close boundary the prior bar is completed, and the new bar is current.
+    h.clock.value = end.value
+    saved = h.runtime.save_history_hour(current, **values)
+    assert h.runtime.latest_editable_history_close() == end
+    with pytest.raises(ValueError):
+        h.runtime.save_history_hour(future, **values)
+    # An existing database row must not bypass the time check on an update.
+    h.clock.value -= timedelta(microseconds=1)
+    with pytest.raises(ValueError):
+        h.runtime.save_history_hour(current, **(values | {"close": "102"}))
+    assert h.runtime.history_hour(current) == saved
+
+
+def test_editor_disables_current_and_future_inputs_and_reopens_after_close() -> None:
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from tfx_quant.desktop.history_editor_panel import HistoryEditorPanel
+
+    h = _Harness(datetime(2026, 9, 15, 11, tzinfo=TAIPEI_TZ))
+    close = Timestamp(datetime(2026, 9, 15, 11, 45, tzinfo=TAIPEI_TZ))
+    panel = SimpleNamespace(
+        _runtime=h.runtime,
+        _timestamp=lambda: close,
+        _status=MagicMock(),
+        _save_button=MagicMock(),
+        _following=MagicMock(),
+        _fields={key: MagicMock() for key in ("open", "close", "high", "low", "volume")},
+        Layout=MagicMock(),
+    )
+    HistoryEditorPanel._update_editability(panel)  # type: ignore[arg-type]
+    panel._save_button.Enable.assert_called_with(False)
+    panel._following.Enable.assert_called_with(False)
+    for field in panel._fields.values():
+        field.Enable.assert_called_with(False)
+    h.clock.value = close.value
+    HistoryEditorPanel._update_editability(panel)  # type: ignore[arg-type]
+    panel._save_button.Enable.assert_called_with(True)
+    panel._following.Enable.assert_called_with(False)
+    for field in panel._fields.values():
+        field.Enable.assert_called_with(True)
+    close = Timestamp(datetime(2026, 9, 16, 9, 45, tzinfo=TAIPEI_TZ))
+    HistoryEditorPanel._update_editability(panel)  # type: ignore[arg-type]
+    panel._save_button.Enable.assert_called_with(False)

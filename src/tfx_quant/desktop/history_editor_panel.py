@@ -26,6 +26,7 @@ class HistoryEditorPanel(wx.Panel):
             label=(
                 "使用目前選擇的商品與契約；時間為臺北時間的 K 棒收盤時間。"
                 "例如 08:45–09:45 顯示為 09:45；箭頭會跳過休市時段並銜接日盤與夜盤。"
+                "僅可輸入已收盤 K 棒。"
             ),
         )
         root.Add(hint, 0, wx.BOTTOM, 6)
@@ -41,6 +42,7 @@ class HistoryEditorPanel(wx.Panel):
         previous.SetToolTip("上一根 K 棒（跨日盤／夜盤）")
         previous.Bind(wx.EVT_BUTTON, lambda _event: self._step(-1))
         following = wx.Button(self, label="▶", style=wx.BU_EXACTFIT)
+        self._following = following
         following.SetToolTip("下一根 K 棒（跨日盤／夜盤）")
         following.Bind(wx.EVT_BUTTON, lambda _event: self._step(1))
         timestamp_row.Add(previous, 0, wx.RIGHT, 4)
@@ -60,13 +62,54 @@ class HistoryEditorPanel(wx.Panel):
         ):
             button = wx.Button(self, label=label)
             button.Bind(wx.EVT_BUTTON, handler)
+            if handler == self._save:
+                self._save_button = button
             row.Add(button, 0, wx.RIGHT, 6)
-        self._status = wx.StaticText(
-            self, label="手動資料會保留，修改時會記錄修訂歷程。"
-        )
+        self._status = wx.StaticText(self, label="手動資料會保留，修改時會記錄修訂歷程。")
         row.Add(self._status, 0, wx.ALIGN_CENTER_VERTICAL)
         root.Add(row)
         self.SetSizer(root)
+        try:
+            latest = runtime.latest_editable_history_close()
+            self._close.ChangeValue(latest.value.strftime("%Y-%m-%d %H:%M"))
+        except ValueError:
+            pass  # No selected contract yet; validation keeps editing disabled.
+        self._close.Bind(wx.EVT_TEXT, lambda _event: self._update_editability())
+        self._timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, lambda _event: self._update_editability(), self._timer)
+        self.Bind(wx.EVT_WINDOW_DESTROY, self._on_destroy)
+        self._timer.Start(1000)
+        self._update_editability()
+
+    def _on_destroy(self, event: wx.WindowDestroyEvent) -> None:
+        if event.GetEventObject() is self:
+            self._timer.Stop()
+        event.Skip()
+
+    def _update_editability(self) -> None:
+        try:
+            close = self._timestamp()
+            self._runtime.validate_history_close(close)
+        except ValueError as exc:
+            editable = False
+            self._status.SetLabel(str(exc))
+        else:
+            editable = True
+            if not self._save_button.IsEnabled():
+                self._status.SetLabel("此 K 棒已收盤，可載入或編輯歷史資料。")
+        self._save_button.Enable(editable)
+        for control in self._fields.values():
+            control.Enable(editable)
+        can_advance = False
+        if editable:
+            try:
+                following = self._runtime.adjacent_history_close(close, 1)
+                self._runtime.validate_history_close(following)
+                can_advance = True
+            except ValueError:
+                pass
+        self._following.Enable(can_advance)
+        self.Layout()
 
     def _timestamp(self) -> Timestamp:
         return Timestamp(
@@ -78,6 +121,7 @@ class HistoryEditorPanel(wx.Panel):
     def _step(self, direction: int) -> None:
         try:
             close = self._runtime.adjacent_history_close(self._timestamp(), direction)
+            self._runtime.validate_history_close(close)
             self._close.SetValue(close.value.strftime("%Y-%m-%d %H:%M"))
             self._load(None)
         except Exception as exc:
@@ -86,6 +130,7 @@ class HistoryEditorPanel(wx.Panel):
 
     def _load(self, _event: wx.CommandEvent | None) -> None:
         try:
+            self._runtime.validate_history_close(self._timestamp())
             start = self._runtime.history_start_for_close(self._timestamp())
             record = self._runtime.history_hour(start)
             for key, control in self._fields.items():
