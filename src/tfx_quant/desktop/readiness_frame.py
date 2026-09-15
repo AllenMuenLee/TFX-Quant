@@ -51,7 +51,9 @@ class ReadinessFrame(wx.Frame):
         title = "TfxQuant — 測試環境（真實行情・模擬下單）" if services.simulation else "TfxQuant"
         super().__init__(parent, title=title, size=(1180, 760))
         self._services = services
-        panel = wx.Panel(self)
+        panel = wx.ScrolledWindow(self, style=wx.VSCROLL | wx.HSCROLL)
+        panel.SetScrollRate(10, 10)
+        self._dashboard = panel
         panel.SetBackgroundColour(_BG)
         root = wx.BoxSizer(wx.VERTICAL)
 
@@ -82,6 +84,9 @@ class ReadinessFrame(wx.Frame):
         self._login_state = wx.StaticText(panel, label="交易與行情未登入")
         self._login_state.SetForegroundColour(_TEXT)
         top.Add(self._login_state, 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 12)
+        history_button = wx.Button(panel, label="交易歷史")
+        history_button.Bind(wx.EVT_BUTTON, self._on_show_trade_history)
+        top.Add(history_button, 0, wx.RIGHT, 8)
         self._log_button = wx.Button(panel, label="查看所有日誌")
         self._log_button.Bind(wx.EVT_BUTTON, self._on_show_logs)
         top.Add(self._log_button, 0, wx.RIGHT, 8)
@@ -105,7 +110,7 @@ class ReadinessFrame(wx.Frame):
         for child in self._activity.GetChildren():
             if isinstance(child, wx.StaticText):
                 child.SetForegroundColour(_TEXT)
-        root.Add(self._activity, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 20)
+        root.Add(self._activity, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 20)
 
         self._reconciliation = ReconciliationPanel(panel, services)
         self._reconciliation.SetBackgroundColour(_BG)
@@ -122,6 +127,7 @@ class ReadinessFrame(wx.Frame):
         root.Add(self._emergency_flatten, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 20)
 
         panel.SetSizer(root)
+        panel.FitInside()
 
         self._unsubscribers = [
             services.event_coordinator.subscribe(BrokerLoginSucceeded, self._on_login_succeeded),
@@ -181,6 +187,13 @@ class ReadinessFrame(wx.Frame):
         if event.GetEventObject() is self:
             self._night_resume_timer.Stop()
         event.Skip()
+
+    def _on_show_trade_history(self, _event: wx.CommandEvent) -> None:
+        self._activity.show_history()
+        self._dashboard.FitInside()
+        position = self._dashboard.CalcUnscrolledPosition(self._activity.GetPosition())
+        _, step_y = self._dashboard.GetScrollPixelsPerUnit()
+        self._dashboard.Scroll(0, max(0, position.y // max(1, step_y)))
 
     def _on_show_logs(self, _event: wx.CommandEvent) -> None:
         LogViewerFrame(self).Show()

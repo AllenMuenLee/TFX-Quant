@@ -557,3 +557,120 @@ def test_history_navigation_holiday_and_shortened_session() -> None:
     assert h.runtime.adjacent_history_close(morning, -1).value == datetime(
         2026, 9, 12, 5, tzinfo=TAIPEI_TZ
     )
+
+
+def test_history_replay_recomputes_after_edits_without_live_orders() -> None:
+    h = _Harness(datetime(2026, 9, 15, 12, tzinfo=TAIPEI_TZ))
+    close = Timestamp(datetime(2026, 8, 31, 9, 45, tzinfo=TAIPEI_TZ))
+    starts = []
+    for index in range(45):
+        start = h.runtime.history_start_for_close(close)
+        starts.append(start)
+        price = 18000 + index * 20
+        h.runtime.save_history_hour(
+            start,
+            open=str(price),
+            close=str(price + 10),
+            high=str(price + 10),
+            low=str(price),
+            volume="10",
+        )
+        close = h.runtime.adjacent_history_close(close, 1)
+    candidates = h.runtime.historical_trades()
+    assert candidates
+    assert any(c.decision.rule == "enter_long" for c in candidates)
+    assert any(c.decision.rule == "add_long" for c in candidates)
+    assert any(c.decision.rule == "eod_flatten" for c in candidates)
+    assert len({c.decision.intent_key for c in candidates}) == len(candidates)
+    assert h.runtime.historical_trades() is candidates
+    for start in starts:
+        h.runtime.save_history_hour(
+            start, open="18000", close="18000", high="18000", low="18000", volume="10"
+        )
+    assert h.runtime.historical_trades() == ()
+    assert not h.closed
+    assert not h.gateways
+
+
+def test_history_replay_resets_warmup_after_missing_or_incomplete_bar() -> None:
+    from dataclasses import replace
+
+    from tfx_quant.application.strategy_signal.history_replay import replay_history
+    from tfx_quant.domain.strategy_signal_engine import EngineConfig
+
+    h = _Harness(datetime(2026, 9, 15, 12, tzinfo=TAIPEI_TZ))
+    close = Timestamp(datetime(2026, 9, 1, 16, tzinfo=TAIPEI_TZ))
+    records = []
+    for index in range(4):
+        price = 18000 + index * 20
+        records.append(
+            h.runtime.save_history_hour(
+                h.runtime.history_start_for_close(close),
+                open=str(price),
+                close=str(price + 10),
+                high=str(price + 10),
+                low=str(price),
+                volume="10",
+            )
+        )
+        close = h.runtime.adjacent_history_close(close, 1)
+    config = EngineConfig(ma_window=2, flat_lookback=2, flat_threshold_points=Decimal("1"))
+
+    def next_close(end: Timestamp) -> Timestamp:
+        return h.runtime.adjacent_history_close(end, 1)
+
+    assert replay_history(records, next_close, config)
+    assert not replay_history([records[0], records[2]], next_close, config)
+    assert not replay_history(
+        [records[0], replace(records[1], is_complete=False), records[2]], next_close, config
+    )
+
+
+def test_missed_history_excludes_executed_signals_but_keeps_unfilled_quantity() -> None:
+    from types import SimpleNamespace
+
+    from tfx_quant.application.strategy_signal.history_replay import replay_history
+    from tfx_quant.desktop.view_models.historical_trades_view_model import missed_trades
+    from tfx_quant.domain.account import TradingAccount
+    from tfx_quant.domain.strategy_signal_engine import EngineConfig
+
+    h = _Harness(datetime(2026, 9, 15, 12, tzinfo=TAIPEI_TZ))
+    records = []
+    for index in range(4):
+        start = Timestamp(datetime(2026, 9, 1, 15 + index, tzinfo=TAIPEI_TZ))
+        price = 18000 + index * 20
+        records.append(
+            h.runtime.save_history_hour(
+                start,
+                open=str(price),
+                close=str(price + 10),
+                high=str(price + 10),
+                low=str(price),
+                volume="10",
+            )
+        )
+    candidates = replay_history(
+        records,
+        lambda end: h.runtime.adjacent_history_close(end, 1),
+        EngineConfig(ma_window=2, flat_lookback=2),
+    )
+    assert candidates
+    candidate = candidates[0]
+    account = TradingAccount("test", "123")
+    order = SimpleNamespace(
+        account=account,
+        instrument=candidate.record.bar.instrument,
+        contract=candidate.record.bar.contract,
+        side=candidate.side,
+        idempotency_key=candidate.decision.intent_key,
+        filled_quantity=0,
+    )
+    assert missed_trades([candidate], [order], account) == [candidate]
+    order.filled_quantity = candidate.quantity
+    assert missed_trades([candidate], [order], account) == []
+    assert missed_trades([candidate], [order], TradingAccount("test", "456")) == [candidate]
+
+    from dataclasses import replace
+
+    partial = replace(candidate, quantity=2)
+    assert missed_trades([partial], [order], account)[0].quantity == 1

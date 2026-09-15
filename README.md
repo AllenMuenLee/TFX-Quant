@@ -156,3 +156,23 @@ trading signals.
 The hourly editor uses Traditional Chinese column titles. Its arrow buttons load the
 previous/next session bar, skipping breaks, weekends, and configured holidays.
 A bar covering 08:45-09:45 is displayed as 09:45; stored bar identities remain unchanged.
+
+
+### Historical strategy review
+
+The trade-report tab automatically replays saved hourly bars for the selected
+instrument/contract after history changes. Unexecuted strategy signals appear as
+**??????????**, with a timestamp, direction, quantity, reference price,
+and strategy reason. The replay uses the same strategy engine as live trading
+(currently MXF only), starts flat, and assumes immediate fills at signal prices.
+It includes entries, add-ons, exits, and the daily flatten clock trigger. Missing
+or incomplete bars restart the replay and moving-average warmup.
+
+Results are derived from saved bars, refreshed after edits, and rebuilt after restart;
+repeated refreshes do not append duplicate rows. Recorded executions for the selected
+account are matched by strategy intent key; partially filled signals show only the
+unfilled quantity. Manual/external trades without that key cannot be matched reliably.
+These are hypothetical strategy results, not proof that a trade could have executed.
+They never submit orders or change actual fills, positions, P&L, or exported execution
+reports. Hypothetical rows cover available saved history for the selected contract;
+actual report rows retain their existing report window.

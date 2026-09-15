@@ -19,6 +19,7 @@ from tfx_quant.application.events.events import (
     TradeLedgerFillRecorded,
 )
 from tfx_quant.desktop.composition import ServiceContainer
+from tfx_quant.desktop.view_models.historical_trades_view_model import missed_trades
 from tfx_quant.desktop.view_models.orders_view_model import build_orders_view
 from tfx_quant.desktop.view_models.pnl_view_model import build_pnl_view
 from tfx_quant.desktop.view_models.positions_view_model import build_positions_view
@@ -26,6 +27,7 @@ from tfx_quant.desktop.view_models.trade_report_view_model import build_trade_re
 
 _ATTENTION_BG = wx.Colour(120, 30, 30)
 _SIM_BG = wx.Colour(60, 45, 12)
+_MAX_VISIBLE_TRADES = 10
 
 
 def _money(value: Decimal | None) -> str:
@@ -37,6 +39,7 @@ class TradingActivityPanel(wx.Panel):
         super().__init__(parent)
         self._services = services
         notebook = wx.Notebook(self)
+        self._notebook = notebook
         self._orders = _grid(
             notebook, ["本機單號", "券商單號", "方向", "開平", "口數", "已成交", "狀態", "時間"]
         )
@@ -48,18 +51,34 @@ class TradingActivityPanel(wx.Panel):
         )
         self._report = _grid(
             notebook,
-            ["交易日", "商品", "方向", "口數", "開倉價", "平倉價", "毛損益", "淨損益", "模擬"],
+            [
+                "交易日／時間",
+                "商品／契約",
+                "方向",
+                "口數",
+                "開倉價／參考價",
+                "平倉價",
+                "毛損益",
+                "淨損益",
+                "成交性質",
+                "策略原因",
+            ],
         )
         notebook.AddPage(self._orders, "委託／成交")
         notebook.AddPage(self._positions, "持倉")
         notebook.AddPage(self._pnl, "損益")
-        notebook.AddPage(self._report, "交易報告")
+        notebook.AddPage(self._report, "交易歷史", select=True)
 
         self._summary = wx.StaticText(self, label="")
+        self._expanded = True
+        self._toggle = wx.Button(self, label="▼ 收合交易區")
+        self._toggle.Bind(wx.EVT_BUTTON, lambda _event: self._set_expanded(not self._expanded))
         outer = wx.BoxSizer(wx.VERTICAL)
+        outer.Add(self._toggle, 0, wx.BOTTOM, 6)
         outer.Add(self._summary, 0, wx.ALL, 6)
-        outer.Add(notebook, 1, wx.EXPAND)
+        outer.Add(notebook, 0, wx.EXPAND)
         self.SetSizer(outer)
+        notebook.Bind(wx.EVT_NOTEBOOK_PAGE_CHANGED, self._on_page_changed)
 
         self._timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, lambda _e: self.refresh(), self._timer)
@@ -74,6 +93,51 @@ class TradingActivityPanel(wx.Panel):
 
     def _on_event(self, _event: object) -> None:
         wx.CallAfter(self.refresh)
+
+    def show_history(self) -> None:
+        """Reveal executed and hypothetical trades from the dashboard shortcut."""
+        self._set_expanded(True)
+        self._notebook.SetSelection(3)
+        self.refresh()
+        self._report.SetFocus()
+
+    def _set_expanded(self, expanded: bool) -> None:
+        self._expanded = expanded
+        self._summary.Show(expanded)
+        self._notebook.Show(expanded)
+        self._toggle.SetLabel("▼ 收合交易區" if expanded else "▶ 展開交易區")
+        self._resize_history()
+
+    def _on_page_changed(self, event: wx.BookCtrlEvent) -> None:
+        self._resize_history()
+        event.Skip()
+
+    def _resize_history(self) -> None:
+        grid = self._notebook.GetCurrentPage()
+        if isinstance(grid, wx.ListCtrl):
+            count = grid.GetItemCount()
+            if count:
+                rect = grid.GetItemRect(0)
+                row_height = rect.height
+                # The first item may be above the viewport when scrolled.
+                header_height = rect.y + grid.GetTopItem() * row_height
+            else:
+                row_height = grid.GetCharHeight() + self.FromDIP(6)
+                header_height = row_height + self.FromDIP(4)
+            height = header_height + max(1, min(count, _MAX_VISIBLE_TRADES)) * row_height
+            # Reserve native borders and the horizontal scrollbar, if present.
+            height += max(0, grid.GetSize().height - grid.GetClientSize().height)
+            self._notebook.SetMinSize((-1, -1))
+            self._notebook.SetMaxSize((-1, -1))
+            self._notebook.SetPageSize(wx.Size(max(1, grid.GetSize().width), height))
+            height = self._notebook.GetSize().height
+            self._notebook.SetMinSize((-1, height))
+            self._notebook.SetMaxSize((-1, height))
+        self.Layout()
+        parent = self.GetParent()
+        parent.Layout()
+        if isinstance(parent, wx.ScrolledWindow):
+            parent.FitInside()
 
     def _on_destroy(self, event: wx.WindowDestroyEvent) -> None:
         if event.GetEventObject() is self:
@@ -167,12 +231,37 @@ class TradingActivityPanel(wx.Panel):
                         f"{t.close_price:,.2f}",
                         _money(t.gross_pnl),
                         _money(t.net_pnl),
-                        "是" if t.simulation else "",
+                        "模擬成交" if t.simulation else "實際成交",
+                        "",
                     ],
                     t.provisional,
                     t.simulation,
                 )
                 for t in report.realized_trades
+            ]
+            + [
+                (
+                    [
+                        candidate.decision.at.value.strftime("%Y-%m-%d %H:%M"),
+                        f"{candidate.record.bar.instrument.value} / "
+                        f"{candidate.record.bar.contract.code}",
+                        "買進" if candidate.side.value == "BUY" else "賣出",
+                        str(candidate.quantity),
+                        str(candidate.decision.current_price),
+                        "—",
+                        "—",
+                        "—",
+                        "歷史推算・未實際成交",
+                        candidate.decision.reason,
+                    ],
+                    False,
+                    True,
+                )
+                for candidate in missed_trades(
+                    services.quote_runtime.historical_trades(),
+                    services.order_repository.list_all(),
+                    services.broker_session.selected_account,
+                )
             ],
         )
 
@@ -180,8 +269,9 @@ class TradingActivityPanel(wx.Panel):
         total = "—" if positions.total_pnl is None else f"{positions.total_pnl:,.0f}"
         self._summary.SetLabel(
             f"已實現 {positions.realized_pnl:,.0f}　未實現 {_money(positions.unrealized_pnl)}　"
-            f"總計 {total}{marker}"
+            f"總計 {total}{marker}　歷史推算：目前商品／契約，假設訊號價成交，不計入損益"
         )
+        self._resize_history()
 
 
 def _grid(parent: wx.Window, columns: list[str]) -> wx.ListCtrl:
@@ -192,15 +282,22 @@ def _grid(parent: wx.Window, columns: list[str]) -> wx.ListCtrl:
 
 
 def _fill_grid(grid: wx.ListCtrl, rows: list[tuple[list[str], bool, bool]]) -> None:
-    grid.DeleteAllItems()
-    for cells, attention, simulated in rows:
-        row = grid.InsertItem(grid.GetItemCount(), cells[0])
+    # Update in place so the periodic refresh does not reset the user's scroll.
+    while grid.GetItemCount() > len(rows):
+        grid.DeleteItem(grid.GetItemCount() - 1)
+    for row, (cells, attention, simulated) in enumerate(rows):
+        if row >= grid.GetItemCount():
+            grid.InsertItem(row, cells[0])
+        else:
+            grid.SetItem(row, 0, cells[0])
         for column, value in enumerate(cells[1:], start=1):
             grid.SetItem(row, column, value)
         if attention:
             grid.SetItemBackgroundColour(row, _ATTENTION_BG)
         elif simulated:
             grid.SetItemBackgroundColour(row, _SIM_BG)
+        else:
+            grid.SetItemBackgroundColour(row, grid.GetBackgroundColour())
 
 
 __all__ = ["TradingActivityPanel"]

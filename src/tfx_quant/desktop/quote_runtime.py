@@ -36,6 +36,7 @@ from tfx_quant.application.ports.instrument_master import InstrumentMasterReposi
 from tfx_quant.application.ports.market_event_repository import MarketEventRepository
 from tfx_quant.application.ports.quote_gateway import QuoteConnectionState, QuoteGateway
 from tfx_quant.application.ports.trading_calendar import TradingCalendarRepository
+from tfx_quant.application.strategy_signal.history_replay import HistoricalTrade, replay_history
 from tfx_quant.domain.bar import Bar
 from tfx_quant.domain.bar_record import BarDataSource, BarPeriod, BarRecord, rolling_two_month_start
 from tfx_quant.domain.contract import ContractMonth
@@ -97,6 +98,8 @@ class QuoteRuntime:
         self._last_stale: bool | None = None
         self._last_event_at: Timestamp | None = None
         self._event_count = 0
+        self._history_replay_input: tuple[BarRecord, ...] = ()
+        self._history_replay_result: tuple[HistoricalTrade, ...] = ()
         # Mark-to-market feed: at most one `LatestPriceObserved` per second per instrument.
         self._last_price_at: dict[Instrument, Timestamp] = {}
         self._gapped: set[Instrument] = set()
@@ -267,6 +270,18 @@ class QuoteRuntime:
         if not candidates:
             raise ValueError("找不到相鄰交易時段的 K 棒。")
         return min(candidates, key=lambda ts: abs((ts.value - close.value).total_seconds()))
+
+    def historical_trades(self) -> tuple[HistoricalTrade, ...]:
+        """Derived history for the selected contract; edits invalidate the snapshot."""
+        records = tuple(
+            record
+            for record in self.query(date.min, self._clock.now().value.date())
+            if record.bar.end.value <= self._clock.now().value
+        )
+        if records != self._history_replay_input:
+            result = replay_history(records, lambda end: self.adjacent_history_close(end, 1))
+            self._history_replay_input, self._history_replay_result = records, result
+        return self._history_replay_result
 
     def history_hour(self, start: Timestamp) -> BarRecord | None:
         current = self._selection.current
