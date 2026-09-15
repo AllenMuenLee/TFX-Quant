@@ -10,8 +10,10 @@ import wx.adv
 
 from tfx_quant.application.ports.quote_gateway import QuoteConnectionState
 from tfx_quant.desktop.composition import ServiceContainer
+from tfx_quant.desktop.history_editor_panel import HistoryEditorPanel
 from tfx_quant.domain.bar import Bar
-from tfx_quant.domain.timestamp import TAIPEI_TZ
+from tfx_quant.domain.bar_record import rolling_two_month_start
+from tfx_quant.domain.timestamp import TAIPEI_TZ, Timestamp
 from tfx_quant.telemetry import get_logger, log_warning
 
 _logger = get_logger(__name__)
@@ -43,6 +45,7 @@ class CandlestickCanvas(wx.Panel):
         self.SetBackgroundColour(_CARD)
         self.SetMinSize((-1, 390))
         self._bars: list[Bar] = []
+        self.review_starts: set[Timestamp] = set()
         self._zoom = 1.0
         self._right_index = 0
         self._drag_x: int | None = None
@@ -174,6 +177,8 @@ class CandlestickCanvas(wx.Panel):
         for index, bar in enumerate(visible_bars):
             x = left + round((index + 0.5) * step)
             color = _UP if bar.close.amount >= bar.open.amount else _DOWN
+            if bar.start in self.review_starts:
+                color = wx.Colour(250, 204, 21)
             dc.SetPen(wx.Pen(color, 1))
             dc.DrawLine(x, y_of(bar.high.amount), x, y_of(bar.low.amount))
             y_open, y_close = y_of(bar.open.amount), y_of(bar.close.amount)
@@ -266,7 +271,19 @@ class MarketDataPanel(wx.Panel):
         self._status = wx.StaticText(self, label="尚未連接元大行情 API")
         self._status.SetForegroundColour(_TEXT)
         root.Add(self._status, 0, wx.BOTTOM, 8)
+        self._review_warning = wx.StaticText(self)
+        self._review_warning.SetForegroundColour(wx.Colour(250, 204, 21))
+        root.Add(self._review_warning, 0, wx.EXPAND | wx.BOTTOM, 6)
+        self._review_button = wx.Button(self, label="檢查待確認 K 棒")
+        self._review_button.Bind(wx.EVT_BUTTON, self._on_review)
+        root.Add(self._review_button, 0, wx.BOTTOM, 8)
         root.Add(self._canvas, 1, wx.EXPAND)
+        root.Add(
+            HistoryEditorPanel(self, services.quote_runtime, self.refresh),
+            0,
+            wx.EXPAND | wx.TOP,
+            10,
+        )
         self.SetSizer(root)
 
         self._timer = wx.Timer(self)
@@ -274,6 +291,45 @@ class MarketDataPanel(wx.Panel):
         self.Bind(wx.EVT_WINDOW_DESTROY, self._on_destroy)
         self._timer.Start(5000)
         self._set_mode(True)
+
+    def _on_review(self, _event: wx.CommandEvent) -> None:
+        service = self._services.quote_runtime
+        today = self._services.clock.now().value.astimezone(TAIPEI_TZ).date()
+        pending = [
+            r for r in service.query(rolling_two_month_start(today), today) if not r.is_complete
+        ]
+        if not pending:
+            wx.MessageBox(
+                "目前僅有形成中的 K 棒待檢查，請等收棒後再確認。", "K 棒檢查", wx.OK, self
+            )
+            return
+        labels = [f"{r.bar.start.value:%m/%d %H:%M}–{r.bar.end.value:%H:%M}" for r in pending]
+        with wx.SingleChoiceDialog(
+            self, "選擇要核對的 K 棒（台北時間）", "K 棒檢查", labels
+        ) as dialog:
+            if dialog.ShowModal() != wx.ID_OK:
+                return
+            record = pending[dialog.GetSelection()]
+        bar = record.bar
+        message = (
+            f"{bar.instrument.display_name_zh} {bar.contract.code}\n"
+            f"{bar.start.value:%Y/%m/%d %H:%M}–{bar.end.value:%H:%M}（台北時間）\n"
+            f"開 {bar.open.amount}　高 {bar.high.amount}　低 {bar.low.amount}\n"
+            f"收 {bar.close.amount}　成交量 {bar.volume}\n\n"
+            "此棒曾受斷線重連、訂閱錯誤或行情異常影響，請核對以上資料。\n"
+            "確認無誤後，後續含此棒的 20MA 可恢復進場／加碼判斷。"
+        )
+        with wx.MessageDialog(
+            self, message, "確認 K 棒無誤", wx.YES_NO | wx.NO_DEFAULT | wx.ICON_WARNING
+        ) as dialog:
+            dialog.SetYesNoLabels("確認無誤", "尚未確認")
+            if dialog.ShowModal() != wx.ID_YES:
+                return
+        try:
+            service.confirm_history_hour(record)
+        except ValueError as exc:
+            wx.MessageBox(str(exc), "請重新檢查", wx.OK | wx.ICON_WARNING, self)
+        self.refresh()
 
     def _on_timer(self, _event: wx.TimerEvent) -> None:
         # A periodic refresh must never take the application down — an unhandled
@@ -311,7 +367,7 @@ class MarketDataPanel(wx.Panel):
         service = self._services.quote_runtime
         instrument, contract = current.instrument, current.contract
         if self._live_mode:
-            end = date.today()
+            end = self._services.clock.now().value.astimezone(TAIPEI_TZ).date()
             records = service.query(end - timedelta(days=10), end)
             bars = [record.bar for record in records[-_LIVE_LIMIT:]]
             forming = service.forming_bar
@@ -343,4 +399,25 @@ class MarketDataPanel(wx.Panel):
             bars = [record.bar for record in records]
             summary = f"{start} — {end} · {len(bars)} 根"
             self._status.SetLabel(f"{instrument.display_name_zh} · {contract.code}  |  {summary}")
+        today = self._services.clock.now().value.astimezone(TAIPEI_TZ).date()
+        pending = [
+            r for r in service.query(rolling_two_month_start(today), today) if not r.is_complete
+        ]
+        review_starts = {r.bar.start for r in pending}
+        forming = service.forming_bar
+        if forming is not None and service.forming_needs_review:
+            review_starts.add(forming.start)
+        self._canvas.review_starts = review_starts
+        self._review_warning.SetLabel(
+            f"⚠ {len(review_starts)} 根 K 棒受斷線重連、訂閱錯誤或行情異常影響，請核對。"
+            "未確認前，含這些棒的 20MA 暫停進場／加碼。"
+            if review_starts
+            else ""
+        )
+        if not review_starts and service.has_market_data_warning:
+            self._review_warning.SetLabel(
+                "⚠ 行情曾發生斷線重連或訂閱錯誤；尚無可核對 K 棒，請檢查連線與行情。"
+            )
+        self._review_button.Show(bool(review_starts))
+        self.Layout()
         self._canvas.set_bars(bars)

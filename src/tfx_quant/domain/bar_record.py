@@ -7,17 +7,8 @@ implementation prompt requires storing — 週期 (period), 交易日 (trading_d
 資料來源 (source), and the created/updated audit timestamps — without forcing every
 existing `Bar` construction site to know about them.
 
-Every bar this codebase ever persists is aggregated locally from real-time events
-received through the official Yuanta quote API (see `行情API元件及說明文件/` and
-`implementation prompt/04-market-data-and-60m-bars/implementation-prompt.md`'s
-banner) — there is no third-party or external market-data source anywhere in this
-system. `source` distinguishes *when* the write happened, not *where* the data came
-from: `LOCAL_YUANTA_REALTIME` is the only source today — a bar closed by
-`domain.bar_aggregator` from locally-recorded Yuanta quote events and written
-promptly by `desktop.quote_runtime.QuoteRuntime`'s `LocalClosedBarWriter`. It is
-never a manual import, a carried-forward previous close, a synthesized value, or an
-local closed-bar replay — a row's `source` must always say honestly which write
-path produced it.
+History includes locally aggregated Yuanta bars and explicit manual OHLCV entries.
+Manual corrections retain revisions and use MANUAL provenance.
 """
 
 from __future__ import annotations
@@ -53,10 +44,9 @@ class MarketSession(StrEnum):
 
 
 class BarDataSource(StrEnum):
+    MANUAL = "MANUAL"
     LOCAL_YUANTA_REALTIME = "LOCAL_YUANTA_REALTIME"
-    """A bar closed by locally aggregating real-time events received through the
-    official Yuanta quote API and written promptly by `LocalClosedBarWriter`. The
-    only source this codebase ever writes — see the module docstring."""
+    """A bar aggregated from official Yuanta real-time quote events."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +73,9 @@ class BarRecord:
     source_first_sequence: int | None = None
     source_last_sequence: int | None = None
     is_complete: bool = True
+    """False means a visible bar requires explicit user review before MA-based orders.
+    Confirmation persists True; it does not invent or backfill missing trades.
+    """
     """Bumped only by an explicit correction (see `application.ports.
     bar_record_repository.BarRecordRepository.apply_correction`) — never by an ordinary
     duplicate `BarClosed` replay, which is idempotently ignored instead."""
@@ -114,12 +107,9 @@ class BarConflictAudit:
     kept as its own audit row rather than discarded — the "保存衝突 audit 與兩方摘要"
     the two-month bar history extension of the implementation prompt requires.
     `existing` is the canonical bar this codebase already had (never overwritten);
-    `incoming` is the rejected bar an attempted write proposed instead. Since
-    `LOCAL_YUANTA_REALTIME` is the only source this codebase ever writes, a conflict
-    here means a re-aggregation produced different OHLCV for an identity that was
-    already closed and saved (e.g. a late-arriving event reopening an already-closed
-    bar's window, or a replay after a crash) — this audit trail doesn't assume which
-    write happened first."""
+    `incoming` is the rejected bar an attempted write proposed instead. The
+    sources may be live aggregation or manual history; neither is silently overwritten.
+    """
 
     existing: BarRecord
     incoming: BarRecord

@@ -93,6 +93,8 @@ class BarRecordRepository(Protocol):
         ordinary duplicate or conflict — those are outcomes, not errors."""
         ...
 
+    def confirm_review(self, record: BarRecord, *, at: Timestamp) -> bool: ...
+
     def apply_correction(self, record: BarRecord, *, reason: str) -> None:
         """Explicitly revises an existing row (bumps `revision`, records
         `record.updated_at`, and writes an audit entry with `reason`) — the only path

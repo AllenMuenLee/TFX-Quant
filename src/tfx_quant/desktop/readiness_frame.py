@@ -35,9 +35,8 @@ _logger = get_logger(__name__)
 _BG = wx.Colour(15, 23, 42)
 _TEXT = wx.Colour(203, 213, 225)
 
-# Wake one second before the night (T+1) session opens so recording can resume the
-# instant 15:00:00 passes, independent of the market-data panel's own refresh timer.
-_NIGHT_RESUME_LEAD = timedelta(seconds=1)
+# Begin login and subscription ten seconds before the night session opens.
+_NIGHT_RESUME_LEAD = timedelta(seconds=10)
 
 _ENVIRONMENT_CHOICES: tuple[Environment, ...] = (Environment.TEST, Environment.PRODUCTION)
 _ENVIRONMENT_LABELS = ("模擬下單（真實行情）", "正式下單（PRODUCTION）")
@@ -153,23 +152,16 @@ class ReadinessFrame(wx.Frame):
         now = datetime.now(TAIPEI_TZ)
         open_at = next_night_session_open(now)
         wake_at = open_at - _NIGHT_RESUME_LEAD
-        if wake_at - now < timedelta(seconds=5):
-            # Too close to fire cleanly (we just handled this open, or the app
-            # started up mid-wake) — target the following day's open instead. The
-            # market-data panel's 5s poll covers the current crossing.
+        if wake_at <= now:
             open_at = next_night_session_open(open_at)
             wake_at = open_at - _NIGHT_RESUME_LEAD
         self._pending_night_open = open_at
         self._night_resume_timer.StartOnce(max(1, round((wake_at - now).total_seconds() * 1000)))
 
     def _on_night_resume_wake(self, _event: wx.TimerEvent) -> None:
-        # Woke ~1s before the open; fire the actual reconnect the instant 15:00:00
-        # passes, then re-arm for tomorrow. A raise here would leave the wx main loop
-        # and close the app, so nothing in this path is allowed to propagate.
+        # Connect at 14:59:50 rather than delaying login until the first trade.
         try:
-            now = datetime.now(TAIPEI_TZ)
-            delay_ms = max(1, round((self._pending_night_open - now).total_seconds() * 1000))
-            wx.CallLater(delay_ms, self._resume_market_data)
+            self._resume_market_data()
         finally:
             self._arm_night_resume()
 

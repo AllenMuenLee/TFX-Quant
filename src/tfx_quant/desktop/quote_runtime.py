@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
-from datetime import date
+from dataclasses import dataclass, replace
+from datetime import date, timedelta
+from decimal import Decimal, InvalidOperation
 
 from pydantic import SecretStr
 
@@ -29,17 +30,18 @@ from tfx_quant.application.market_data.realtime_bar_aggregator import (
     RealtimeBarAggregator,
 )
 from tfx_quant.application.market_data.recorder_service import MarketDataRecorderService
-from tfx_quant.application.ports.bar_record_repository import BarRecordRepository
+from tfx_quant.application.ports.bar_record_repository import BarRecordRepository, BarUpsertOutcome
 from tfx_quant.application.ports.clock import Clock
 from tfx_quant.application.ports.instrument_master import InstrumentMasterRepository
 from tfx_quant.application.ports.market_event_repository import MarketEventRepository
 from tfx_quant.application.ports.quote_gateway import QuoteConnectionState, QuoteGateway
 from tfx_quant.application.ports.trading_calendar import TradingCalendarRepository
 from tfx_quant.domain.bar import Bar
-from tfx_quant.domain.bar_record import BarPeriod, BarRecord, rolling_two_month_start
+from tfx_quant.domain.bar_record import BarDataSource, BarPeriod, BarRecord, rolling_two_month_start
 from tfx_quant.domain.contract import ContractMonth
 from tfx_quant.domain.instrument import Instrument
 from tfx_quant.domain.market_data import MarketDataGap, RawMarketEvent, RecordedMarketEvent
+from tfx_quant.domain.money import Price
 from tfx_quant.domain.timestamp import Timestamp
 from tfx_quant.domain.trading_calendar import TradingCalendar
 from tfx_quant.telemetry import get_logger, log_info, log_warning
@@ -202,6 +204,130 @@ class QuoteRuntime:
             )
         )
 
+    @property
+    def has_market_data_warning(self) -> bool:
+        current = self._selection.current
+        return current is not None and current.instrument in self._gapped
+
+    @property
+    def forming_needs_review(self) -> bool:
+        current = self._selection.current
+        stream = None if current is None else self._streams.get(current.instrument)
+        return stream is not None and stream.aggregator.forming_needs_review
+
+    def bars_reviewed(self, bars: list[Bar]) -> bool:
+        for bar in bars:
+            record = self._bars.get_one(
+                bar.instrument, bar.contract, BarPeriod.SIXTY_MINUTE, bar.start
+            )
+            if record is None or not record.is_complete or record.bar != bar:
+                return False
+        return True
+
+    def confirm_history_hour(self, record: BarRecord) -> None:
+        """Confirm the exact instrument, contract and revision shown in the dialog."""
+        if not self._bars.confirm_review(record, at=self._clock.now()):
+            raise ValueError("K 棒資料已變更，請重新檢查。")
+
+    def history_start_for_close(self, close: Timestamp) -> Timestamp:
+        """Translate the editor's close label to the persisted open-time identity."""
+        current = self._selection.current
+        if current is None:
+            raise ValueError("請先選擇商品與契約月份。")
+        boundary = self._calendar.boundary_containing(
+            Timestamp(close.value - timedelta(microseconds=1)), current.entry
+        )
+        if boundary is None or boundary[1] != close:
+            raise ValueError("請輸入有效的 K 棒收盤時間，例如日盤 09:45、夜盤 16:00。")
+        return boundary[0]
+
+    def adjacent_history_close(self, close: Timestamp, direction: int) -> Timestamp:
+        """Step to an adjacent session bar, skipping breaks and closed trading days."""
+        if direction not in (-1, 1):
+            raise ValueError("direction must be -1 or 1")
+        current = self._selection.current
+        if current is None:
+            raise ValueError("請先選擇商品與契約月份。")
+        entry = current.entry
+        sessions = [(entry.day_session_start, entry.day_session_end)]
+        if entry.night_session_start is not None and entry.night_session_end is not None:
+            sessions.append((entry.night_session_start, entry.night_session_end))
+        candidates: list[Timestamp] = []
+        # Include the previous date because its night session crosses midnight.
+        for offset in range(-1, 367) if direction == 1 else range(1, -367, -1):
+            day = close.value.date() + timedelta(days=offset)
+            if not self._calendar.is_trading_day(day):
+                continue
+            for start_time, end_time in sessions:
+                for _, end in self._calendar.bar_boundaries(day, start_time, end_time):
+                    if (end.value - close.value).total_seconds() * direction > 0:
+                        candidates.append(end)
+            if candidates and abs(offset) > 1:
+                break
+        if not candidates:
+            raise ValueError("找不到相鄰交易時段的 K 棒。")
+        return min(candidates, key=lambda ts: abs((ts.value - close.value).total_seconds()))
+
+    def history_hour(self, start: Timestamp) -> BarRecord | None:
+        current = self._selection.current
+        if current is None:
+            raise ValueError("Select an instrument and contract first.")
+        return self._bars.get_one(
+            current.instrument, current.contract, BarPeriod.SIXTY_MINUTE, start
+        )
+
+    def save_history_hour(
+        self, start: Timestamp, *, open: str, close: str, high: str, low: str, volume: str
+    ) -> BarRecord:
+        """Persist manual history without publishing live trading events."""
+        current = self._selection.current
+        if current is None:
+            raise ValueError("Select an instrument and contract first.")
+        boundary = self._calendar.boundary_containing(start, current.entry)
+        if boundary is None or boundary[0] != start:
+            raise ValueError("Use a session bar start time (e.g. 08:45 or 15:00), in Taipei time.")
+        _, end, trading_day, session = boundary
+        now = self._clock.now()
+        if end.value > now.value:
+            raise ValueError("Only completed historical hours can be saved.")
+        prices = []
+        for label, raw in (("Open", open), ("Close", close), ("High", high), ("Low", low)):
+            try:
+                amount = Decimal(raw.strip())
+            except InvalidOperation as exc:
+                raise ValueError(f"{label} must be a valid price.") from exc
+            if not amount.is_finite() or amount <= 0:
+                raise ValueError(f"{label} must be finite and positive.")
+            prices.append(Price(amount))
+        if not volume.strip().isascii() or not volume.strip().isdigit():
+            raise ValueError("Volume must be a non-negative whole number.")
+        count = int(volume.strip())
+        if count > 9223372036854775807:
+            raise ValueError("Volume exceeds database capacity.")
+        bar = Bar(
+            current.instrument,
+            current.contract,
+            prices[0],
+            prices[2],
+            prices[3],
+            prices[1],
+            count,
+            start,
+            end,
+        )
+        record = BarRecord(
+            bar, BarPeriod.SIXTY_MINUTE, trading_day, session, BarDataSource.MANUAL, False, now, now
+        )
+        existing = self.history_hour(start)
+        if existing is not None and not existing.is_complete:
+            record = replace(record, is_complete=False)
+        outcome = self._bars.upsert_closed_bar(record)
+        if outcome is BarUpsertOutcome.CONFLICT_REJECTED:
+            self._bars.apply_correction(record, reason="Manual hourly history edit")
+        saved = self.history_hour(start)
+        assert saved is not None
+        return saved
+
     def _on_switch(self, event: InstrumentSwitchCompleted) -> None:
         del event
         # Only the charted market changes here. A stream whose contract is unchanged is
@@ -346,7 +472,21 @@ class QuoteRuntime:
         stream = self._by_symbol.get(gap.symbol)
         if stream is None:
             return
-        stream.aggregator.mark_incomplete()
+        stream.aggregator.mark_incomplete(gap.start, gap.end)
+        # A reconnect may report a gap after the affected bar has already closed.
+        end = gap.end or self._clock.now()
+        for record in self._bars.query_range(
+            stream.instrument,
+            stream.contract,
+            BarPeriod.SIXTY_MINUTE,
+            start_date=gap.start.value.date(),
+            end_date=end.value.date(),
+        ):
+            if record.bar.start.value <= end.value and record.bar.end.value > gap.start.value:
+                self._bars.apply_correction(
+                    replace(record, is_complete=False, updated_at=self._clock.now()),
+                    reason=f"Market data requires review: {gap.reason}",
+                )
         self._gapped.add(stream.instrument)
         self._bus.publish(
             MarketDataGapDetected(

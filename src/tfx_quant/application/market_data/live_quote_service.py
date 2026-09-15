@@ -91,7 +91,13 @@ class LiveQuoteService:
         for symbol in self._symbols:
             if symbol in self._subscribed:
                 continue
-            self._gateway.subscribe(symbol, quote_request_type(wanted))
+            try:
+                self._gateway.subscribe(symbol, quote_request_type(wanted))
+            except Exception as exc:  # noqa: BLE001
+                log_warning(
+                    _logger, "quote_subscription_retry_pending", symbol=symbol, error=str(exc)
+                )
+                continue
             self._subscribed += (symbol,)
 
     def stop_connection(self) -> None:

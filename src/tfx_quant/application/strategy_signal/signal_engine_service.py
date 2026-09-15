@@ -59,6 +59,7 @@ from tfx_quant.application.order_management.order_manager import OrderManager, O
 from tfx_quant.application.ports.clock import Clock
 from tfx_quant.application.ports.order_repository import OrderRepository
 from tfx_quant.domain.account import TradingAccount
+from tfx_quant.domain.bar import Bar
 from tfx_quant.domain.contract import ContractMonth
 from tfx_quant.domain.instrument import Instrument
 from tfx_quant.domain.money import Price
@@ -142,6 +143,7 @@ class StrategySignalEngineService:
         event_bus: EventBus,
         selected_account: SelectedAccount,
         engine_config: EngineConfig | None = None,
+        bars_reviewed: Callable[[list[Bar]], bool] | None = None,
         risk_gate: RiskEntryWindowGate | None = None,
         clock_interval_seconds: float = _DEFAULT_CLOCK_INTERVAL_SECONDS,
     ) -> None:
@@ -151,6 +153,8 @@ class StrategySignalEngineService:
         self._event_bus = event_bus
         self._selected_account = selected_account
         self._engine_config = engine_config
+        self._bars_reviewed = bars_reviewed
+        self._review_windows: dict[_EngineKey, list[Bar]] = {}
         self._risk_gate = risk_gate if risk_gate is not None else _default_risk_entry_window_gate
         self._clock_interval_seconds = clock_interval_seconds
         self._lock = threading.RLock()
@@ -175,6 +179,7 @@ class StrategySignalEngineService:
         key = (instrument, contract)
         with self._lock:
             self._engines.pop(key, None)
+            self._review_windows.pop(key, None)
             self._stale.pop(key, None)
             self._gapped.pop(key, None)
             self._position_uncertain.pop(key, None)
@@ -260,7 +265,17 @@ class StrategySignalEngineService:
                     config=self._engine_config,
                 )
                 self._engines[key] = engine
-            data_reliable = not self._stale.get(key, False) and not self._gapped.get(key, False)
+            config = self._engine_config or EngineConfig()
+            window = self._review_windows.setdefault(key, [])
+            window.append(event.bar)
+            # Include every close used by the current MA, slope and flatness lookback.
+            del window[: max(0, len(window) - config.ma_window - max(2, config.flat_lookback) + 1)]
+            reviewed = (
+                self._bars_reviewed(window)
+                if self._bars_reviewed is not None
+                else not self._gapped.get(key, False)
+            )
+            data_reliable = not self._stale.get(key, False) and reviewed
             has_active_order = self._has_active_order(event.instrument, event.contract)
             position_state_uncertain = self._position_uncertain.get(key, False)
             decision = engine.on_bar_closed(

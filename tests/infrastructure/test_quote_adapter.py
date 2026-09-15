@@ -150,8 +150,9 @@ def test_broken_link_marks_gap_and_relogin_reregisters_and_closes_it() -> None:
     assert adapter.state is QuoteConnectionState.STALE
 
     adapter.on_mkt_status_change(2, _LOGON_OK, 1)
-    assert [gap.reason for gap in gaps] == ["disconnect"]
-    assert gaps[0].end is not None
+    assert [gap.reason for gap in gaps] == ["disconnect", "disconnect"]
+    assert gaps[0].end is None
+    assert gaps[1].end is not None
     assert control.registrations == [("MXFI6", "4", 1, 0), ("MXFI6", "4", 1, 0)]
 
 

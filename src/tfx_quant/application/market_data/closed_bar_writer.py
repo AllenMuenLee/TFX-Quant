@@ -37,7 +37,7 @@ class LocalClosedBarWriter:
             updated_at=now,
             source_first_sequence=closed.first_sequence,
             source_last_sequence=closed.last_sequence,
-            is_complete=True,
+            is_complete=closed.is_complete,
         )
         outcome = self._repository.upsert_closed_bar(record)
         if outcome is BarUpsertOutcome.INSERTED:

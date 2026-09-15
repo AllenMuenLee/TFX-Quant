@@ -184,6 +184,14 @@ class YuantaQuoteAdapter:
             raise ValueError("Yuanta quote symbol length must be 4..13")
         result = self._register(symbol, mode, request_type)
         if result != 0:
+            self._on_gap(
+                MarketDataGap(
+                    symbol,
+                    Timestamp(self._clock().astimezone(TAIPEI_TZ)),
+                    None,
+                    f"registration failed: {result}",
+                )
+            )
             raise QuoteRegistrationError(
                 f"AddMktReg failed with documented RegErrCode={result}"
                 f" ({_REGISTRATION_ERRORS.get(result, 'undocumented')})"
@@ -236,6 +244,8 @@ class YuantaQuoteAdapter:
         elif link in (QuoteLinkStatus.LINK_BROKEN, QuoteLinkStatus.LINK_FAILED):
             self._state = QuoteConnectionState.STALE
             self._gap_started = Timestamp(self._clock().astimezone(TAIPEI_TZ))
+            for symbol in tuple(self._subscriptions):
+                self._on_gap(MarketDataGap(symbol, self._gap_started, None, "disconnect"))
         elif link is QuoteLinkStatus.IDLE:
             self._state = QuoteConnectionState.IDLE
         else:
@@ -357,7 +367,18 @@ class YuantaQuoteAdapter:
     ) -> int:
         # The control declares ``updmode`` as a string: the sample passes ``modle[0]``,
         # the leading character of e.g. "4-SnapshotUpd".
-        result = self._control.AddMktReg(symbol, str(int(mode)), int(request_type), _SET_MAP)
+        try:
+            result = self._control.AddMktReg(symbol, str(int(mode)), int(request_type), _SET_MAP)
+        except Exception as exc:
+            self._on_gap(
+                MarketDataGap(
+                    symbol,
+                    Timestamp(self._clock().astimezone(TAIPEI_TZ)),
+                    None,
+                    f"registration exception: {type(exc).__name__}",
+                )
+            )
+            raise
         log_info(
             _logger,
             "quote_registration_result",

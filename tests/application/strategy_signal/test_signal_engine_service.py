@@ -121,7 +121,9 @@ def _rising_warmup_plus_entry(
     return _bars(closes, opens=opens)
 
 
-def _service() -> tuple[
+def _service(
+    bars_reviewed: Callable[[list[Bar]], bool] | None = None,
+) -> tuple[
     StrategySignalEngineService, MockTradeGateway, SqliteOrderRepository, FakeEventBus, FakeClock
 ]:
     event_bus = FakeEventBus()
@@ -142,6 +144,7 @@ def _service() -> tuple[
         clock=clock,
         event_bus=event_bus,
         selected_account=lambda: _ACCOUNT,
+        bars_reviewed=bars_reviewed,
     )
     return service, gateway, repo, event_bus, clock
 
@@ -176,6 +179,42 @@ def test_entry_signal_submits_order_via_order_manager() -> None:
     assert order.quantity.lots == 1
     assert order.kind is OrderKind.OPEN
     assert order.price == Price(Decimal("10380"))
+
+
+def test_unconfirmed_bar_in_ma_blocks_orders_until_confirmation() -> None:
+    bars = _rising_warmup_plus_entry()
+    pending = {bars[-3].start}
+    _svc, gateway, _repo, bus, _clock = _service(
+        lambda window: not any(bar.start in pending for bar in window)
+    )
+    _publish_bars(bus, bars)
+    assert gateway.submitted_orders == []
+    pending.clear()
+    assert gateway.submitted_orders == []
+    last = bars[-1]
+    following = replace(last, start=last.end, end=Timestamp(last.end.value + timedelta(hours=1)))
+    _publish_bars(bus, [following])
+    assert len(gateway.submitted_orders) == 1
+
+
+def test_unconfirmed_bar_used_by_ma_lookback_blocks_until_it_rolls_out() -> None:
+    bars = _rising_warmup_plus_entry()
+    pending = {bars[0].start}
+    windows: list[list[Bar]] = []
+
+    def reviewed(window: list[Bar]) -> bool:
+        windows.append(list(window))
+        return not any(bar.start in pending for bar in window)
+
+    _svc, gateway, _repo, bus, _clock = _service(reviewed)
+    _publish_bars(bus, bars)
+    assert len(windows[-1]) == _MA_WINDOW + _FLAT_LOOKBACK - 1
+    assert gateway.submitted_orders == []
+    last = bars[-1]
+    _publish_bars(
+        bus, [replace(last, start=last.end, end=Timestamp(last.end.value + timedelta(hours=1)))]
+    )
+    assert len(gateway.submitted_orders) == 1
 
 
 def test_fill_confirmation_enables_add_on_signal() -> None:

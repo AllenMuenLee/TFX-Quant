@@ -26,6 +26,7 @@ class ClosedAggregation:
     session: MarketSession
     first_sequence: int
     last_sequence: int
+    is_complete: bool = True
 
 
 @dataclass(slots=True)
@@ -40,6 +41,7 @@ class _Forming:
     last_sequence: int
     last_fingerprint: tuple[object, ...]
     last_total: int
+    last_session_id: str
     complete: bool = True
 
 
@@ -73,10 +75,15 @@ class RealtimeBarAggregator:
         self._resolve = boundary_resolver
         self._started_at = recording_started_at
         self._forming: _Forming | None = None
+        self._review_intervals: list[tuple[Timestamp, Timestamp | None]] = []
 
     @property
     def forming_bar(self) -> Bar | None:
         return None if self._forming is None else self._bar(self._forming)
+
+    @property
+    def forming_needs_review(self) -> bool:
+        return self._forming is not None and not self._forming.complete
 
     def accept(self, event: RecordedMarketEvent) -> list[ClosedAggregation]:
         if not event.is_trade or event.matched_at is None or event.match_price is None:
@@ -89,6 +96,19 @@ class RealtimeBarAggregator:
         if self._started_at is not None and boundary[0].value < self._started_at.value:
             # A boundary already under way when recording began — see the class docstring.
             return []
+        # An open gap ends at the first valid trade observed after it.
+        self._review_intervals = [
+            (
+                start,
+                event.matched_at if end is None and event.matched_at.value >= start.value else end,
+            )
+            for start, end in self._review_intervals
+            if end is None or end.value >= boundary[0].value
+        ]
+        needs_review = any(
+            start.value < boundary[1].value and (end is None or end.value >= boundary[0].value)
+            for start, end in self._review_intervals
+        )
         closed = self.advance(event.matched_at)
         fingerprint = (
             event.match_time_raw,
@@ -108,21 +128,27 @@ class RealtimeBarAggregator:
                 event.raw.sequence,
                 fingerprint,
                 event.total_match_quantity,
+                event.raw.session_id,
+                complete=not needs_review,
             )
             return closed
         forming = self._forming
+        if needs_review:
+            forming.complete = False
         if boundary[0] != forming.boundary[0]:
             # A different open boundary without the prior boundary being closable is a gap.
             forming.complete = False
             return closed
         if fingerprint == forming.last_fingerprint:
             return closed
-        if (
-            event.raw.sequence <= forming.last_sequence
-            or event.total_match_quantity < forming.last_total
-        ):
+        if event.raw.session_id != forming.last_session_id:
+            forming.complete = False
+            forming.first_sequence = min(forming.first_sequence, event.raw.sequence)
+        elif event.raw.sequence <= forming.last_sequence:
             forming.complete = False
             return closed
+        if event.total_match_quantity < forming.last_total:
+            forming.complete = False
         forming.high = max(forming.high, event.match_price)
         forming.low = min(forming.low, event.match_price)
         forming.close = event.match_price
@@ -130,6 +156,7 @@ class RealtimeBarAggregator:
         forming.last_sequence = event.raw.sequence
         forming.last_fingerprint = fingerprint
         forming.last_total = event.total_match_quantity
+        forming.last_session_id = event.raw.session_id
         return closed
 
     def advance(self, now: Timestamp) -> list[ClosedAggregation]:
@@ -137,8 +164,6 @@ class RealtimeBarAggregator:
         if forming is None or now.value < forming.boundary[1].value:
             return []
         self._forming = None
-        if not forming.complete:
-            return []
         start, end, trading_day, session = forming.boundary
         return [
             ClosedAggregation(
@@ -147,12 +172,19 @@ class RealtimeBarAggregator:
                 session,
                 forming.first_sequence,
                 forming.last_sequence,
+                forming.complete,
             )
         ]
 
-    def mark_incomplete(self) -> None:
+    def mark_incomplete(self, start: Timestamp | None = None, end: Timestamp | None = None) -> None:
+        if start is not None:
+            self._review_intervals.append((start, end))
         if self._forming is not None:
-            self._forming.complete = False
+            boundary = self._forming.boundary
+            if start is None or (
+                start.value < boundary[1].value and (end is None or end.value >= boundary[0].value)
+            ):
+                self._forming.complete = False
 
     def _bar(self, forming: _Forming) -> Bar:
         start, end, _day, _session = forming.boundary

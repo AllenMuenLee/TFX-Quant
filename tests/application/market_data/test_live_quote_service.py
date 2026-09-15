@@ -86,6 +86,20 @@ def test_switches_from_t_to_t_plus_1_port_and_resubscribes_every_symbol() -> Non
     assert gateways[1].subscriptions == [("TXFI6", 2), ("MXFI6", 2)]
 
 
+def test_night_connection_and_subscriptions_start_ten_seconds_before_open() -> None:
+    service, gateways, clock = _service()
+    clock.value = datetime(2026, 8, 24, 14, 59, 49, tzinfo=TAIPEI_TZ)
+    service.start("user", SecretStr("secret"), ("TXFI6", "MXFI6"))
+    assert gateways == []
+    clock.value = clock.value.replace(second=50)
+    service.refresh()
+    assert gateways[0].connections == [("apiquote.yuantafutures.com.tw", 82, 2)]
+    assert gateways[0].subscriptions == [("TXFI6", 2), ("MXFI6", 2)]
+    clock.value = clock.value.replace(hour=15, minute=0, second=0)
+    service.refresh()
+    assert len(gateways) == 1
+
+
 def test_intermission_teardown_failure_is_logged_as_past_day_session_not_a_fault(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -94,9 +108,7 @@ def test_intermission_teardown_failure_is_logged_as_past_day_session_not_a_fault
     error must be swallowed — it used to bubble out of the market-data refresh timer
     and close the whole application — and recorded plainly as "過了日盤時間", not as a
     warning."""
-    caplog.set_level(
-        logging.INFO, logger="tfx_quant.application.market_data.live_quote_service"
-    )
+    caplog.set_level(logging.INFO, logger="tfx_quant.application.market_data.live_quote_service")
     service, gateways, clock = _service()
     clock.value = datetime(2026, 8, 24, 13, 0, tzinfo=TAIPEI_TZ)
     service.start("A123456789", SecretStr("secret"), ("TXFI6", "MXFI6"))
@@ -107,9 +119,7 @@ def test_intermission_teardown_failure_is_logged_as_past_day_session_not_a_fault
     assert gateways[0].stopped
 
     payloads = [json.loads(record.message) for record in caplog.records]
-    past_day = next(
-        p for p in payloads if p["event"] == "quote_connection_closed_past_day_session"
-    )
+    past_day = next(p for p in payloads if p["event"] == "quote_connection_closed_past_day_session")
     assert past_day["note"] == "過了日盤時間"
     assert past_day["scheduled_resume"] == "15:00:00"
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]

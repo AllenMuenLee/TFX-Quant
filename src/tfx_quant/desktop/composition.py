@@ -236,8 +236,9 @@ def _resolve_trading_calendar_path(settings: TradingSettings) -> Path:
 def _resolve_market_data_db_path(settings: TradingSettings) -> Path:
     """Unlike the instrument master/trading calendar paths, there is no bundled example
     to fall back to — this is a per-user, per-machine data file that starts empty (see
-    `TradingSettings.market_data_db_path`'s docstring) and accumulates only from bars
-    this software has actually recorded itself."""
+    `TradingSettings.market_data_db_path`'s docstring) and stores recorded bars
+    and manual hourly history.
+    All trading environments resolve to this same market-data file."""
     if settings.market_data_db_path is not None:
         return Path(settings.market_data_db_path)
     local_app_data = os.environ.get("LOCALAPPDATA")
@@ -650,6 +651,7 @@ def build_services(
         event_bus=event_coordinator,
         selected_account=lambda: broker_session.selected_account,
         risk_gate=risk_supervisor.validate_entry_window,
+        bars_reviewed=quote_runtime.bars_reviewed,
     )
     bar_signal_state_store.add(signal_engine_service)
 

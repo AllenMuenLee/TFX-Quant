@@ -15,6 +15,7 @@ QUOTE_HOST = "apiquote.yuantafutures.com.tw"
 DAY_SESSION_START = time(8, 45)
 DAY_SESSION_END = time(13, 45)
 NIGHT_SESSION_START = time(15, 0)
+NIGHT_CONNECTION_START = time(14, 59, 50)
 NIGHT_SESSION_END = time(5, 0)
 
 _MATCH_TIME_LENGTH = 12
@@ -32,7 +33,7 @@ def quote_session_at(value: datetime) -> QuoteSession | None:
     wall = local.time().replace(tzinfo=None)
     if DAY_SESSION_START <= wall < DAY_SESSION_END:
         return QuoteSession.T
-    if wall >= NIGHT_SESSION_START or wall < NIGHT_SESSION_END:
+    if wall >= NIGHT_CONNECTION_START or wall < NIGHT_SESSION_END:
         return QuoteSession.T_PLUS_1
     return None
 

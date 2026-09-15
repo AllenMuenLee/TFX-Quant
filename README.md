@@ -136,3 +136,23 @@ proprietary components requires a redistribution right from Yuanta; use
 `.github/workflows/ci.yml` runs on `windows-latest` with a **32-bit (x86)** Python
 3.11: `ruff`, `mypy`, `lint-imports`, `pytest` (mock gateways only, no broker
 credentials or OCX), plus a `package` job that runs `installer/build.py`.
+
+
+### Manual hourly price history
+
+The market-data screen includes an **Hourly history** section in both mock and
+production mode. Select the instrument and contract, enter the bar close date/time
+in Asia/Taipei and its open, close, high, low and volume, then click **Save / update
+hour**. Use **Load existing hour** to retrieve a row before editing it. Times follow
+the configured session boundaries (for example 09:45, 10:45 for the day session).
+Only completed bars can be entered; OHLC prices must be positive and internally
+consistent, and volume must be a non-negative integer.
+
+Both modes use the same `market_data.sqlite3` file (or the same configured
+`market_data_db_path`). Corrections retain a revision history. Manual rows are
+excluded from automatic two-month cleanup. Saving history does not publish live
+trading signals.
+
+The hourly editor uses Traditional Chinese column titles. Its arrow buttons load the
+previous/next session bar, skipping breaks, weekends, and configured holidays.
+A bar covering 08:45-09:45 is displayed as 09:45; stored bar identities remain unchanged.

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 
+import pytest
 from pydantic import SecretStr
 
 from tfx_quant.application.events.event_coordinator import EventCoordinator
@@ -308,7 +310,18 @@ def test_a_gap_marks_only_its_own_symbols_stream_incomplete() -> None:
     harness.clock.value = datetime(2026, 9, 1, 10, 45, tzinfo=TAIPEI_TZ)
     harness.runtime.refresh()
 
-    assert [event.instrument for event in harness.closed] == [Instrument.MXF]
+    assert [event.instrument for event in harness.closed] == [Instrument.MXF, Instrument.TXF]
+    from tfx_quant.domain.bar_record import BarPeriod
+
+    for instrument in Instrument:
+        record = harness.bars.get_one(
+            instrument,
+            _CONTRACT,
+            BarPeriod.SIXTY_MINUTE,
+            Timestamp(datetime(2026, 9, 1, 9, 45, tzinfo=TAIPEI_TZ)),
+        )
+        assert record is not None
+        assert record.is_complete == (instrument is Instrument.MXF)
 
 
 def test_a_stopped_and_restarted_session_drops_the_boundary_it_restarts_inside() -> None:
@@ -338,6 +351,61 @@ def test_no_trade_after_login_leaves_the_recorded_history_empty() -> None:
 
     assert harness.closed == []
     assert harness.runtime.query(date(2026, 9, 1), date(2026, 9, 1)) == []
+
+
+@pytest.mark.parametrize("reason", ["disconnect", "registration failed: 3"])
+def test_gap_bar_remains_visible_and_requires_explicit_confirmation(reason: str) -> None:
+    h = _Harness(datetime(2026, 9, 1, 14, 59, 50, tzinfo=TAIPEI_TZ))
+    h.login()
+    g = h.gateways[-1]
+    h.clock.value = datetime(2026, 9, 1, 15, 5, tzinfo=TAIPEI_TZ)
+    g.on_gap(MarketDataGap("MXFI6", Timestamp(h.clock.value), None, reason))
+    g.on_event(_trade("MXFI6", 10, h.clock.value, price="18000", total=10))
+    assert h.runtime.forming_bar is not None
+    assert h.runtime.forming_needs_review
+    h.clock.value = h.clock.value.replace(hour=16, minute=0)
+    h.runtime.refresh()
+    record = h.runtime.query(date(2026, 9, 1), date(2026, 9, 1))[0]
+    assert not record.is_complete
+    assert not h.runtime.bars_reviewed([record.bar])
+    h.runtime.confirm_history_hour(record)
+    assert h.runtime.bars_reviewed([record.bar])
+    # Confirmation must not replay a historical trading event.
+    assert len(h.closed) == 1
+
+
+def test_late_reconnect_marks_closed_bar_and_invalidates_stale_confirmation() -> None:
+    h = _Harness(datetime(2026, 9, 1, 15, 0, tzinfo=TAIPEI_TZ))
+    h.login()
+    g = h.gateways[-1]
+    g.on_event(_trade("MXFI6", 1, h.clock.value, price="18000", total=1))
+    h.clock.value = h.clock.value.replace(hour=16)
+    h.runtime.refresh()
+    start = Timestamp(datetime(2026, 9, 1, 15, 30, tzinfo=TAIPEI_TZ))
+    g.on_gap(MarketDataGap("MXFI6", start, Timestamp(h.clock.value), "disconnect"))
+    record = h.runtime.query(date(2026, 9, 1), date(2026, 9, 1))[0]
+    assert not record.is_complete
+    g.on_gap(MarketDataGap("MXFI6", start, Timestamp(h.clock.value), "registration error"))
+    with pytest.raises(ValueError):
+        h.runtime.confirm_history_hour(record)
+    assert not h.runtime.bars_reviewed([record.bar])
+
+
+def test_reconnect_with_new_sequence_still_updates_and_persists_candle() -> None:
+    h = _Harness(datetime(2026, 9, 1, 15, 0, tzinfo=TAIPEI_TZ))
+    h.login()
+    g = h.gateways[-1]
+    g.on_event(_trade("MXFI6", 100, h.clock.value, price="18000", total=100))
+    h.clock.value = h.clock.value.replace(minute=10)
+    trade = replace(_trade("MXFI6", 1, h.clock.value, price="18050", total=101), session_id="new")
+    g.on_event(trade)
+    forming = h.runtime.forming_bar
+    assert forming is not None and forming.close.amount == Decimal("18050")
+    h.clock.value = h.clock.value.replace(hour=16, minute=0)
+    h.runtime.refresh()
+    record = h.runtime.query(date(2026, 9, 1), date(2026, 9, 1))[0]
+    assert record.bar.volume == 2
+    assert not record.is_complete
 
 
 def test_refresh_reports_staleness_for_every_recorded_market() -> None:
@@ -401,3 +469,91 @@ def test_recording_survives_a_night_session_reconnect_without_losing_a_market() 
     harness.runtime.refresh()
 
     assert sorted(harness.gateways[0].subscriptions) == ["MXFI6", "TXFI6"]
+
+
+def test_manual_history_persists_corrects_and_survives_retention() -> None:
+    from tfx_quant.domain.bar_record import BarDataSource
+
+    h = _Harness(datetime(2026, 9, 15, 12, tzinfo=TAIPEI_TZ))
+    start = Timestamp(datetime(2026, 6, 1, 8, 45, tzinfo=TAIPEI_TZ))
+    values = dict(open="100.25", close="101", high="102", low="99", volume="12")
+    saved = h.runtime.save_history_hour(start, **values)
+    assert saved.source is BarDataSource.MANUAL
+    assert saved.bar.open.amount == Decimal("100.25")
+    assert saved.revision == 1
+    values["close"] = "102"
+    corrected = h.runtime.save_history_hour(start, **values)
+    assert corrected.revision == 2
+    assert corrected.created_at == saved.created_at
+    h.runtime.refresh()
+    assert h.runtime.history_hour(start) == corrected
+    assert h.runtime.query(date(2026, 6, 1), date(2026, 6, 1)) == [corrected]
+    assert not h.closed
+    assert not h.gateways
+    assert h.runtime.save_history_hour(start, **values).revision == 2
+
+
+def test_manual_history_rejects_invalid_input_without_writes() -> None:
+    import pytest
+
+    from tfx_quant.domain.errors import DomainError
+
+    h = _Harness(datetime(2026, 9, 15, 12, tzinfo=TAIPEI_TZ))
+    start = Timestamp(datetime(2026, 9, 15, 8, 45, tzinfo=TAIPEI_TZ))
+    values = dict(open="100", close="101", high="102", low="99", volume="12")
+    for key, bad in (
+        ("open", "NaN"),
+        ("high", "Infinity"),
+        ("volume", "1.5"),
+        ("volume", "-1"),
+        ("high", "98"),
+        ("close", "0"),
+    ):
+        with pytest.raises((ValueError, DomainError)):
+            h.runtime.save_history_hour(start, **(values | {key: bad}))
+    for hour, minute in ((8, 0), (12, 45)):
+        with pytest.raises(ValueError):
+            h.runtime.save_history_hour(
+                Timestamp(datetime(2026, 9, 15, hour, minute, tzinfo=TAIPEI_TZ)), **values
+            )
+    assert h.runtime.query(date(2026, 9, 15), date(2026, 9, 15)) == []
+
+
+def test_history_close_labels_and_session_navigation() -> None:
+    import pytest
+
+    h = _Harness(datetime(2026, 9, 15, 12, tzinfo=TAIPEI_TZ))
+
+    def ts(day: int, hour: int, minute: int = 0) -> Timestamp:
+        return Timestamp(datetime(2026, 9, day, hour, minute, tzinfo=TAIPEI_TZ))
+
+    assert h.runtime.history_start_for_close(ts(15, 9, 45)) == ts(15, 8, 45)
+    assert h.runtime.history_start_for_close(ts(16, 0)) == ts(15, 23)
+    assert h.runtime.adjacent_history_close(ts(15, 9, 45), 1) == ts(15, 10, 45)
+    assert h.runtime.adjacent_history_close(ts(15, 13, 45), 1) == ts(15, 16)
+    assert h.runtime.adjacent_history_close(ts(15, 16), -1) == ts(15, 13, 45)
+    assert h.runtime.adjacent_history_close(ts(15, 5), 1) == ts(15, 9, 45)
+    assert h.runtime.adjacent_history_close(ts(15, 9, 45), -1) == ts(15, 5)
+    assert h.runtime.adjacent_history_close(ts(15, 23), 1) == ts(16, 0)
+    # Friday night ends Saturday; next session is Monday morning.
+    assert h.runtime.adjacent_history_close(ts(12, 5), 1) == ts(14, 9, 45)
+    assert h.runtime.adjacent_history_close(ts(14, 9, 45), -1) == ts(12, 5)
+    with pytest.raises(ValueError):
+        h.runtime.history_start_for_close(ts(15, 15))
+
+
+def test_history_navigation_holiday_and_shortened_session() -> None:
+    from tfx_quant.domain.trading_calendar import TradingCalendar
+
+    h = _Harness(datetime(2026, 9, 15, 12, tzinfo=TAIPEI_TZ))
+    h.runtime._calendar = TradingCalendar(
+        holidays=frozenset({date(2026, 9, 14)}),
+        early_closes={date(2026, 9, 15): time(11, 15)},
+    )
+    close = Timestamp(datetime(2026, 9, 15, 11, 15, tzinfo=TAIPEI_TZ))
+    assert h.runtime.history_start_for_close(close).value.time() == time(10, 45)
+    assert h.runtime.adjacent_history_close(close, 1).value.time() == time(16)
+    morning = Timestamp(datetime(2026, 9, 15, 9, 45, tzinfo=TAIPEI_TZ))
+    assert h.runtime.adjacent_history_close(morning, -1).value == datetime(
+        2026, 9, 12, 5, tzinfo=TAIPEI_TZ
+    )

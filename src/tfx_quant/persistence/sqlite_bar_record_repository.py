@@ -197,6 +197,36 @@ class SqliteBarRecordRepository:
         )
         return outcome
 
+    def confirm_review(self, record: BarRecord, *, at: Timestamp) -> bool:
+        """Compare-and-set prevents confirming a bar changed while its dialog was open."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE bar_records SET is_complete=1, revision=revision+1, updated_at=? "
+                "WHERE instrument=? AND contract_year=? AND contract_month=? "
+                "AND period=? AND start_at=? AND revision=? AND is_complete=0",
+                (
+                    at.value.isoformat(),
+                    record.bar.instrument.value,
+                    record.bar.contract.year,
+                    record.bar.contract.month,
+                    record.period.value,
+                    record.bar.start.value.isoformat(),
+                    record.revision,
+                ),
+            )
+            self._conn.commit()
+            changed = cursor.rowcount == 1
+        if changed:
+            log_info(
+                _logger,
+                "market_data_bar_confirmed",
+                instrument=record.bar.instrument.value,
+                contract=record.bar.contract.code,
+                bar_start=record.bar.start.value.isoformat(),
+                revision=record.revision + 1,
+            )
+        return changed
+
     def apply_correction(self, record: BarRecord, *, reason: str) -> None:
         try:
             with self._lock:
@@ -418,12 +448,12 @@ class SqliteBarRecordRepository:
         try:
             with self._lock:
                 candidate_row = self._conn.execute(
-                    "SELECT COUNT(*) FROM bar_records WHERE trading_day < ?",
+                    "SELECT COUNT(*) FROM bar_records WHERE trading_day < ? AND source != 'MANUAL'",
                     (cutoff_trading_day.isoformat(),),
                 ).fetchone()
                 candidate_count = 0 if candidate_row is None else int(candidate_row[0])
                 cursor = self._conn.execute(
-                    "DELETE FROM bar_records WHERE trading_day < ?",
+                    "DELETE FROM bar_records WHERE trading_day < ? AND source != 'MANUAL'",
                     (cutoff_trading_day.isoformat(),),
                 )
                 self._conn.commit()

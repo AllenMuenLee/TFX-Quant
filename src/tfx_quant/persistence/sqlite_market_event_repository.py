@@ -85,8 +85,9 @@ class SqliteMarketEventRepository:
     def record_gap(self, gap: MarketDataGap) -> None:
         with self._lock:
             self._conn.execute(
-                "INSERT OR IGNORE INTO market_data_gaps(symbol,start_at,end_at,reason) "
-                "VALUES(?,?,?,?)",
+                "INSERT INTO market_data_gaps(symbol,start_at,end_at,reason) "
+                "VALUES(?,?,?,?) ON CONFLICT(symbol,start_at,reason) "
+                "DO UPDATE SET end_at=COALESCE(excluded.end_at, market_data_gaps.end_at)",
                 (
                     gap.symbol,
                     gap.start.value.isoformat(),

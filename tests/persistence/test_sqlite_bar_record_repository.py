@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
 from datetime import date, datetime
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
@@ -27,6 +29,28 @@ from tfx_quant.persistence.sqlite_bar_record_repository import SqliteBarRecordRe
 _INSTRUMENT = Instrument.TXF
 _CONTRACT = ContractMonth(year=2026, month=9)
 _OTHER_CONTRACT = ContractMonth(year=2026, month=10)
+
+
+def test_bar_review_survives_reopen_and_confirmation_is_revision_guarded(tmp_path: Path) -> None:
+    path = tmp_path / "review.sqlite3"
+    connection = sqlite3.connect(path)
+    repository = SqliteBarRecordRepository(connection)
+    record = replace(_record(_ts(2026, 9, 1, 15, 0), _ts(2026, 9, 1, 16, 0)), is_complete=False)
+    repository.upsert_closed_bar(record)
+    connection.close()
+    connection = sqlite3.connect(path)
+    repository = SqliteBarRecordRepository(connection)
+    saved = repository.get_one(*record.identity)
+    assert saved is not None and not saved.is_complete
+    assert repository.confirm_review(saved, at=record.bar.end)
+    assert not repository.confirm_review(saved, at=record.bar.end)
+    connection.close()
+    connection = sqlite3.connect(path)
+    repository = SqliteBarRecordRepository(connection)
+    confirmed = repository.get_one(*record.identity)
+    assert confirmed is not None and confirmed.is_complete
+    assert confirmed.revision == saved.revision + 1
+    connection.close()
 
 
 def _ts(y: int, m: int, d: int, hh: int, mm: int) -> Timestamp:
