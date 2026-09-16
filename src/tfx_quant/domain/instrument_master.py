@@ -29,12 +29,13 @@ old `-UNCONFIRMED` convention this file used for `vendor_symbol`.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, time
+from datetime import date, datetime, time
 from decimal import Decimal
 
 from tfx_quant.domain.contract import ContractMonth
 from tfx_quant.domain.errors import InvalidInstrumentMasterEntryError
 from tfx_quant.domain.instrument import Instrument
+from tfx_quant.domain.timestamp import TAIPEI_TZ
 
 _FUTURES_MONTH_CODE = "1ABCDEFGHIJKL"
 """期貨月份對應代碼 (期貨報價代碼7xxx變更規則): index 0 ("1") means 近月 (front/nearest
@@ -121,6 +122,11 @@ class InstrumentMasterEntry:
             raise InvalidInstrumentMasterEntryError(
                 "night_session_start and night_session_end must both be set or both be None"
             )
+
+    @property
+    def expires_at(self) -> datetime:
+        """TAIFEX expiry-day cutoff; the master retains holiday-adjusted dates."""
+        return datetime.combine(self.expiry_date, time(13, 30), tzinfo=TAIPEI_TZ)
 
     @property
     def display_name_zh(self) -> str:

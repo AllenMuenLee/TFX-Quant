@@ -82,6 +82,13 @@ def test_validate_can_open_allows_on_expiry_date_itself() -> None:
     assert validate_can_open(entry, as_of=_timestamp("2026-08-18T10:00:00")) is None
 
 
+def test_validate_can_open_rejects_at_expiry_cutoff() -> None:
+    entry = _entry()
+    assert validate_can_open(entry, as_of=_timestamp("2026-09-16T13:29:59")) is None
+    assert validate_can_open(entry, as_of=_timestamp("2026-09-16T13:30:00")) is not None
+    assert validate_can_open(entry, as_of=_timestamp("2026-09-16T15:00:00")) is not None
+
+
 # -- validate_order_price ------------------------------------------------------------
 
 

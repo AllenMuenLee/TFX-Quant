@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from math import ceil
 
 import wx
 
@@ -38,6 +39,10 @@ _TEXT = wx.Colour(203, 213, 225)
 # Begin login and subscription ten seconds before the night session opens.
 _NIGHT_RESUME_LEAD = timedelta(seconds=10)
 
+# wx.Timer takes a signed 32-bit millisecond interval. Long waits are split without
+# resolving contracts until the actual expiry deadline is reached.
+_MAX_TIMER_DELAY_MS = 2_147_483_647
+
 _ENVIRONMENT_CHOICES: tuple[Environment, ...] = (Environment.TEST, Environment.PRODUCTION)
 _ENVIRONMENT_LABELS = ("模擬下單（真實行情）", "正式下單（PRODUCTION）")
 _PRODUCTION_SWITCH_CONFIRM = (
@@ -51,6 +56,7 @@ class ReadinessFrame(wx.Frame):
         title = "TfxQuant — 測試環境（真實行情・模擬下單）" if services.simulation else "TfxQuant"
         super().__init__(parent, title=title, size=(1180, 760))
         self._services = services
+        self._closing = False
         panel = wx.ScrolledWindow(self, style=wx.VSCROLL | wx.HSCROLL)
         panel.SetScrollRate(10, 10)
         self._dashboard = panel
@@ -133,7 +139,9 @@ class ReadinessFrame(wx.Frame):
             services.event_coordinator.subscribe(BrokerLoginSucceeded, self._on_login_succeeded),
             services.event_coordinator.subscribe(BrokerSessionReady, self._on_session_ready),
             services.event_coordinator.subscribe(BrokerLoggedOut, self._on_event),
-            services.event_coordinator.subscribe(InstrumentSwitchCompleted, self._on_event),
+            services.event_coordinator.subscribe(
+                InstrumentSwitchCompleted, self._on_contract_changed
+            ),
             services.event_coordinator.subscribe(BarClosed, self._on_event),
             services.event_coordinator.subscribe(MarketDataFreshnessChanged, self._on_event),
         ]
@@ -149,7 +157,55 @@ class ReadinessFrame(wx.Frame):
         self.Bind(wx.EVT_WINDOW_DESTROY, self._on_destroy)
         self._arm_night_resume()
 
+        self._contract_rollover_timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self._on_contract_rollover_wake, self._contract_rollover_timer)
+        self._arm_contract_rollover()
+
         self.Centre()
+        self._refresh()
+
+    def _arm_contract_rollover(self) -> None:
+        self._contract_rollover_timer.Stop()
+        if self._closing:
+            return
+        selection = self._services.instrument_selection
+        current = selection.current
+        if current is None:
+            return
+        delay = (current.entry.expires_at - self._services.clock.now().value).total_seconds()
+        if delay <= 0 and selection.auto_refresh_error:
+            # Missing master data/blocked switch is visible in the UI. Do not spin
+            # on an already-expired deadline; an explicit switch re-arms the timer.
+            return
+        self._contract_rollover_timer.StartOnce(
+            min(_MAX_TIMER_DELAY_MS, max(1, ceil(delay * 1000)))
+        )
+
+    def _on_contract_rollover_wake(self, _event: wx.TimerEvent) -> None:
+        if self._closing:
+            return
+        selection = self._services.instrument_selection
+        current = selection.current
+        if current is None:
+            return
+        if self._services.clock.now().value < current.entry.expires_at:
+            self._arm_contract_rollover()
+            return
+        try:
+            if not selection.refresh_auto_selection():
+                self._selector.refresh()  # Show a blocked rollover or missing master.
+        except Exception as exc:  # noqa: BLE001
+            log_warning(_logger, "contract_rollover_failed", error=str(exc))
+            return
+        self._arm_contract_rollover()
+
+    def _on_contract_changed(self, _event: InstrumentSwitchCompleted) -> None:
+        wx.CallAfter(self._apply_contract_change)
+
+    def _apply_contract_change(self) -> None:
+        if self._closing:
+            return
+        self._arm_contract_rollover()
         self._refresh()
 
     # -- night-session resume schedule ---------------------------------------------------
@@ -185,6 +241,8 @@ class ReadinessFrame(wx.Frame):
 
     def _on_destroy(self, event: wx.WindowDestroyEvent) -> None:
         if event.GetEventObject() is self:
+            self._closing = True
+            self._contract_rollover_timer.Stop()
             self._night_resume_timer.Stop()
         event.Skip()
 
@@ -300,6 +358,8 @@ class ReadinessFrame(wx.Frame):
         self._market.refresh()
 
     def _on_close(self, event: wx.CloseEvent) -> None:
+        self._closing = True
+        self._contract_rollover_timer.Stop()
         self._night_resume_timer.Stop()
         for unsubscribe in self._unsubscribers:
             unsubscribe()

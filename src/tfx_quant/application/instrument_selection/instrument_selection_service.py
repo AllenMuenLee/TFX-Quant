@@ -1,9 +1,8 @@
 """InstrumentSelectionService — the switch/selection workflow for Feature 03.
 
-Owns exactly the sequence the implementation prompt spells out: 切換流程必須先暫停 (the
-strategy must already be paused/stopped — this service never drives the state machine
-itself, see below), 重新查詢帳戶狀態, 清空 K 棒／訊號狀態; 成功後仍需使用者重新啟動。
-And the hard precondition: 策略執行中或存在持倉、活動委託、未知委託時禁止切換商品／契約。
+Manual switches require a stopped or safely paused strategy. Automatic quarterly
+rollover first pauses a running strategy, then uses the same switch workflow. It
+never restarts the strategy, changes existing positions, or submits orders.
 This service itself never touches the quote-gateway registration directly — publishing
 `InstrumentSwitchCompleted` (carrying `vendor_symbol`) is what tells
 `desktop.quote_runtime.QuoteRuntime._on_switch` which of its recorded markets is now
@@ -13,26 +12,9 @@ a switch changes the live registration only when it also changes a contract mont
 (`bar_signal_state_store.clear()`) is a separate step, resetting Feature 05's
 per-(instrument, contract) engine state.
 
-**Why this service never transitions `StrategyStateMachine` itself**: the "must first
-pause" requirement and the "forbid switching while executing" requirement would
-otherwise read as contradictory (if switching always force-pauses first, what does
-"forbid while executing" forbid?). Resolved by treating "must first pause" as a
-*precondition* the switch checks (state already `STOPPED` or `PAUSED_SAFE`) rather than
-an action the switch performs — switching never itself moves the strategy in or out of
-`RUNNING`. Since `StrategyState.RUNNING` is only reachable via a fresh `STARTING` (see
-`domain.strategy_state`), leaving the machine in `STOPPED`/`PAUSED_SAFE` after a switch
-already guarantees "成功後仍需使用者重新啟動" without this service needing to force any
-particular transition.
-
-**Why `switch_to()` re-validates via `_evaluate_switch_allowed()` immediately before
-clearing bar/signal state**: this is the literal "重新查詢帳戶狀態" step — a fresh
-position/order query right before the switch actually takes effect, not just the
-earlier `check_switch_allowed()` a caller may have polled moments before while the
-operator was still deciding. If the real `TradeGatewayPort` can't yet answer that query
-safely, `LegacyBroker.query_open_orders` raises `OrderQueryNotReadyError` whenever the broker's
-report query hasn't completed yet or an order's status is unresolved (see
-`infrastructure.yuanta.legacy_broker`) — that propagates as a blocked switch rather
-than a silent unsafe assumption.
+The controlled master supplies expiry dates, including holiday adjustments. Auto
+selection considers March/June/September/December and rolls at the expiry-day 13:30
+Taiwan cutoff. Rechecking an unchanged contract does not publish events or clear bars.
 """
 
 from __future__ import annotations
@@ -57,6 +39,7 @@ from tfx_quant.application.ports.yuanta_gateways import (
 )
 from tfx_quant.domain.contract import ContractMonth
 from tfx_quant.domain.instrument import Instrument
+from tfx_quant.domain.instrument_master import InstrumentMasterEntry
 from tfx_quant.domain.order import Order
 from tfx_quant.domain.position import Position
 from tfx_quant.domain.strategy_state import StrategyState, StrategyStateMachine
@@ -134,6 +117,7 @@ class InstrumentSelectionService:
         self._event_publisher = event_publisher
         self._broker_session_ready = broker_session_ready or (lambda: True)
         self._current: ResolvedSelection | None = None
+        self.auto_refresh_error: str | None = None
 
     @property
     def current(self) -> ResolvedSelection | None:
@@ -173,44 +157,62 @@ class InstrumentSelectionService:
         return ResolvedSelection(instrument=instrument, contract=contract, entry=entry)
 
     def resolve_near_month(self, instrument: Instrument) -> ResolvedSelection:
-        """AUTO mode: the nearest tradable, unexpired contract for `instrument`, per
-        the controlled master file — never a computed/guessed month. Per Feature 03's
-        acceptance criteria, the caller must still show this to the operator and
-        obtain confirmation before it's applied via `switch_to()`."""
-        as_of_date = self._clock.now().value.date()
-        candidates = sorted(
-            (
-                entry
-                for entry in self._instrument_master.list_for(instrument)
-                if entry.tradable and entry.expiry_date >= as_of_date
-            ),
-            key=lambda entry: (entry.contract.year, entry.contract.month),
-        )
-        log_info(
-            _logger,
-            "near_month_candidates_resolved",
-            instrument=instrument.value,
-            as_of_date=as_of_date.isoformat(),
-            candidate_contracts=[entry.contract.code for entry in candidates],
-        )
-        if not candidates:
-            log_warning(
-                _logger, "contract_resolution_rejected", mode="AUTO", instrument=instrument.value
-            )
-            raise InstrumentMasterEntryNotFoundError(
-                f"{instrument.display_name_zh}（{instrument.value}）目前無可交易之近月契約"
-                "，主檔可能缺漏或已全數到期"
-            )
-        entry = candidates[0]
+        """AUTO mode: nearest unexpired quarterly contract in the controlled master."""
+        entry = self._nearest_quarterly_entry(instrument)
         log_info(
             _logger,
             "contract_resolved",
             mode="AUTO",
             instrument=instrument.value,
             contract=entry.contract.code,
-            selection_reason="earliest tradable unexpired contract by (year, month)",
+            selection_reason="earliest tradable quarterly contract before expiry-day 13:30",
         )
         return ResolvedSelection(instrument=instrument, contract=entry.contract, entry=entry)
+
+    def _nearest_quarterly_entry(self, instrument: Instrument) -> InstrumentMasterEntry:
+        now = self._clock.now().value
+        candidates = sorted(
+            (
+                entry
+                for entry in self._instrument_master.list_for(instrument)
+                if entry.tradable
+                and entry.contract.month in (3, 6, 9, 12)
+                and now < entry.expires_at
+            ),
+            key=lambda entry: (entry.contract.year, entry.contract.month),
+        )
+        if not candidates:
+            raise InstrumentMasterEntryNotFoundError(
+                f"{instrument.display_name_zh}（{instrument.value}）目前無可交易之季月契約"
+                "，主檔可能缺漏或已全數到期"
+            )
+        return candidates[0]
+
+    def refresh_auto_selection(self) -> bool:
+        """Re-evaluate at scheduled rollover; pause a running strategy before switching.
+
+        Missing master data leaves the last selection visible with an explicit error.
+        """
+        current = self._current
+        if current is None:
+            return False
+        try:
+            entry = self._nearest_quarterly_entry(current.instrument)
+            if entry.contract == current.contract:
+                self.auto_refresh_error = None
+                return False
+            if self._strategy_state_machine.state is StrategyState.RUNNING:
+                self._strategy_state_machine.transition(StrategyState.PAUSED_SAFE)
+            self.switch_to(ResolvedSelection(current.instrument, entry.contract, entry))
+        except (InstrumentMasterEntryNotFoundError, SwitchBlockedError) as exc:
+            if self._strategy_state_machine.state is StrategyState.RUNNING:
+                self._strategy_state_machine.transition(StrategyState.PAUSED_SAFE)
+            if self.auto_refresh_error != str(exc):
+                log_warning(_logger, "contract_auto_refresh_failed", reason=str(exc))
+            self.auto_refresh_error = str(exc)
+            return False
+        self.auto_refresh_error = None
+        return True
 
     # -- Switching --------------------------------------------------------------
 
@@ -284,6 +286,7 @@ class InstrumentSelectionService:
         )
 
         self._current = resolved
+        self.auto_refresh_error = None
 
         if self._event_publisher is not None:
             self._event_publisher.publish(

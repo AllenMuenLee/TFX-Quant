@@ -17,6 +17,9 @@ from tfx_quant.application.events.events import (
     LatestPriceObserved,
     MarketDataFreshnessChanged,
 )
+from tfx_quant.application.instrument_selection.instrument_selection_service import (
+    InstrumentSelectionService,
+)
 from tfx_quant.application.instrument_selection.selection import ResolvedSelection
 from tfx_quant.application.ports.quote_gateway import (
     QuoteConnectionState,
@@ -28,7 +31,10 @@ from tfx_quant.domain.contract import ContractMonth
 from tfx_quant.domain.instrument import Instrument
 from tfx_quant.domain.instrument_master import InstrumentMasterEntry
 from tfx_quant.domain.market_data import MarketDataGap, RawMarketEvent
+from tfx_quant.domain.strategy_state import StrategyStateMachine
 from tfx_quant.domain.timestamp import TAIPEI_TZ, Timestamp
+from tfx_quant.infrastructure.bar_signal_state import InMemoryBarSignalStateStore
+from tfx_quant.infrastructure.yuanta.mock_trade_gateway import MockTradeGateway
 from tfx_quant.persistence.sqlite_bar_record_repository import SqliteBarRecordRepository
 from tfx_quant.persistence.sqlite_market_event_repository import SqliteMarketEventRepository
 
@@ -70,7 +76,7 @@ class _Clock:
 
 
 class _Selection:
-    """Only the two members `QuoteRuntime` reads off the selection service."""
+    """Selection stub for tests unrelated to automatic rollover."""
 
     def __init__(self, instrument: Instrument) -> None:
         self.current: ResolvedSelection | None = ResolvedSelection(
@@ -95,6 +101,19 @@ class _Calendar:
 
     def get_early_closes(self) -> dict[date, time]:
         return {}
+
+
+class _QuarterlyMaster(_Master):
+    def get(self, instrument: Instrument, contract: ContractMonth) -> InstrumentMasterEntry:
+        entry = _entry(instrument, contract)
+        if contract.month == 12:
+            return replace(
+                entry, vendor_symbol=f"{instrument.value}L6", expiry_date=date(2026, 12, 16)
+            )
+        return entry
+
+    def list_for(self, instrument: Instrument) -> Sequence[InstrumentMasterEntry]:
+        return [self.get(instrument, _CONTRACT), self.get(instrument, ContractMonth(2026, 12))]
 
 
 class _Gateway:
@@ -185,6 +204,47 @@ class _Harness:
                 vendor_symbol=_SYMBOLS[instrument],
             )
         )
+
+
+@pytest.mark.parametrize("charted", list(Instrument))
+def test_runtime_rolls_both_quote_subscriptions_before_night_open(charted: Instrument) -> None:
+    h = _Harness(datetime(2026, 9, 16, 13, 29, 59, tzinfo=TAIPEI_TZ), charted=charted)
+    master = _QuarterlyMaster()
+    store = InMemoryBarSignalStateStore()
+    selection = InstrumentSelectionService(
+        strategy_state_machine=StrategyStateMachine(),
+        trade_gateway=MockTradeGateway(),
+        instrument_master=master,
+        bar_signal_state_store=store,
+        clock=h.clock,
+        event_publisher=h.bus,
+    )
+    h.runtime._selection = selection
+    h.runtime._master = master
+    selection.switch_to(selection.resolve_near_month(charted))
+    h.login()
+    gateway = h.gateways[0]
+    assert set(gateway.subscriptions) == {"MXFI6", "TXFI6"}
+    h.runtime.refresh()
+    assert gateway.unsubscriptions == []
+
+    h.clock.value = datetime(2026, 9, 16, 13, 30, 2, tzinfo=TAIPEI_TZ)
+    h.runtime.refresh()
+    assert selection.current is not None
+    assert selection.current.contract == _CONTRACT
+    assert gateway.unsubscriptions == []
+    # The scheduled rollover publishes the signal; ordinary quote refresh does not.
+    assert selection.refresh_auto_selection() is True
+    assert selection.current is not None
+    assert selection.current.instrument == charted
+    assert selection.current.contract == ContractMonth(2026, 12)
+    assert set(h.runtime.recorded_symbols) == {"MXFL6", "TXFL6"}
+    assert sorted(gateway.unsubscriptions) == ["MXFI6", "TXFI6"]
+    assert sorted(gateway.subscriptions) == ["MXFI6", "MXFL6", "TXFI6", "TXFL6"]
+    assert h.runtime.forming_bar is None
+    h.runtime.refresh()
+    assert len(gateway.subscriptions) == 4
+    assert len(store.clear_calls) == 2
 
 
 def test_login_registers_and_records_both_markets_at_once() -> None:

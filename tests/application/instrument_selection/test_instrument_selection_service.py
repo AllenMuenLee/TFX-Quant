@@ -39,8 +39,11 @@ _NOW = Timestamp(datetime.fromisoformat("2026-08-18T10:00:00").replace(tzinfo=TA
 
 
 class FakeClock:
+    def __init__(self, value: Timestamp = _NOW) -> None:
+        self.value = value
+
     def now(self) -> Timestamp:
-        return _NOW
+        return self.value
 
 
 class RecordingEventPublisher:
@@ -308,3 +311,98 @@ def test_switch_to_works_with_real_event_coordinator(tmp_path: Path) -> None:
         service.switch_to(resolved)
     finally:
         coordinator.stop(timeout=1.0)
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "expected_before", "expected_after"),
+    [
+        ("2026-03-18T13:29:59", "2026-03-18T13:30:00", "202603", "202606"),
+        ("2026-06-17T13:29:59", "2026-06-17T13:30:00", "202606", "202609"),
+        ("2026-09-16T13:29:59", "2026-09-16T13:30:00", "202609", "202612"),
+        ("2026-12-16T13:29:59", "2026-12-16T13:30:00", "202612", "202703"),
+    ],
+)
+def test_quarterly_rollover_at_taiwan_cutoff(
+    tmp_path: Path, before: str, after: str, expected_before: str, expected_after: str
+) -> None:
+    dates = [
+        ("202603", "2026-03-18"),
+        ("202606", "2026-06-17"),
+        ("202609", "2026-09-16"),
+        ("202610", "2026-10-21"),
+        ("202612", "2026-12-16"),
+        ("202703", "2027-03-17"),
+    ]
+    clock = FakeClock(Timestamp(datetime.fromisoformat(before).replace(tzinfo=TAIPEI_TZ)))
+    machine = StrategyStateMachine()
+    publisher = RecordingEventPublisher()
+    store = InMemoryBarSignalStateStore()
+    service = InstrumentSelectionService(
+        strategy_state_machine=machine,
+        trade_gateway=MockTradeGateway(),
+        instrument_master=_write_repo(
+            tmp_path,
+            [
+                _entry_dict("MXF", ContractMonth.from_code(code), multiplier="50", expiry=expiry)
+                for code, expiry in dates
+            ],
+        ),
+        bar_signal_state_store=store,
+        clock=clock,
+        event_publisher=publisher,
+    )
+    service.switch_to(service.resolve_near_month(Instrument.MXF))
+    assert service.current is not None
+    assert service.current.contract.code == expected_before
+    assert service.refresh_auto_selection() is False
+    machine.transition(StrategyState.STARTING)
+    machine.transition(StrategyState.RUNNING)
+    clock.value = Timestamp(datetime.fromisoformat(after).replace(tzinfo=TAIPEI_TZ))
+    assert service.refresh_auto_selection() is True
+    assert service.current.contract.code == expected_after
+    assert machine.state is StrategyState.PAUSED_SAFE
+    assert service.refresh_auto_selection() is False
+    assert len(publisher.events) == 2
+    assert len(store.clear_calls) == 2
+
+
+def test_runtime_missing_next_contract_is_visible_and_pauses(tmp_path: Path) -> None:
+    clock = FakeClock()
+    machine = StrategyStateMachine()
+    service = InstrumentSelectionService(
+        strategy_state_machine=machine,
+        trade_gateway=MockTradeGateway(),
+        instrument_master=_master_repo(tmp_path),
+        bar_signal_state_store=InMemoryBarSignalStateStore(),
+        clock=clock,
+    )
+    # TXF has no December entry in this controlled master.
+    service.switch_to(service.resolve_near_month(Instrument.TXF))
+    original = service.current
+    machine.transition(StrategyState.STARTING)
+    machine.transition(StrategyState.RUNNING)
+    clock.value = Timestamp(datetime(2026, 9, 16, 13, 30, tzinfo=TAIPEI_TZ))
+    assert service.refresh_auto_selection() is False
+    assert service.current == original
+    assert service.auto_refresh_error is not None
+    assert machine.state is StrategyState.PAUSED_SAFE
+
+
+def test_auto_selection_honors_adjusted_master_expiry(tmp_path: Path) -> None:
+    clock = FakeClock(Timestamp(datetime(2026, 9, 16, 15, tzinfo=TAIPEI_TZ)))
+    service = InstrumentSelectionService(
+        strategy_state_machine=StrategyStateMachine(),
+        trade_gateway=MockTradeGateway(),
+        instrument_master=_write_repo(
+            tmp_path,
+            [
+                _entry_dict("MXF", _MXF_CONTRACT, multiplier="50", expiry="2026-09-17"),
+                _entry_dict("MXF", _MXF_DEC_CONTRACT, multiplier="50", expiry="2026-12-16"),
+            ],
+        ),
+        bar_signal_state_store=InMemoryBarSignalStateStore(),
+        clock=clock,
+    )
+    assert service.resolve_near_month(Instrument.MXF).contract == _MXF_CONTRACT
+    clock.value = Timestamp(datetime(2026, 9, 17, 13, 30, tzinfo=TAIPEI_TZ))
+    assert service.resolve_near_month(Instrument.MXF).contract == _MXF_DEC_CONTRACT

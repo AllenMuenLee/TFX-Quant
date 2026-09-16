@@ -127,7 +127,9 @@ class QuoteRuntime:
         if current is None:
             return None
         stream = self._streams.get(current.instrument)
-        return None if stream is None else stream.aggregator.forming_bar
+        if stream is None or stream.contract != current.contract:
+            return None
+        return stream.aggregator.forming_bar
 
     @property
     def recorded_symbols(self) -> tuple[str, ...]:

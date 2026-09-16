@@ -29,7 +29,7 @@ def validate_can_open(entry: InstrumentMasterEntry | None, *, as_of: Timestamp) 
         reason = "商品主檔缺漏，禁止建倉"
     elif not entry.tradable:
         reason = f"{entry.vendor_symbol} 已停止交易，禁止建倉"
-    elif entry.expiry_date < as_of.value.date():
+    elif as_of.value >= entry.expires_at:
         reason = f"{entry.vendor_symbol} 契約已到期（{entry.expiry_date}），禁止建倉"
     else:
         reason = None
