@@ -19,7 +19,7 @@ def _display_contract(contract: ContractMonth) -> str:
 class InstrumentSelectionPanel(wx.Panel):
     """Switches only the displayed/subscribed quote product.
 
-    Contract selection is the controlled master's nearest tradable quarterly month. The
+    Contract selection is the controlled master's nearest tradable contract month. The
     operator can choose the quote product, but never a contract month. Trading remains
     independently constrained to MXF at the order boundary.
     """
@@ -60,7 +60,7 @@ class InstrumentSelectionPanel(wx.Panel):
         except InstrumentSelectionError as exc:
             self._status.SetLabel(str(exc))
             return
-        self._status.SetLabel(f"契約年月：{_display_contract(resolved.contract)}（自動季月）")
+        self._status.SetLabel(f"契約年月：{_display_contract(resolved.contract)}（自動近月）")
 
     def refresh(self) -> None:
         current = self._services.instrument_selection.current
@@ -69,5 +69,5 @@ class InstrumentSelectionPanel(wx.Panel):
             return
         self._instrument_choice.SetSelection(_INSTRUMENTS.index(current.instrument))
         error = self._services.instrument_selection.auto_refresh_error
-        suffix = f"（更新失敗：{error}）" if error else "（自動季月）"
+        suffix = f"（更新失敗：{error}）" if error else "（自動近月）"
         self._status.SetLabel(f"契約年月：{_display_contract(current.contract)}{suffix}")

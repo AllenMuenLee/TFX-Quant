@@ -6,12 +6,12 @@ position of 2 lots and no overnight positions (flat by 04:55 Asia/Taipei daily).
 UI's MXF/TXF switch only changes which instrument's market data is *watched*, never
 what is *traded*.
 
-The displayed 契約年月 automatically selects the nearest tradable **quarterly**
-contract (March, June, September, December). While the app is open, a one-shot timer
+The displayed 契約年月 automatically selects the nearest tradable **near-month**
+contract across all contract months. While the app is open, a one-shot timer
 updates the contract at **13:30 Asia/Taipei on the expiry date**, before the 15:00
 night session. The contract-change event updates the UI and both quote subscriptions;
 normal market-data refreshes do not recalculate the contract. For
-example, 2026-09 changes to 2026-12 on September 16, 2026. Expiry dates normally fall
+example, 2026-09 changes to 2026-10 on September 16, 2026. Expiry dates normally fall
 on the third Wednesday; the controlled instrument master remains authoritative for
 holiday adjustments. A running strategy is safely paused before rollover and must
 be restarted manually. Missing next-contract master data is shown beside 契約年月;

@@ -1,6 +1,6 @@
 """InstrumentSelectionService — the switch/selection workflow for Feature 03.
 
-Manual switches require a stopped or safely paused strategy. Automatic quarterly
+Manual switches require a stopped or safely paused strategy. Automatic near-month
 rollover first pauses a running strategy, then uses the same switch workflow. It
 never restarts the strategy, changes existing positions, or submits orders.
 This service itself never touches the quote-gateway registration directly — publishing
@@ -13,7 +13,7 @@ a switch changes the live registration only when it also changes a contract mont
 per-(instrument, contract) engine state.
 
 The controlled master supplies expiry dates, including holiday adjustments. Auto
-selection considers March/June/September/December and rolls at the expiry-day 13:30
+selection considers every contract month and rolls at the expiry-day 13:30
 Taiwan cutoff. Rechecking an unchanged contract does not publish events or clear bars.
 """
 
@@ -157,33 +157,31 @@ class InstrumentSelectionService:
         return ResolvedSelection(instrument=instrument, contract=contract, entry=entry)
 
     def resolve_near_month(self, instrument: Instrument) -> ResolvedSelection:
-        """AUTO mode: nearest unexpired quarterly contract in the controlled master."""
-        entry = self._nearest_quarterly_entry(instrument)
+        """AUTO mode: nearest tradable unexpired contract in the controlled master."""
+        entry = self._nearest_tradable_entry(instrument)
         log_info(
             _logger,
             "contract_resolved",
             mode="AUTO",
             instrument=instrument.value,
             contract=entry.contract.code,
-            selection_reason="earliest tradable quarterly contract before expiry-day 13:30",
+            selection_reason="earliest tradable contract before expiry-day 13:30",
         )
         return ResolvedSelection(instrument=instrument, contract=entry.contract, entry=entry)
 
-    def _nearest_quarterly_entry(self, instrument: Instrument) -> InstrumentMasterEntry:
+    def _nearest_tradable_entry(self, instrument: Instrument) -> InstrumentMasterEntry:
         now = self._clock.now().value
         candidates = sorted(
             (
                 entry
                 for entry in self._instrument_master.list_for(instrument)
-                if entry.tradable
-                and entry.contract.month in (3, 6, 9, 12)
-                and now < entry.expires_at
+                if entry.tradable and now < entry.expires_at
             ),
             key=lambda entry: (entry.contract.year, entry.contract.month),
         )
         if not candidates:
             raise InstrumentMasterEntryNotFoundError(
-                f"{instrument.display_name_zh}（{instrument.value}）目前無可交易之季月契約"
+                f"{instrument.display_name_zh}（{instrument.value}）目前無可交易之近月契約"
                 "，主檔可能缺漏或已全數到期"
             )
         return candidates[0]
@@ -197,7 +195,7 @@ class InstrumentSelectionService:
         if current is None:
             return False
         try:
-            entry = self._nearest_quarterly_entry(current.instrument)
+            entry = self._nearest_tradable_entry(current.instrument)
             if entry.contract == current.contract:
                 self.auto_refresh_error = None
                 return False
