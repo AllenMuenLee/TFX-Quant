@@ -251,7 +251,11 @@ class TradingActivityPanel(wx.Panel):
                         "—",
                         "—",
                         "—",
-                        "歷史推算・未實際成交",
+                        (
+                            "歷史模擬・成交處理中"
+                            if services.simulation
+                            else "歷史推算・未實際成交"
+                        ),
                         candidate.decision.reason,
                     ],
                     False,
@@ -269,7 +273,12 @@ class TradingActivityPanel(wx.Panel):
         total = "—" if positions.total_pnl is None else f"{positions.total_pnl:,.0f}"
         self._summary.SetLabel(
             f"已實現 {positions.realized_pnl:,.0f}　未實現 {_money(positions.unrealized_pnl)}　"
-            f"總計 {total}{marker}　歷史推算：目前商品／契約，假設訊號價成交，不計入損益"
+            f"總計 {total}{marker}　"
+            + (
+                "歷史模擬：訊號依序成交並計入模擬庫存／損益"
+                if services.simulation
+                else "歷史推算：目前商品／契約，假設訊號價成交，不計入損益"
+            )
         )
         self._resize_history()
 

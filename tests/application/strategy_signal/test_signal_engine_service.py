@@ -36,7 +36,7 @@ _INSTRUMENT = Instrument.MXF
 _CONTRACT = ContractMonth(year=2026, month=9)
 _MA_WINDOW = 20
 _FLAT_LOOKBACK = 5
-_WARMUP = _MA_WINDOW + _FLAT_LOOKBACK - 1
+_WARMUP = _MA_WINDOW + _FLAT_LOOKBACK
 
 
 class FakeEventBus:
@@ -111,7 +111,7 @@ def _bars(
 def _rising_warmup_plus_entry(
     *, extra_closes: list[str] | None = None, extra_opens: list[str] | None = None
 ) -> list[Bar]:
-    """39-bar warm-up (arithmetic ramp, step 10 => MA slope UP, 5-MA range 40 => not
+    """25-bar warm-up (arithmetic ramp, step 10 => MA slope UP, 5-MA range 40 => not
     choppy) plus two closing RED bars, closing at 10:45 — a full ENTER_LONG fixture."""
     warmup = [str(Decimal("10000") + Decimal("10") * i) for i in range(_WARMUP - 2)]
     tail_closes = ["10370", "10380"]
@@ -208,7 +208,7 @@ def test_unconfirmed_bar_used_by_ma_lookback_blocks_until_it_rolls_out() -> None
 
     _svc, gateway, _repo, bus, _clock = _service(reviewed)
     _publish_bars(bus, bars)
-    assert len(windows[-1]) == _MA_WINDOW + _FLAT_LOOKBACK - 1
+    assert len(windows[-1]) == _MA_WINDOW + _FLAT_LOOKBACK
     assert gateway.submitted_orders == []
     last = bars[-1]
     _publish_bars(

@@ -293,14 +293,17 @@ class StrategySignalEngine:
         position_state_uncertain: bool,
         trigger: str,
     ) -> StrategyDecision:
+        # One current MA for slope/signal plus the *preceding* flatness window.  The
+        # trigger bar must not make an otherwise-flat prior five-bar window look wide.
         ma_values = moving_average_series(
-            self._closes, self._config.ma_window, self._config.flat_lookback
+            self._closes, self._config.ma_window, self._config.flat_lookback + 1
         )
         ma_current = ma_values[-1] if ma_values else None
         ma_previous = ma_values[-2] if len(ma_values) >= 2 else None
+        prior_ma_values = ma_values[:-1]
         ma_range = (
-            recent_range(ma_values[-self._config.flat_lookback :])
-            if len(ma_values) >= self._config.flat_lookback
+            recent_range(prior_ma_values[-self._config.flat_lookback :])
+            if len(prior_ma_values) >= self._config.flat_lookback
             else None
         )
         ctx = _EvalContext(
@@ -317,7 +320,7 @@ class StrategySignalEngine:
             ma_sample_count=len(self._closes),
             ma_range=ma_range,
             ma_is_choppy=is_choppy(
-                ma_values,
+                prior_ma_values,
                 lookback=self._config.flat_lookback,
                 threshold=self._config.flat_threshold_points,
             ),
@@ -458,6 +461,17 @@ class StrategySignalEngine:
                 signal_kind=None,
                 reason="20MA樣本不足（未滿20根）",
             )
+        if ctx.ma_range is None:
+            return self._make(
+                ctx,
+                rule="no_signal",
+                passed=False,
+                signal_kind=None,
+                reason=(
+                    f"近{self._config.flat_lookback}根20MA樣本不足，"
+                    "無法判斷均線走平，禁止新進場或加碼"
+                ),
+            )
         if ctx.ma_is_choppy:
             return self._make(
                 ctx,
@@ -465,7 +479,7 @@ class StrategySignalEngine:
                 passed=False,
                 signal_kind=None,
                 reason=(
-                    f"均線走平（近5根20MA幅度 {ctx.ma_range} < "
+                    f"均線走平（觸發棒前5根20MA幅度 {ctx.ma_range} < "
                     f"{self._config.flat_threshold_points}）"
                 ),
             )

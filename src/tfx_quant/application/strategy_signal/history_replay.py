@@ -1,4 +1,4 @@
-"""Read-only counterfactual replay. Never connects to orders, fills, or an event bus."""
+"""Deterministic history replay used by the simulation execution path."""
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -25,6 +25,15 @@ class HistoricalTrade:
     quantity: int
 
 
+@dataclass(frozen=True)
+class HistoricalReplay:
+    """Replay output plus the fully warmed strategy state after assumed fills."""
+
+    trades: tuple[HistoricalTrade, ...]
+    engine: StrategySignalEngine | None
+    review_bars: tuple[BarRecord, ...]
+
+
 def replay_history(
     records: Sequence[BarRecord],
     next_close: Callable[[Timestamp], Timestamp],
@@ -33,12 +42,23 @@ def replay_history(
     """Start flat, assume immediate fills at signal prices, restart after unknown data.
 
     Session breaks preserve state; missing/incomplete bars reset the replay and its
-    warmup. Each result is hypothetical, even when a matching execution exists.
+    warmup. The returned candidates do not cause side effects by themselves; TEST
+    composition explicitly hands them to ``HistoricalSimulationService`` for execution.
     """
+    return replay_history_state(records, next_close, config).trades
+
+
+def replay_history_state(
+    records: Sequence[BarRecord],
+    next_close: Callable[[Timestamp], Timestamp],
+    config: EngineConfig | None = None,
+) -> HistoricalReplay:
+    """Replay history and retain the final warmed engine for simulation continuation."""
     config = config or EngineConfig()
     results: list[HistoricalTrade] = []
     engine: StrategySignalEngine | None = None
     previous: BarRecord | None = None
+    review_records: list[BarRecord] = []
 
     def accept(record: BarRecord, decision: StrategyDecision) -> None:
         if not decision.passed or decision.signal_kind is None:
@@ -55,7 +75,8 @@ def replay_history(
             )
             quantity = 1
         results.append(HistoricalTrade(record, decision, side, quantity))
-        # This engine is private to the replay; these fills never enter the live ledger.
+        # Keep replay decisions stateful. TEST composition separately persists the same
+        # assumed fills through the simulator; production merely displays candidates.
         engine.on_fill_confirmed(
             side=side, price=decision.current_price, quantity=quantity, at=decision.at
         )
@@ -63,12 +84,14 @@ def replay_history(
     for record in records:
         if record.bar.instrument is not Instrument.MXF or not record.is_complete:
             engine, previous = None, None
+            review_records = []
             continue
         if previous is not None and (
             previous.bar.contract != record.bar.contract
             or next_close(previous.bar.end) != record.bar.end
         ):
             engine, previous = None, None
+            review_records = []
         if engine is None:
             engine = StrategySignalEngine(
                 instrument=record.bar.instrument, contract=record.bar.contract, config=config
@@ -99,4 +122,13 @@ def replay_history(
             ),
         )
         previous = record
-    return tuple(results)
+        review_records.append(record)
+    return HistoricalReplay(tuple(results), engine, tuple(review_records))
+
+
+__all__ = [
+    "HistoricalReplay",
+    "HistoricalTrade",
+    "replay_history",
+    "replay_history_state",
+]

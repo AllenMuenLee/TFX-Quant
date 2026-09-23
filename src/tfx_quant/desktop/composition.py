@@ -45,6 +45,9 @@ from tfx_quant.application.settings.trading_settings import (
     TradingSettings,
     validate_startup,
 )
+from tfx_quant.application.strategy_signal.historical_simulation_service import (
+    HistoricalSimulationService,
+)
 from tfx_quant.application.strategy_signal.signal_engine_service import (
     StrategySignalEngineService,
 )
@@ -71,6 +74,7 @@ from tfx_quant.infrastructure.market_data.trading_calendar_repository import (
 from tfx_quant.infrastructure.yuanta.instrument_master_repository import (
     JsonInstrumentMasterRepository,
 )
+from tfx_quant.infrastructure.yuanta.mock_trade_gateway import MockTradeGateway
 from tfx_quant.infrastructure.yuanta.preflight import raise_if_any_failed, run_preflight_checks
 from tfx_quant.persistence.sqlite_bar_record_repository import SqliteBarRecordRepository
 from tfx_quant.persistence.sqlite_connection import create_connection
@@ -152,6 +156,7 @@ class ServiceContainer:
     position_valuation_service: PositionValuationService
     order_repository: OrderRepository
     audit_timeline_reader: Callable[[str], tuple[AuditTimelineStep, ...]]
+    historical_simulation_service: HistoricalSimulationService | None = None
     simulation: bool = False
     """`True` in the 測試環境 (`settings.environment is Environment.TEST`): the trade
     adapter is the local simulator and never sends anything to a server; market data is
@@ -365,6 +370,7 @@ def build_services(
 
     trade_gateway: TradeGatewayPort
     broker_session: IBrokerSession
+    local_simulator: MockTradeGateway | None = None
     # Trade adapter selection is driven purely by `settings.environment`:
     #   PRODUCTION -> the real Yuanta OCX broker (real trade server). A preflight failure
     #                 fails loudly here, never a silent mock fallback (ADR 0004).
@@ -376,9 +382,12 @@ def build_services(
         trade_gateway, broker_session = overrides.broker_factory(event_coordinator)
     elif is_test_env:
         from tfx_quant.infrastructure.yuanta.mock_broker_session import MockBrokerSession
-        from tfx_quant.infrastructure.yuanta.mock_trade_gateway import MockTradeGateway
 
-        trade_gateway = MockTradeGateway(event_publisher=event_coordinator)
+        local_simulator = MockTradeGateway(
+            event_publisher=event_coordinator,
+            track_positions_from_fills=True,
+        )
+        trade_gateway = local_simulator
         broker_session = MockBrokerSession(event_publisher=event_coordinator)
     else:
         log_info(_logger, "preflight_checks_started")
@@ -655,6 +664,18 @@ def build_services(
     )
     bar_signal_state_store.add(signal_engine_service)
 
+    historical_simulation_service: HistoricalSimulationService | None = None
+    if local_simulator is not None:
+        historical_simulation_service = HistoricalSimulationService(
+            order_manager=order_manager,
+            order_repository=order_repository,
+            gateway=local_simulator,
+            event_bus=event_coordinator,
+            selected_account=lambda: broker_session.selected_account,
+            replay_installed=signal_engine_service.install_historical_replay,
+        )
+        quote_runtime.set_historical_replay_handler(historical_simulation_service.sync)
+
     log_info(_logger, "module_load_completed")
     return ServiceContainer(
         settings=settings,
@@ -680,6 +701,7 @@ def build_services(
         position_valuation_service=position_valuation_service,
         order_repository=order_repository,
         audit_timeline_reader=_audit_timeline_reader,
+        historical_simulation_service=historical_simulation_service,
         simulation=simulation_flag,
     )
 

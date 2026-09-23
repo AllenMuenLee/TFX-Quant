@@ -58,6 +58,7 @@ from tfx_quant.application.order_management.errors import (
 from tfx_quant.application.order_management.order_manager import OrderManager, OrderRequest
 from tfx_quant.application.ports.clock import Clock
 from tfx_quant.application.ports.order_repository import OrderRepository
+from tfx_quant.application.strategy_signal.history_replay import HistoricalReplay
 from tfx_quant.domain.account import TradingAccount
 from tfx_quant.domain.bar import Bar
 from tfx_quant.domain.contract import ContractMonth
@@ -190,6 +191,33 @@ class StrategySignalEngineService:
             contract=contract.code,
         )
 
+    def install_historical_replay(self, replay: HistoricalReplay) -> None:
+        """Continue live TEST simulation from the replay's confirmed-fill state.
+
+        Composition exposes this only to ``HistoricalSimulationService`` after every
+        queued historical order has actually reached FILLED.  Production never calls it.
+        """
+        if replay.engine is None or not replay.review_bars:
+            return
+        last = replay.review_bars[-1].bar
+        key = (last.instrument, last.contract)
+        config = self._engine_config or EngineConfig()
+        max_review = config.ma_window + max(2, config.flat_lookback)
+        with self._lock:
+            self._engines[key] = replay.engine
+            self._review_windows[key] = [
+                record.bar for record in replay.review_bars[-max_review:]
+            ]
+        log_info(
+            _logger,
+            "strategy_signal_engine_history_installed",
+            instrument=last.instrument.value,
+            contract=last.contract.code,
+            replay_trade_count=len(replay.trades),
+            position_side=replay.engine.position_side.value,
+            position_lots=len(replay.engine.lots),
+        )
+
     # -- Lifecycle: the 04:55 clock-tick trigger -------------------------------------------
 
     def start(self) -> None:
@@ -268,8 +296,9 @@ class StrategySignalEngineService:
             config = self._engine_config or EngineConfig()
             window = self._review_windows.setdefault(key, [])
             window.append(event.bar)
-            # Include every close used by the current MA, slope and flatness lookback.
-            del window[: max(0, len(window) - config.ma_window - max(2, config.flat_lookback) + 1)]
+            # Include the current MA plus every close used by the preceding flatness
+            # lookback. With 20MA / five prior values this is 25 closes.
+            del window[: max(0, len(window) - config.ma_window - max(2, config.flat_lookback))]
             reviewed = (
                 self._bars_reviewed(window)
                 if self._bars_reviewed is not None

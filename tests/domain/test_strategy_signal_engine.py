@@ -24,7 +24,7 @@ _INSTRUMENT = Instrument.TXF
 _CONTRACT = ContractMonth(year=2026, month=9)
 _MA_WINDOW = 20
 _FLAT_LOOKBACK = 5
-_WARMUP = _MA_WINDOW + _FLAT_LOOKBACK - 1  # 24: enough closes for 5 full MA values
+_WARMUP = _MA_WINDOW + _FLAT_LOOKBACK  # 25: current MA plus 5 preceding MA values
 
 
 def _engine(config: EngineConfig | None = None) -> StrategySignalEngine:
@@ -182,6 +182,22 @@ def test_choppy_ma_blocks_entry_even_with_valid_streak_and_slope() -> None:
     assert decision.ma_recent_range == Decimal("8")
 
 
+def test_flat_previous_five_ma_values_cannot_be_hidden_by_trigger_bar_jump() -> None:
+    engine = _engine()
+    # The five MA values before the trigger are identical. The trigger bar itself jumps
+    # enough that the old inclusive window had range >= 10 and incorrectly allowed entry.
+    closes = ["10000"] * (_WARMUP - 1) + ["10200"]
+    opens = closes[:-2] + ["9999", "10000"]
+
+    decision = _feed(engine, _bars(closes, opens=opens))
+
+    assert decision is not None
+    assert decision.ma_slope is MaSlope.UP
+    assert decision.ma_recent_range == Decimal("0")
+    assert decision.ma_is_choppy is True
+    assert decision.signal_kind is None
+
+
 def test_ma_range_exactly_10_is_not_choppy() -> None:
     engine = _engine()
     # Step of 2.5 => range == 4*2.5 == 10 exactly — boundary is NOT choppy per spec.
@@ -204,6 +220,26 @@ def test_insufficient_ma_samples_blocks_entry() -> None:
     assert decision is not None
     assert decision.ma_value is None
     assert decision.signal_kind is None
+
+
+@pytest.mark.parametrize("close_count", range(_MA_WINDOW, _WARMUP))
+def test_incomplete_five_ma_lookback_blocks_entry(close_count: int) -> None:
+    """20MA exists after 20 closes, but five prior 20MA values need 25 closes.
+
+    Missing flatness history is unknown, not evidence that the MA is non-choppy.
+    """
+    engine = _engine()
+    closes = _ramp_closes(close_count, start="10000", step="10")
+    opens = closes[:-2] + [str(Decimal(closes[-2]) - 5), str(Decimal(closes[-1]) - 5)]
+
+    decision = _feed(engine, _bars(closes, opens=opens))
+
+    assert decision is not None
+    assert decision.ma_value is not None
+    assert decision.ma_recent_range is None
+    assert decision.ma_is_choppy is False
+    assert decision.signal_kind is None
+    assert "近5根20MA樣本不足" in decision.reason
 
 
 # -- Entry time gate: 08:45/09:45 no-entry, 10:45 earliest allowed -----------------------------

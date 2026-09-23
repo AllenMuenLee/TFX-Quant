@@ -36,7 +36,11 @@ from tfx_quant.application.ports.instrument_master import InstrumentMasterReposi
 from tfx_quant.application.ports.market_event_repository import MarketEventRepository
 from tfx_quant.application.ports.quote_gateway import QuoteConnectionState, QuoteGateway
 from tfx_quant.application.ports.trading_calendar import TradingCalendarRepository
-from tfx_quant.application.strategy_signal.history_replay import HistoricalTrade, replay_history
+from tfx_quant.application.strategy_signal.history_replay import (
+    HistoricalReplay,
+    HistoricalTrade,
+    replay_history_state,
+)
 from tfx_quant.domain.bar import Bar
 from tfx_quant.domain.bar_record import BarDataSource, BarPeriod, BarRecord, rolling_two_month_start
 from tfx_quant.domain.contract import ContractMonth
@@ -100,6 +104,8 @@ class QuoteRuntime:
         self._event_count = 0
         self._history_replay_input: tuple[BarRecord, ...] = ()
         self._history_replay_result: tuple[HistoricalTrade, ...] = ()
+        self._history_replay_snapshot = HistoricalReplay((), None, ())
+        self._historical_replay_handler: Callable[[HistoricalReplay], None] | None = None
         # Mark-to-market feed: at most one `LatestPriceObserved` per second per instrument.
         self._last_price_at: dict[Instrument, Timestamp] = {}
         self._gapped: set[Instrument] = set()
@@ -274,16 +280,30 @@ class QuoteRuntime:
         return min(candidates, key=lambda ts: abs((ts.value - close.value).total_seconds()))
 
     def historical_trades(self) -> tuple[HistoricalTrade, ...]:
-        """Derived history for the selected contract; edits invalidate the snapshot."""
+        """Derived history; TEST mode may execute it through the configured simulator."""
         records = tuple(
             record
             for record in self.query(date.min, self._clock.now().value.date())
             if record.bar.end.value <= self._clock.now().value
         )
         if records != self._history_replay_input:
-            result = replay_history(records, lambda end: self.adjacent_history_close(end, 1))
-            self._history_replay_input, self._history_replay_result = records, result
+            snapshot = replay_history_state(
+                records, lambda end: self.adjacent_history_close(end, 1)
+            )
+            self._history_replay_input = records
+            self._history_replay_snapshot = snapshot
+            self._history_replay_result = snapshot.trades
+        if self._historical_replay_handler is not None:
+            # Called even for an unchanged snapshot: the first UI read may happen before
+            # the TEST broker account is ready. The handler is idempotent by intent key.
+            self._historical_replay_handler(self._history_replay_snapshot)
         return self._history_replay_result
+
+    def set_historical_replay_handler(
+        self, handler: Callable[[HistoricalReplay], None] | None
+    ) -> None:
+        """Enable execution only when composition explicitly wires TEST simulation."""
+        self._historical_replay_handler = handler
 
     def history_hour(self, start: Timestamp) -> BarRecord | None:
         current = self._selection.current

@@ -21,7 +21,7 @@ from tfx_quant.domain.money import Price
 from tfx_quant.domain.order import ClientOrderId, Order
 from tfx_quant.domain.order_state_machine import OrderReport, OrderStatus
 from tfx_quant.domain.position import Position
-from tfx_quant.domain.quantity import Quantity
+from tfx_quant.domain.quantity import NetPosition, Quantity
 from tfx_quant.domain.side import Side
 from tfx_quant.domain.timestamp import Timestamp
 from tfx_quant.infrastructure.yuanta.event_publisher import EventPublisher
@@ -45,12 +45,15 @@ class MockTradeGateway:
         positions: Sequence[Position] = (),
         event_publisher: EventPublisher | None = None,
         on_submit: OnSubmit | None = None,
+        track_positions_from_fills: bool = False,
     ) -> None:
         self._logged_in = logged_in
         self._open_orders = list(open_orders)
         self._positions = list(positions)
         self._event_publisher: EventPublisher = event_publisher or _NullEventPublisher()
         self._on_submit = on_submit
+        self._track_positions_from_fills = track_positions_from_fills
+        self._position_fill_ids: set[str] = set()
         self._seq_counter = itertools.count(1)
         self._query_positions_error: Exception | None = None
 
@@ -128,13 +131,19 @@ class MockTradeGateway:
     # -- Scripting: order reports ----------------------------------------------------
 
     def simulate_ack(
-        self, client_order_id: ClientOrderId, broker_order_no: str, *, seq: int | None = None
+        self,
+        client_order_id: ClientOrderId,
+        broker_order_no: str,
+        *,
+        seq: int | None = None,
+        at: Timestamp | None = None,
     ) -> OrderReport:
         return self._publish_report(
             client_order_id,
             status=OrderStatus.ACKNOWLEDGED,
             broker_order_no=broker_order_no,
             seq=seq,
+            at=at,
         )
 
     def simulate_reject(
@@ -157,12 +166,13 @@ class MockTradeGateway:
         broker_order_no: str | None = None,
         reject_reason: str | None = None,
         seq: int | None = None,
+        at: Timestamp | None = None,
     ) -> OrderReport:
         report = OrderReport(
             client_order_id=client_order_id,
             status=status,
             broker_seq_no=seq if seq is not None else next(self._seq_counter),
-            at=Timestamp.now(),
+            at=at or Timestamp.now(),
             broker_order_no=broker_order_no,
             reject_reason=reject_reason,
         )
@@ -180,6 +190,7 @@ class MockTradeGateway:
         *,
         broker_fill_no: str,
         seq: int | None = None,
+        at: Timestamp | None = None,
     ) -> Fill:
         order = self._orders_by_client_id.get(client_order_id)
         instrument = order.instrument if order is not None else Instrument.MXF
@@ -190,14 +201,62 @@ class MockTradeGateway:
             side=side,
             quantity=Quantity(quantity),
             price=Price(price),
-            at=Timestamp.now(),
+            at=at or Timestamp.now(),
             broker_fill_no=broker_fill_no,
             broker_seq_no=seq if seq is not None else next(self._seq_counter),
         )
         self._fills.append(fill)
         self._last_fill = fill
+        if self._track_positions_from_fills and broker_fill_no not in self._position_fill_ids:
+            self._apply_fill_to_positions(order, fill)
+            self._position_fill_ids.add(broker_fill_no)
         self._event_publisher.publish(FillReceived(at=fill.at, fill=fill))
         return fill
+
+    def _apply_fill_to_positions(self, order: Order | None, fill: Fill) -> None:
+        if order is None:
+            return
+        match_index = next(
+            (
+                index
+                for index, position in enumerate(self._positions)
+                if position.account == order.account
+                and position.instrument == order.instrument
+                and position.contract == order.contract
+            ),
+            None,
+        )
+        existing = self._positions[match_index] if match_index is not None else None
+        prior = 0 if existing is None else existing.net.lots
+        delta = fill.quantity.lots if fill.side is Side.BUY else -fill.quantity.lots
+        updated = prior + delta
+        if updated == 0:
+            if match_index is not None:
+                del self._positions[match_index]
+            return
+        if existing is None or prior == 0 or (prior > 0) != (updated > 0):
+            average = fill.price
+        elif (prior > 0) == (delta > 0):
+            total = abs(prior) + abs(delta)
+            average = Price(
+                (existing.average_price.amount * abs(prior) + fill.price.amount * abs(delta))
+                / total
+            )
+        else:
+            assert existing.average_price is not None
+            average = existing.average_price
+        position = Position(
+            account=order.account,
+            instrument=order.instrument,
+            contract=order.contract,
+            net=NetPosition(updated),
+            average_price=average,
+            as_of=fill.at,
+        )
+        if match_index is None:
+            self._positions.append(position)
+        else:
+            self._positions[match_index] = position
 
     def replay_last_fill(self) -> Fill:
         """Re-publishes the exact last `FillReceived` — the duplicate-fill acceptance
