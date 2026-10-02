@@ -42,7 +42,6 @@ from tfx_quant.domain.instrument import Instrument
 from tfx_quant.domain.moving_average import (
     MaSlope,
     determine_slope,
-    is_choppy,
     moving_average_series,
     recent_range,
 )
@@ -51,7 +50,7 @@ from tfx_quant.domain.side import Side
 from tfx_quant.domain.signal import SignalKind
 from tfx_quant.domain.timestamp import Timestamp
 
-STRATEGY_VERSION = "1"
+STRATEGY_VERSION = "2"
 
 _DEFAULT_MA_WINDOW = 20
 _DEFAULT_FLAT_LOOKBACK = 5
@@ -119,6 +118,9 @@ class StrategyDecision:
     ma_slope: MaSlope
     ma_sample_count: int
     ma_recent_range: Decimal | None
+    ma_change: Decimal | None
+    ma_small_change_streak: int
+    ma_waiting_for_breakout: bool
     ma_is_choppy: bool
     entry_gate_open: bool
     data_reliable: bool
@@ -152,6 +154,9 @@ class _EvalContext:
     ma_slope: MaSlope
     ma_sample_count: int
     ma_range: Decimal | None
+    ma_change: Decimal | None
+    ma_small_change_streak: int
+    ma_waiting_for_breakout: bool
     ma_is_choppy: bool
     entry_gate_open: bool
 
@@ -183,6 +188,7 @@ class StrategySignalEngine:
         self._active_basis: Decimal | None = None
         self._profit_activated = False
         self._max_favorable: Decimal | None = None
+        self._waiting_for_ma_breakout = False
 
     # -- Position introspection (read-only; for callers/tests) --------------------------
 
@@ -257,6 +263,7 @@ class StrategySignalEngine:
                 self._position_side = PositionSide.LONG if side is Side.BUY else PositionSide.SHORT
             self._lots.append(LotFill(price=price, at=at))
             self._active_basis = price
+            self._waiting_for_ma_breakout = False
         else:
             self._closed_quantity += quantity
             if self._closed_quantity > len(self._lots):
@@ -293,19 +300,36 @@ class StrategySignalEngine:
         position_state_uncertain: bool,
         trigger: str,
     ) -> StrategyDecision:
-        # One current MA for slope/signal plus the *preceding* flatness window.  The
-        # trigger bar must not make an otherwise-flat prior five-bar window look wide.
+        # Current MA, the preceding flatness window, and one older MA to measure
+        # each of the preceding bars' one-bar changes.
         ma_values = moving_average_series(
-            self._closes, self._config.ma_window, self._config.flat_lookback + 1
+            self._closes, self._config.ma_window, self._config.flat_lookback + 2
         )
         ma_current = ma_values[-1] if ma_values else None
         ma_previous = ma_values[-2] if len(ma_values) >= 2 else None
+        ma_change = (
+            abs(ma_current - ma_previous)
+            if ma_current is not None and ma_previous is not None
+            else None
+        )
         prior_ma_values = ma_values[:-1]
         ma_range = (
             recent_range(prior_ma_values[-self._config.flat_lookback :])
             if len(prior_ma_values) >= self._config.flat_lookback
             else None
         )
+        small_change_streak = 0
+        ma_pairs = zip(reversed(ma_values[:-1]), reversed(ma_values[1:]), strict=True)
+        for previous, current in ma_pairs:
+            if abs(current - previous) >= self._config.flat_threshold_points:
+                break
+            small_change_streak += 1
+        if (
+            bar is not None
+            and data_reliable
+            and small_change_streak >= self._config.flat_lookback + 1
+        ):
+            self._waiting_for_ma_breakout = True
         ctx = _EvalContext(
             now=now,
             bar=bar,
@@ -319,10 +343,13 @@ class StrategySignalEngine:
             ma_slope=determine_slope(ma_current, ma_previous),
             ma_sample_count=len(self._closes),
             ma_range=ma_range,
-            ma_is_choppy=is_choppy(
-                prior_ma_values,
-                lookback=self._config.flat_lookback,
-                threshold=self._config.flat_threshold_points,
+            ma_change=ma_change,
+            ma_small_change_streak=small_change_streak,
+            ma_waiting_for_breakout=self._waiting_for_ma_breakout,
+            ma_is_choppy=(
+                self._waiting_for_ma_breakout
+                and ma_change is not None
+                and ma_change < self._config.flat_threshold_points
             ),
             entry_gate_open=self._is_entry_window(now),
         )
@@ -479,7 +506,7 @@ class StrategySignalEngine:
                 passed=False,
                 signal_kind=None,
                 reason=(
-                    f"均線走平（觸發棒前5根20MA幅度 {ctx.ma_range} < "
+                    f"均線走平後等待突破（當根20MA變化 {ctx.ma_change} < "
                     f"{self._config.flat_threshold_points}）"
                 ),
             )
@@ -656,6 +683,9 @@ class StrategySignalEngine:
             ma_slope=ctx.ma_slope,
             ma_sample_count=ctx.ma_sample_count,
             ma_recent_range=ctx.ma_range,
+            ma_change=ctx.ma_change,
+            ma_small_change_streak=ctx.ma_small_change_streak,
+            ma_waiting_for_breakout=ctx.ma_waiting_for_breakout,
             ma_is_choppy=ctx.ma_is_choppy,
             entry_gate_open=ctx.entry_gate_open,
             data_reliable=ctx.data_reliable,

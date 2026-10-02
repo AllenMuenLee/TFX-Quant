@@ -169,23 +169,24 @@ def test_wrong_slope_blocks_long_entry() -> None:
     assert decision.ma_slope is MaSlope.DOWN
 
 
-def test_choppy_ma_blocks_entry_even_with_valid_streak_and_slope() -> None:
+def test_five_small_ma_changes_do_not_yet_block_entry() -> None:
     engine = _engine()
-    # Step of 2 => last-5-MA range = 4*2 = 8 < 10 => choppy.
+    # Only five one-bar MA changes are available; the sixth has not occurred yet.
     closes = _ramp_closes(_WARMUP, start="10000", step="2")
     opens = closes[:-2] + ["9990", "9996"]  # last two bars RED
     bars = _bars(closes, opens=opens)
     decision = _feed(engine, bars)
     assert decision is not None
-    assert decision.signal_kind is None
-    assert decision.ma_is_choppy is True
+    assert decision.signal_kind is SignalKind.ENTER_LONG
+    assert decision.ma_small_change_streak == 5
+    assert decision.ma_waiting_for_breakout is False
+    assert decision.ma_is_choppy is False
     assert decision.ma_recent_range == Decimal("8")
 
 
-def test_flat_previous_five_ma_values_cannot_be_hidden_by_trigger_bar_jump() -> None:
+def test_ten_point_ma_change_allows_entry_despite_flat_prior_five_ma_values() -> None:
     engine = _engine()
-    # The five MA values before the trigger are identical. The trigger bar itself jumps
-    # enough that the old inclusive window had range >= 10 and incorrectly allowed entry.
+    # The old max-min gate would block this first qualifying 10-point change.
     closes = ["10000"] * (_WARMUP - 1) + ["10200"]
     opens = closes[:-2] + ["9999", "10000"]
 
@@ -193,21 +194,147 @@ def test_flat_previous_five_ma_values_cannot_be_hidden_by_trigger_bar_jump() -> 
 
     assert decision is not None
     assert decision.ma_slope is MaSlope.UP
+    assert decision.ma_change == Decimal("10")
     assert decision.ma_recent_range == Decimal("0")
+    assert decision.ma_is_choppy is False
+    assert decision.signal_kind is SignalKind.ENTER_LONG
+
+
+@pytest.mark.parametrize(("step", "expected_range"), [("-2.5", "10"), ("-3", "12")])
+def test_six_small_ma_changes_block_october_1_1700_short_entry(
+    step: str, expected_range: str
+) -> None:
+    engine = _engine()
+    closes = _ramp_closes(_WARMUP + 1, start="10000", step=step)
+    opens = closes[:-2] + [
+        str(Decimal(closes[-2]) + 5),
+        str(Decimal(closes[-1]) + 5),
+    ]
+    bars = _bars(
+        closes,
+        opens=opens,
+        final_start=datetime(2026, 10, 1, 16, 0, tzinfo=TAIPEI_TZ),
+    )
+
+    decision = _feed(engine, bars)
+
+    assert decision is not None
+    assert decision.bar_end == Timestamp(datetime(2026, 10, 1, 17, 0, tzinfo=TAIPEI_TZ))
+    assert decision.streak_length == 2
+    assert decision.ma_slope is MaSlope.DOWN
+    assert decision.ma_recent_range == Decimal(expected_range)  # old range gate permits this
+    assert decision.ma_small_change_streak == 6
+    assert decision.ma_waiting_for_breakout is True
+    assert decision.ma_change == abs(Decimal(step))
     assert decision.ma_is_choppy is True
+    assert decision.signal_kind is None
+    assert "等待突破" in decision.reason
+
+
+def test_six_small_ma_changes_also_block_add_on() -> None:
+    engine = _engine()
+    closes = _ramp_closes(_WARMUP + 1, start="10000", step="-2.5")
+    opens = closes[:-1] + [str(Decimal(closes[-1]) + 5)]
+    bars = _bars(closes, opens=opens)
+    _feed(engine, bars[:-1])
+    engine.on_fill_confirmed(
+        side=Side.SELL, price=Decimal(closes[-2]), quantity=1, at=bars[-2].end
+    )
+
+    decision = _feed(engine, bars[-1:])
+
+    assert decision.ma_small_change_streak == 6
+    assert decision.ma_recent_range == Decimal("10")
     assert decision.signal_kind is None
 
 
-def test_ma_range_exactly_10_is_not_choppy() -> None:
+def test_first_ten_point_ma_change_after_six_small_changes_can_enter() -> None:
     engine = _engine()
-    # Step of 2.5 => range == 4*2.5 == 10 exactly — boundary is NOT choppy per spec.
-    closes = _ramp_closes(_WARMUP, start="10000", step="2.5")
-    opens = closes[:-2] + [str(Decimal(closes[-2]) - 5), str(Decimal(closes[-1]) - 5)]
+    closes = _ramp_closes(_WARMUP + 1, start="10000", step="-2")
+    opens = closes[:-2] + [str(Decimal(value) + 5) for value in closes[-2:]]
+    bars = _bars(closes, opens=opens)
+    flat_decision = _feed(engine, bars)
+    assert flat_decision.ma_waiting_for_breakout is True
+    assert flat_decision.signal_kind is None
+
+    breakout_close = Decimal(closes[-20]) - 200
+    breakout_bar = _bars(
+        [str(breakout_close)],
+        opens=[str(breakout_close + 5)],
+        final_start=bars[-1].end.value,
+    )[0]
+    decision = _feed(engine, [breakout_bar])
+
+    assert decision.ma_change == Decimal("10")
+    assert decision.ma_recent_range < Decimal("10")
+    assert decision.ma_waiting_for_breakout is True
+    assert decision.ma_is_choppy is False
+    assert decision.signal_kind is SignalKind.ENTER_SHORT
+
+    engine.on_fill_confirmed(side=Side.SELL, price=breakout_close, quantity=1, at=breakout_bar.end)
+    after_fill = engine.on_clock_tick(
+        breakout_bar.end, has_active_order=False, position_state_uncertain=False
+    )
+    assert after_fill.ma_waiting_for_breakout is False
+
+
+def test_breakout_without_valid_entry_keeps_waiting_for_next_ten_point_change() -> None:
+    engine = _engine()
+    closes = _ramp_closes(_WARMUP + 1, start="10000", step="-2")
+    opens = closes[:-2] + [str(Decimal(value) + 5) for value in closes[-2:]]
+    bars = _bars(closes, opens=opens)
+    _feed(engine, bars)
+
+    breakout_close = Decimal(closes[-20]) - 200
+    breakout_bar = _bars(
+        [str(breakout_close)],
+        opens=[str(breakout_close + 5)],
+        final_start=bars[-1].end.value,
+    )[0]
+    missed = engine.on_bar_closed(
+        breakout_bar, data_reliable=True, has_active_order=True, position_state_uncertain=False
+    )
+    assert missed.ma_change == Decimal("10")
+    assert missed.signal_kind is None
+    assert missed.ma_waiting_for_breakout is True
+
+    small_close = Decimal(closes[-19]) - 40
+    small_bar = _bars(
+        [str(small_close)],
+        opens=[str(small_close + 5)],
+        final_start=breakout_bar.end.value,
+    )[0]
+    still_waiting = _feed(engine, [small_bar])
+    assert still_waiting.ma_change == Decimal("2")
+    assert still_waiting.ma_slope is MaSlope.DOWN
+    assert still_waiting.streak_length >= 2
+    assert still_waiting.ma_waiting_for_breakout is True
+    assert still_waiting.signal_kind is None
+
+    later_breakout_close = Decimal(closes[-18]) - 200
+    later_bar = _bars(
+        [str(later_breakout_close)],
+        opens=[str(later_breakout_close + 5)],
+        final_start=small_bar.end.value,
+    )[0]
+    entered = _feed(engine, [later_bar])
+    assert entered.ma_change == Decimal("10")
+    assert entered.signal_kind is SignalKind.ENTER_SHORT
+
+
+@pytest.mark.parametrize("last_close", ["10020", "10200"])
+def test_ma_change_equal_to_10_breaks_small_change_streak(last_close: str) -> None:
+    engine = _engine()
+    # The preceding five MA values span exactly 10; a 10-point change either
+    # inside that history or on the trigger bar breaks the small-change streak.
+    closes = ["10000"] * _MA_WINDOW + ["10200", "9800", "10000", "10000", "10000", last_close]
+    opens = closes[:-2] + ["9999", str(Decimal(last_close) - 1)]
     bars = _bars(closes, opens=opens)
     decision = _feed(engine, bars)
     assert decision is not None
     assert decision.ma_recent_range == Decimal("10")
     assert decision.ma_is_choppy is False
+    assert decision.ma_small_change_streak < 6
     assert decision.signal_kind is SignalKind.ENTER_LONG
 
 

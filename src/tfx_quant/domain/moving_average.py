@@ -69,10 +69,11 @@ def recent_range(values: Sequence[Decimal]) -> Decimal | None:
 
 
 def is_choppy(values: Sequence[Decimal], *, lookback: int, threshold: Decimal) -> bool:
-    """True ("均線走平不交易") when the most recent `lookback` MA values span less than
-    `threshold` points. Fewer than `lookback` samples is never choppy by this function
-    alone — callers gate new entries on sample sufficiency separately. The boundary
-    (`range == threshold`) is deliberately NOT choppy — locked by a fixed test."""
+    """Legacy MA range comparison, retained for callers needing that diagnostic.
+
+    The strategy entry gate uses consecutive one-bar MA changes instead. Fewer than
+    `lookback` samples return False; equality to `threshold` also returns False.
+    """
     if len(values) < lookback:
         return False
     span = recent_range(values[-lookback:])

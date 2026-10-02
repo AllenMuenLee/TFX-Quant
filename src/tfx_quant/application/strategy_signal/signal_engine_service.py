@@ -202,7 +202,7 @@ class StrategySignalEngineService:
         last = replay.review_bars[-1].bar
         key = (last.instrument, last.contract)
         config = self._engine_config or EngineConfig()
-        max_review = config.ma_window + max(2, config.flat_lookback)
+        max_review = config.ma_window + max(2, config.flat_lookback + 1)
         with self._lock:
             self._engines[key] = replay.engine
             self._review_windows[key] = [
@@ -296,9 +296,9 @@ class StrategySignalEngineService:
             config = self._engine_config or EngineConfig()
             window = self._review_windows.setdefault(key, [])
             window.append(event.bar)
-            # Include the current MA plus every close used by the preceding flatness
-            # lookback. With 20MA / five prior values this is 25 closes.
-            del window[: max(0, len(window) - config.ma_window - max(2, config.flat_lookback))]
+            # Include the oldest MA needed for the preceding five one-bar changes.
+            # With 20MA / five prior changes plus the trigger, this is 26 closes.
+            del window[: max(0, len(window) - config.ma_window - max(2, config.flat_lookback + 1))]
             reviewed = (
                 self._bars_reviewed(window)
                 if self._bars_reviewed is not None
@@ -448,6 +448,12 @@ class StrategySignalEngineService:
             position_lots=decision.position_lots,
             ma_value=str(decision.ma_value) if decision.ma_value is not None else None,
             ma_slope=decision.ma_slope.value,
+            ma_recent_range=(
+                str(decision.ma_recent_range) if decision.ma_recent_range is not None else None
+            ),
+            ma_change=str(decision.ma_change) if decision.ma_change is not None else None,
+            ma_small_change_streak=decision.ma_small_change_streak,
+            ma_waiting_for_breakout=decision.ma_waiting_for_breakout,
             ma_is_choppy=decision.ma_is_choppy,
             entry_gate_open=decision.entry_gate_open,
             stop_basis=str(decision.stop_basis) if decision.stop_basis is not None else None,

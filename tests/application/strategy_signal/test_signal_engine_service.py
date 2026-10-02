@@ -211,9 +211,16 @@ def test_unconfirmed_bar_used_by_ma_lookback_blocks_until_it_rolls_out() -> None
     assert len(windows[-1]) == _MA_WINDOW + _FLAT_LOOKBACK
     assert gateway.submitted_orders == []
     last = bars[-1]
-    _publish_bars(
-        bus, [replace(last, start=last.end, end=Timestamp(last.end.value + timedelta(hours=1)))]
+    following = replace(last, start=last.end, end=Timestamp(last.end.value + timedelta(hours=1)))
+    _publish_bars(bus, [following])
+    assert len(windows[-1]) == _MA_WINDOW + _FLAT_LOOKBACK + 1
+    assert gateway.submitted_orders == []  # oldest MA still needs the pending bar
+    after_following = replace(
+        following,
+        start=following.end,
+        end=Timestamp(following.end.value + timedelta(hours=1)),
     )
+    _publish_bars(bus, [after_following])
     assert len(gateway.submitted_orders) == 1
 
 
