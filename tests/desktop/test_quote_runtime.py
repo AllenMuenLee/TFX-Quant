@@ -16,6 +16,7 @@ from tfx_quant.application.events.events import (
     InstrumentSwitchCompleted,
     LatestPriceObserved,
     MarketDataFreshnessChanged,
+    TradePriceRecorded,
 )
 from tfx_quant.application.instrument_selection.instrument_selection_service import (
     InstrumentSelectionService,
@@ -482,7 +483,9 @@ def test_refresh_reports_staleness_for_every_recorded_market() -> None:
 def test_latest_price_is_published_coalesced_to_one_per_second_per_market() -> None:
     harness = _Harness(datetime(2026, 9, 1, 9, 45, tzinfo=TAIPEI_TZ), charted=Instrument.MXF)
     prices: list[LatestPriceObserved] = []
+    trades: list[TradePriceRecorded] = []
     harness.bus.subscribe(LatestPriceObserved, prices.append)
+    harness.bus.subscribe(TradePriceRecorded, trades.append)
     harness.login()
     gateway = harness.gateways[0]
 
@@ -504,6 +507,9 @@ def test_latest_price_is_published_coalesced_to_one_per_second_per_market() -> N
     assert [str(p.price) for p in mxf_prices] == ["18000", "18100"]
     assert mxf_prices[0].quality == "OK"
     assert harness.runtime.coalesced_price_updates == 4
+    assert [str(trade.price) for trade in trades if trade.instrument is Instrument.MXF] == [
+        "18000", "18001", "18002", "18003", "18004", "18100"
+    ]
 
 
 def test_latest_price_quality_is_gap_after_a_gap_on_that_market() -> None:

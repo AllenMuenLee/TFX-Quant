@@ -224,6 +224,17 @@ class MarketDataFreshnessChanged(Event):
 
 
 @dataclass(frozen=True, slots=True)
+class TradePriceRecorded(Event):
+    """Every persisted match price for strategy risk checks, without UI coalescing."""
+
+    instrument: Instrument
+    contract: ContractMonth
+    price: Decimal
+    observed_at: Timestamp
+    quality: str
+
+
+@dataclass(frozen=True, slots=True)
 class LatestPriceObserved(Event):
     """The most recent valid match price for a recorded market, published by
     `desktop.quote_runtime.QuoteRuntime` — coalesced to at most one per second per

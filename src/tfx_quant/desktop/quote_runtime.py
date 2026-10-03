@@ -16,6 +16,7 @@ from tfx_quant.application.events.events import (
     LatestPriceObserved,
     MarketDataFreshnessChanged,
     MarketDataGapDetected,
+    TradePriceRecorded,
 )
 from tfx_quant.application.instrument_selection.errors import InstrumentSelectionError
 from tfx_quant.application.instrument_selection.instrument_selection_service import (
@@ -475,17 +476,28 @@ class QuoteRuntime:
     ) -> None:
         if recorded.match_price is None or recorded.matched_at is None:
             return
-        last = self._last_price_at.get(instrument)
-        if last is not None and (recorded.matched_at.value - last.value).total_seconds() < 1.0:
-            self._coalesced_price_updates += 1
-            return
-        self._last_price_at[instrument] = recorded.matched_at
         if instrument in self._gapped:
             quality = "GAP"
         elif self._live.state is QuoteConnectionState.LOGGED_ON:
             quality = "OK"
         else:
             quality = "STALE"
+        if instrument is Instrument.MXF:
+            self._bus.publish(
+                TradePriceRecorded(
+                    at=self._clock.now(),
+                    instrument=instrument,
+                    contract=contract,
+                    price=recorded.match_price,
+                    observed_at=recorded.matched_at,
+                    quality=quality,
+                )
+            )
+        last = self._last_price_at.get(instrument)
+        if last is not None and (recorded.matched_at.value - last.value).total_seconds() < 1.0:
+            self._coalesced_price_updates += 1
+            return
+        self._last_price_at[instrument] = recorded.matched_at
         self._bus.publish(
             LatestPriceObserved(
                 at=self._clock.now(),

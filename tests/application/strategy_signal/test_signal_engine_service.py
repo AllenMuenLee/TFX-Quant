@@ -14,6 +14,7 @@ from tfx_quant.application.events.events import (
     ManualPositionSyncCompleted,
     MarketDataFreshnessChanged,
     PositionDiscrepancyDetected,
+    TradePriceRecorded,
 )
 from tfx_quant.application.order_management.order_manager import OrderManager
 from tfx_quant.application.strategy_signal.signal_engine_service import StrategySignalEngineService
@@ -243,6 +244,84 @@ def test_fill_confirmation_enables_add_on_signal() -> None:
     assert add_order.side is Side.BUY
     assert add_order.quantity.lots == 1
     assert add_order.price == Price(Decimal("10390"))
+
+
+def test_persisted_trade_price_triggers_intrabar_two_lot_profit_close() -> None:
+    _service_instance, gateway, _repo, event_bus, _clock = _service()
+    bars = _rising_warmup_plus_entry()
+    _publish_bars(event_bus, bars)
+    entry = gateway.submitted_orders[0]
+    gateway.simulate_ack(entry.client_order_id, "B0001")
+    gateway.simulate_fill(entry.client_order_id, 1, Decimal("10380"), broker_fill_no="F1")
+
+    add_bar = _bars(
+        ["10390"], opens=["10380"], final_start=bars[-1].start.value + timedelta(hours=1)
+    )[0]
+    _publish_bars(event_bus, [add_bar])
+    add = gateway.submitted_orders[1]
+    gateway.simulate_ack(add.client_order_id, "B0002")
+    gateway.simulate_fill(add.client_order_id, 1, Decimal("10390"), broker_fill_no="F2")
+
+    at = Timestamp(add_bar.end.value + timedelta(minutes=10))
+    event_bus.publish(
+        TradePriceRecorded(
+            at=at,
+            instrument=_INSTRUMENT,
+            contract=_CONTRACT,
+            price=Decimal("10700"),
+            observed_at=at,
+            quality="GAP",
+        )
+    )
+    assert len(gateway.submitted_orders) == 2
+    event_bus.publish(
+        TradePriceRecorded(
+            at=at,
+            instrument=_INSTRUMENT,
+            contract=_CONTRACT,
+            price=Decimal("10700"),
+            observed_at=at,
+            quality="OK",
+        )
+    )
+    event_bus.publish(
+        TradePriceRecorded(
+            at=at,
+            instrument=_INSTRUMENT,
+            contract=_CONTRACT,
+            price=Decimal("10500"),
+            observed_at=Timestamp(at.value - timedelta(minutes=1)),
+            quality="OK",
+        )
+    )
+    assert len(gateway.submitted_orders) == 2
+    event_bus.publish(
+        TradePriceRecorded(
+            at=at,
+            instrument=_INSTRUMENT,
+            contract=_CONTRACT,
+            price=Decimal("10600"),
+            observed_at=at,
+            quality="OK",
+        )
+    )
+    assert len(gateway.submitted_orders) == 3
+    close = gateway.submitted_orders[2]
+    assert close.side is Side.SELL
+    assert close.kind is OrderKind.CLOSE
+    assert close.quantity.lots == 2
+    assert close.price == Price(Decimal("10600"))
+    event_bus.publish(
+        TradePriceRecorded(
+            at=at,
+            instrument=_INSTRUMENT,
+            contract=_CONTRACT,
+            price=Decimal("10500"),
+            observed_at=at,
+            quality="OK",
+        )
+    )
+    assert len(gateway.submitted_orders) == 3
 
 
 def test_replaying_the_same_closed_bar_does_not_double_submit() -> None:

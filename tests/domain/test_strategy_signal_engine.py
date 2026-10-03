@@ -635,6 +635,63 @@ def test_profit_pullback_30_percent_triggers_exit() -> None:
     assert decision.max_favorable_points == Decimal("300")
 
 
+def test_intrabar_trade_price_triggers_two_lot_profit_exit_before_bar_close() -> None:
+    engine = _engine()
+    at = Timestamp(datetime(2026, 10, 2, 23, 0, tzinfo=TAIPEI_TZ))
+    engine.on_fill_confirmed(side=Side.BUY, price=Decimal("48761"), quantity=1, at=at)
+    engine.on_fill_confirmed(side=Side.BUY, price=Decimal("48905"), quantity=1, at=at)
+
+    peak = engine.on_trade_price(
+        Decimal("49492"), at, has_active_order=False, position_state_uncertain=False
+    )
+    assert peak.signal_kind is None
+    assert peak.profit_tracking_active is True
+    assert peak.profit_basis == Decimal("48833")
+    assert peak.stop_basis == Decimal("48905")
+    assert peak.max_favorable_points == Decimal("659")
+
+    above_trigger = engine.on_trade_price(
+        Decimal("49295"), at, has_active_order=False, position_state_uncertain=False
+    )
+    assert above_trigger.signal_kind is None
+    exact_trigger = engine.on_trade_price(
+        Decimal("49294"), at, has_active_order=False, position_state_uncertain=False
+    )
+    assert exact_trigger.signal_kind is SignalKind.EXIT_ALL
+
+    pullback_at = Timestamp(datetime(2026, 10, 2, 23, 25, tzinfo=TAIPEI_TZ))
+    exit_decision = engine.on_trade_price(
+        Decimal("49205"), pullback_at, has_active_order=False, position_state_uncertain=False
+    )
+    assert exit_decision.signal_kind is SignalKind.EXIT_ALL
+    assert exit_decision.rule == "profit_pullback"
+    assert exit_decision.position_lots == 2
+    assert exit_decision.current_price == Decimal("49205")
+    assert exit_decision.trigger == "trade_price"
+
+
+def test_intrabar_short_pullback_uses_average_cost_and_exits_both_lots() -> None:
+    engine = _engine()
+    at = Timestamp(datetime(2026, 10, 2, 23, 0, tzinfo=TAIPEI_TZ))
+    engine.on_fill_confirmed(side=Side.SELL, price=Decimal("1000"), quantity=1, at=at)
+    engine.on_fill_confirmed(side=Side.SELL, price=Decimal("900"), quantity=1, at=at)
+
+    peak = engine.on_trade_price(
+        Decimal("500"), at, has_active_order=False, position_state_uncertain=False
+    )
+    assert peak.profit_basis == Decimal("950")
+    assert peak.max_favorable_points == Decimal("450")
+    before = engine.on_trade_price(
+        Decimal("634"), at, has_active_order=False, position_state_uncertain=False
+    )
+    assert before.signal_kind is None
+    reached = engine.on_trade_price(
+        Decimal("635"), at, has_active_order=False, position_state_uncertain=False
+    )
+    assert reached.signal_kind is SignalKind.EXIT_ALL
+    assert reached.position_lots == 2
+
+
 def test_profit_pullback_max_favorable_keeps_rising_before_pullback() -> None:
     engine = _engine()
     tail_closes = ["10370", "10380"]
@@ -845,6 +902,11 @@ def test_partial_close_of_two_lots_keeps_remaining_lot_risk_managed() -> None:
     engine.on_fill_confirmed(side=Side.SELL, price=Decimal("10090"), quantity=1, at=add_bar.end)
     assert engine.position_side is PositionSide.LONG  # not yet fully flat
     assert engine.lots == engine.lots  # still holding, risk state must not have been cleared
+
+    remaining = engine.on_clock_tick(
+        add_bar.end, has_active_order=False, position_state_uncertain=False
+    )
+    assert remaining.position_lots == 1
 
     engine.on_fill_confirmed(side=Side.SELL, price=Decimal("10090"), quantity=1, at=add_bar.end)
     assert engine.position_side is PositionSide.FLAT

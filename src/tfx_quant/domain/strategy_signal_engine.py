@@ -1,20 +1,16 @@
 """60分鐘策略訊號引擎 — a deterministic, broker/UI-independent state machine.
 
-Consumes only already-confirmed inputs — closed `Bar`s (Feature 04's `BarClosed`),
+Consumes confirmed closed `Bar`s (Feature 04's `BarClosed`), persisted trade prices,
 actual fill confirmations (real broker fills, never order acks/intents), and wall-clock
 ticks — and produces `StrategyDecision`s carrying, at most, one `SignalKind` trading
 intent. Never calls a broker, never treats a submitted order as filled; the caller
 (application layer) is responsible for turning a decision's `signal_kind` into an actual
 order via `OrderManager`, keyed by `intent_key` for idempotent, replay-safe submission.
 
-**Combined-position P&L / max-favorable-point basis** (加碼前後如何計算整體部位獲利):
-the stop-loss basis and the profit/pullback basis are the *same* single value — the most
-recently filled lot's actual price — mirroring the spec's explicit stop-loss rule ("已建
-立第2口...改以第2口實際成交價為共同停損基準"). The basis rebases the instant a new lot
-fills; the already-tracked max-favorable-point value is never reset or recomputed under
-the new basis, only carried forward and compared against future evaluations under
-whatever basis is currently active. This was an explicit product decision (implementation
-prompt 05 flags this formula as a blocker otherwise) — not one to change without asking.
+**Position bases**: the 300-point stop-loss keeps the most recently filled lot's
+actual price. Profit activation and pullback use the arithmetic mean of confirmed
+opening fills; both lots exit together. A tracked price peak is rebased into points
+when a new lot fills so the same observed market high/low remains the peak.
 
 **20MA slope**: an exact Decimal one-bar delta between the current and immediately
 preceding closed bar's 20MA (see `domain.moving_average.determine_slope`) — also an
@@ -50,7 +46,7 @@ from tfx_quant.domain.side import Side
 from tfx_quant.domain.signal import SignalKind
 from tfx_quant.domain.timestamp import Timestamp
 
-STRATEGY_VERSION = "2"
+STRATEGY_VERSION = "3"
 
 _DEFAULT_MA_WINDOW = 20
 _DEFAULT_FLAT_LOOKBACK = 5
@@ -102,14 +98,12 @@ class StrategyDecision:
     strategy_version: str
     at: Timestamp
     trigger: str
-    """"bar_closed" or "clock_tick"."""
+    """"bar_closed", "trade_price", or "clock_tick"."""
     bar_start: Timestamp | None
     bar_end: Timestamp | None
     current_price: Decimal | None
-    """The last closed bar's close price at the time of this evaluation — the only
-    price this engine ever sees, even though a live Yuanta quote feed exists elsewhere
-    in this codebase for display/staleness purposes (this engine never reads it).
-    Callers submitting an order for a signal use this as the order price."""
+    """The latest accepted trade price, or the latest closed bar's close before a
+    trade arrives. Callers submitting an order for a signal use this as its price."""
     candle_color: CandleColor | None
     streak_color: CandleColor | None
     streak_length: int
@@ -130,6 +124,7 @@ class StrategyDecision:
     position_lots: int
     lot_prices: tuple[Decimal, ...]
     stop_basis: Decimal | None
+    profit_basis: Decimal | None
     profit_tracking_active: bool
     current_favorable_points: Decimal | None
     max_favorable_points: Decimal | None
@@ -165,8 +160,7 @@ class StrategySignalEngine:
     """One instance tracks one (instrument, contract)'s position lifecycle. Pure/no I/O
     — every input is an explicit method argument; every output is a returned
     `StrategyDecision`. Deterministic: the same call sequence always produces the same
-    decisions, which is what makes this independently testable with fixed K-bar/fill/
-    clock fixtures."""
+    decisions, testable with fixed K-bar/trade-price/fill/clock fixtures."""
 
     def __init__(
         self,
@@ -180,7 +174,7 @@ class StrategySignalEngine:
         self._config = config or EngineConfig()
         self._closes: list[Decimal] = []
         self._streak = CandleStreakCounter()
-        self._last_close: Decimal | None = None
+        self._last_price: Decimal | None = None
         self._last_bar_start: Timestamp | None = None
         self._position_side = PositionSide.FLAT
         self._lots: list[LotFill] = []
@@ -220,7 +214,7 @@ class StrategySignalEngine:
         max_history = self._config.ma_window + self._config.flat_lookback + 5
         if len(self._closes) > max_history:
             self._closes = self._closes[-max_history:]
-        self._last_close = bar.close.amount
+        self._last_price = bar.close.amount
         self._last_bar_start = bar.start
         return self._evaluate(
             now=bar.end,
@@ -247,6 +241,25 @@ class StrategySignalEngine:
             trigger="clock_tick",
         )
 
+    def on_trade_price(
+        self,
+        price: Decimal,
+        at: Timestamp,
+        *,
+        has_active_order: bool,
+        position_state_uncertain: bool,
+    ) -> StrategyDecision:
+        """Evaluate exits on every trusted, persisted match price; never open on a tick."""
+        self._last_price = price
+        return self._evaluate(
+            now=at,
+            bar=None,
+            data_reliable=True,
+            has_active_order=has_active_order,
+            position_state_uncertain=position_state_uncertain,
+            trigger="trade_price",
+        )
+
     def on_fill_confirmed(
         self, *, side: Side, price: Decimal, quantity: int, at: Timestamp
     ) -> None:
@@ -259,10 +272,27 @@ class StrategySignalEngine:
                 raise InvalidStrategyEngineError("opening fills must be exactly 1 lot at a time")
             if len(self._lots) >= self._config.max_lots:
                 raise InvalidStrategyEngineError("cannot open beyond max_lots")
+            old_profit_basis = self._profit_basis()
+            old_peak_price: Decimal | None = None
+            if old_profit_basis is not None and self._max_favorable is not None:
+                old_peak_price = (
+                    old_profit_basis + self._max_favorable
+                    if self._position_side is PositionSide.LONG
+                    else old_profit_basis - self._max_favorable
+                )
             if self._position_side is PositionSide.FLAT:
                 self._position_side = PositionSide.LONG if side is Side.BUY else PositionSide.SHORT
             self._lots.append(LotFill(price=price, at=at))
             self._active_basis = price
+            if old_peak_price is not None:
+                new_profit_basis = self._profit_basis()
+                assert new_profit_basis is not None
+                rebased_peak = self._signed_points(old_peak_price, new_profit_basis)
+                if rebased_peak > 0:
+                    self._max_favorable = rebased_peak
+                else:
+                    self._profit_activated = False
+                    self._max_favorable = None
             self._waiting_for_ma_breakout = False
         else:
             self._closed_quantity += quantity
@@ -277,6 +307,11 @@ class StrategySignalEngine:
         if self._position_side is PositionSide.SHORT:
             return side is Side.SELL
         return True
+
+    def _profit_basis(self) -> Decimal | None:
+        if not self._lots:
+            return None
+        return sum((lot.price for lot in self._lots), Decimal(0)) / len(self._lots)
 
     def _reset_position(self) -> None:
         """Only ever called once the closing quantity exactly matches the held lot
@@ -402,9 +437,9 @@ class StrategySignalEngine:
     def _check_stop_loss(self, ctx: _EvalContext) -> StrategyDecision | None:
         if self._position_side is PositionSide.FLAT or self._active_basis is None:
             return None
-        if self._last_close is None:
+        if self._last_price is None:
             return None
-        points = self._signed_points(self._last_close, self._active_basis)
+        points = self._signed_points(self._last_price, self._active_basis)
         if points > -self._config.stop_loss_points:
             return None
         if ctx.has_active_order:
@@ -426,11 +461,12 @@ class StrategySignalEngine:
     # -- Priority 3: 30% profit-pullback exit -------------------------------------------------
 
     def _check_profit_pullback(self, ctx: _EvalContext) -> StrategyDecision | None:
-        if self._position_side is PositionSide.FLAT or self._active_basis is None:
+        profit_basis = self._profit_basis()
+        if profit_basis is None:
             return None
-        if self._last_close is None:
+        if self._last_price is None:
             return None
-        points = self._signed_points(self._last_close, self._active_basis)
+        points = self._signed_points(self._last_price, profit_basis)
         if not self._profit_activated:
             if points < self._config.profit_activation_points:
                 return None
@@ -627,11 +663,12 @@ class StrategySignalEngine:
         raise InvalidStrategyEngineError("no active position to compute points for")
 
     def _current_points_or_none(self) -> Decimal | None:
-        if self._position_side is PositionSide.FLAT or self._active_basis is None:
+        profit_basis = self._profit_basis()
+        if profit_basis is None:
             return None
-        if self._last_close is None:
+        if self._last_price is None:
             return None
-        return self._signed_points(self._last_close, self._active_basis)
+        return self._signed_points(self._last_price, profit_basis)
 
     def _current_retracement_or_none(self) -> Decimal | None:
         if not self._profit_activated or self._max_favorable is None:
@@ -674,7 +711,7 @@ class StrategySignalEngine:
             trigger=ctx.trigger,
             bar_start=ctx.bar.start if ctx.bar is not None else None,
             bar_end=ctx.bar.end if ctx.bar is not None else None,
-            current_price=self._last_close,
+            current_price=self._last_price,
             candle_color=ctx.candle_color,
             streak_color=self._streak.color,
             streak_length=self._streak.length,
@@ -692,9 +729,10 @@ class StrategySignalEngine:
             has_active_order=ctx.has_active_order,
             position_state_uncertain=ctx.position_state_uncertain,
             position_side=self._position_side,
-            position_lots=len(self._lots),
+            position_lots=len(self._lots) - self._closed_quantity,
             lot_prices=tuple(lot.price for lot in self._lots),
             stop_basis=self._active_basis,
+            profit_basis=self._profit_basis(),
             profit_tracking_active=self._profit_activated,
             current_favorable_points=self._current_points_or_none(),
             max_favorable_points=self._max_favorable,

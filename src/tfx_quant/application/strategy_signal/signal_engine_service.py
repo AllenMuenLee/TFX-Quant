@@ -9,12 +9,9 @@ flag tracked for it), which is exactly Feature 03's instrument-switch reset hook
 Feature 08's manual-sync reset hook, now with a real body instead of
 `NullBarSignalStateStore`'s no-op.
 
-**Order price**: this engine only ever decides on closed 60-minute bars (see
-`docs/adr/0006`) — even though the desktop UI separately shows a live Yuanta quote
-feed for display/staleness purposes, this engine and this service never read it. The
-*only* price this engine (or this service) ever has is the triggering bar's close,
-carried on every `StrategyDecision.current_price`. Every submitted order uses that
-price.
+**Order price**: entries use the triggering 60-minute bar's close. Risk exits also
+evaluate every persisted trade price, so an intrabar exit uses the triggering trade
+price carried on `StrategyDecision.current_price`.
 
 **Submission path**: every signal (`ENTER_*`/`ADD_*`/`EXIT_ALL`) goes straight through
 `OrderManager.submit()`, never through `ScalingService`/`ReversalWorkflowService`. Those
@@ -50,6 +47,7 @@ from tfx_quant.application.events.events import (
     MarketDataGapCleared,
     MarketDataGapDetected,
     PositionDiscrepancyDetected,
+    TradePriceRecorded,
 )
 from tfx_quant.application.order_management.errors import (
     ActiveWorkflowInProgressError,
@@ -162,11 +160,13 @@ class StrategySignalEngineService:
         self._engines: dict[_EngineKey, StrategySignalEngine] = {}
         self._stale: dict[_EngineKey, bool] = {}
         self._gapped: dict[_EngineKey, bool] = {}
+        self._last_trade_at: dict[_EngineKey, Timestamp] = {}
         self._position_uncertain: dict[_EngineKey, bool] = {}
         self._timer: threading.Timer | None = None
         self._running = False
 
         event_bus.subscribe(BarClosed, self._on_bar_closed)
+        event_bus.subscribe(TradePriceRecorded, self._on_trade_price)
         event_bus.subscribe(FillReceived, self._on_fill)
         event_bus.subscribe(MarketDataFreshnessChanged, self._on_freshness_changed)
         event_bus.subscribe(MarketDataGapDetected, self._on_gap_detected)
@@ -183,6 +183,7 @@ class StrategySignalEngineService:
             self._review_windows.pop(key, None)
             self._stale.pop(key, None)
             self._gapped.pop(key, None)
+            self._last_trade_at.pop(key, None)
             self._position_uncertain.pop(key, None)
         log_info(
             _logger,
@@ -205,6 +206,7 @@ class StrategySignalEngineService:
         max_review = config.ma_window + max(2, config.flat_lookback + 1)
         with self._lock:
             self._engines[key] = replay.engine
+            self._last_trade_at.pop(key, None)
             self._review_windows[key] = [
                 record.bar for record in replay.review_bars[-max_review:]
             ]
@@ -315,6 +317,41 @@ class StrategySignalEngineService:
             )
         self._log_decision(decision, event.instrument, event.contract)
         self._act_on_decision(decision, event.instrument, event.contract)
+
+    def _on_trade_price(self, event: TradePriceRecorded) -> None:
+        if event.instrument is not Instrument.MXF or event.quality != "OK":
+            return
+        key = (event.instrument, event.contract)
+        with self._lock:
+            last_trade_at = self._last_trade_at.get(key)
+            if last_trade_at is not None and event.observed_at.value < last_trade_at.value:
+                return
+            engine = self._engines.get(key)
+            if (
+                engine is None
+                or engine.position_side is PositionSide.FLAT
+                or self._stale.get(key, False)
+                or self._gapped.get(key, False)
+            ):
+                return
+            self._last_trade_at[key] = event.observed_at
+            position_state_uncertain = self._position_uncertain.get(key, False)
+            decision = engine.on_trade_price(
+                event.price,
+                event.observed_at,
+                has_active_order=True,
+                position_state_uncertain=position_state_uncertain,
+            )
+            if decision.rule in ("eod_flatten", "stop_loss", "profit_pullback"):
+                decision = engine.on_trade_price(
+                    event.price,
+                    event.observed_at,
+                    has_active_order=self._has_active_order(event.instrument, event.contract),
+                    position_state_uncertain=position_state_uncertain,
+                )
+        if decision.signal_kind is not None:
+            self._log_decision(decision, event.instrument, event.contract)
+            self._act_on_decision(decision, event.instrument, event.contract)
 
     def _on_fill(self, event: FillReceived) -> None:
         fill = event.fill
@@ -457,6 +494,7 @@ class StrategySignalEngineService:
             ma_is_choppy=decision.ma_is_choppy,
             entry_gate_open=decision.entry_gate_open,
             stop_basis=str(decision.stop_basis) if decision.stop_basis is not None else None,
+            profit_basis=str(decision.profit_basis) if decision.profit_basis is not None else None,
             current_favorable_points=(
                 str(decision.current_favorable_points)
                 if decision.current_favorable_points is not None
