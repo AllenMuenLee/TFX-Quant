@@ -386,6 +386,7 @@ def build_services(
         local_simulator = MockTradeGateway(
             event_publisher=event_coordinator,
             track_positions_from_fills=True,
+            execute_on_submit=True,
         )
         trade_gateway = local_simulator
         broker_session = MockBrokerSession(event_publisher=event_coordinator)
@@ -481,6 +482,8 @@ def build_services(
         path_basename=order_db_path.name,
     )
     order_repository = SqliteOrderRepository(order_connection)
+    if local_simulator is not None:
+        local_simulator.restore_filled(order_repository.list_all())
 
     reversal_workflow_db_path = _resolve_reversal_workflow_db_path(settings)
     reversal_workflow_connection = create_connection(
@@ -529,7 +532,9 @@ def build_services(
         clock=clock,
         id_generator=id_generator,
         event_bus=event_coordinator,
-        position_lookup=reconciliation_service.expected_net_lookup,
+        # 測試環境 only: the simulated strategy's engine is rebuilt from the replay, so an
+        # exit is sized to what the simulator actually holds and never reverses it.
+        position_lookup=reconciliation_service.expected_net_lookup if is_test_env else None,
     )
 
     # Must run after `reconciliation_service`/`order_manager` have all subscribed their
@@ -631,6 +636,7 @@ def build_services(
         market_data_healthy=lambda _instrument, _contract: quote_runtime.state.value == "LOGGED_ON",
         current_selection=lambda: instrument_selection.current,
         selected_account=lambda: broker_session.selected_account,
+        simulation=is_test_env,
     )
 
     reversal_workflow_service = ReversalWorkflowService(
@@ -661,6 +667,9 @@ def build_services(
         selected_account=lambda: broker_session.selected_account,
         risk_gate=risk_supervisor.validate_entry_window,
         bars_reviewed=quote_runtime.bars_reviewed,
+        # 測試環境 only: the simulated strategy's engine is rebuilt from the replay, so an
+        # exit is sized to what the simulator actually holds and never reverses it.
+        position_lookup=reconciliation_service.expected_net_lookup if is_test_env else None,
     )
     bar_signal_state_store.add(signal_engine_service)
 
@@ -673,6 +682,7 @@ def build_services(
             event_bus=event_coordinator,
             selected_account=lambda: broker_session.selected_account,
             replay_installed=signal_engine_service.install_historical_replay,
+            replay_pending=signal_engine_service.suspend_for_history,
         )
         quote_runtime.set_historical_replay_handler(historical_simulation_service.sync)
 

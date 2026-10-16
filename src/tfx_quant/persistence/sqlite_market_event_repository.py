@@ -6,6 +6,7 @@ import threading
 from datetime import UTC, datetime
 from decimal import Decimal
 
+from tfx_quant.application.ports.market_event_repository import TradePrint
 from tfx_quant.domain.market_data import (
     MarketDataGap,
     MarketEventQuality,
@@ -97,6 +98,48 @@ class SqliteMarketEventRepository:
             )
             self._conn.commit()
 
+    def first_trade_beyond(
+        self,
+        symbol: str,
+        *,
+        since: TradePrint | Timestamp,
+        before: Timestamp,
+        at_or_below: Decimal,
+        at_or_above: Decimal,
+    ) -> TradePrint | None:
+        lower, lower_args = _since_clause(since)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT matched_at_taipei,session_id,sequence,match_price FROM market_events "
+                f"WHERE symbol=? AND quality=? AND match_price IS NOT NULL AND {lower} "
+                "AND matched_at_taipei<? "
+                "AND (CAST(match_price AS REAL)<=? OR CAST(match_price AS REAL)>=?) "
+                "ORDER BY matched_at_taipei,session_id,sequence LIMIT 1",
+                (
+                    symbol,
+                    MarketEventQuality.VALID_TRADE.value,
+                    *lower_args,
+                    _taipei_text(before),
+                    float(at_or_below),
+                    float(at_or_above),
+                ),
+            ).fetchone()
+        return None if row is None else _trade_print(row)
+
+    def last_trade_at_or_before(
+        self, symbol: str, *, since: TradePrint | Timestamp, at: Timestamp
+    ) -> TradePrint | None:
+        lower, lower_args = _since_clause(since)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT matched_at_taipei,session_id,sequence,match_price FROM market_events "
+                f"WHERE symbol=? AND quality=? AND match_price IS NOT NULL AND {lower} "
+                "AND matched_at_taipei<=? "
+                "ORDER BY matched_at_taipei DESC,session_id DESC,sequence DESC LIMIT 1",
+                (symbol, MarketEventQuality.VALID_TRADE.value, *lower_args, _taipei_text(at)),
+            ).fetchone()
+        return None if row is None else _trade_print(row)
+
     def list_gaps(self, symbol: str) -> list[MarketDataGap]:
         with self._lock:
             rows = self._conn.execute(
@@ -113,6 +156,26 @@ class SqliteMarketEventRepository:
             )
             for a, b, r in rows
         ]
+
+
+def _taipei_text(at: Timestamp) -> str:
+    # Same text form `append` stores, so string order is time order.
+    return at.value.astimezone(TAIPEI_TZ).isoformat()
+
+
+def _since_clause(since: TradePrint | Timestamp) -> tuple[str, tuple[object, ...]]:
+    if isinstance(since, TradePrint):
+        return "(matched_at_taipei,session_id,sequence)>(?,?,?)", since.position
+    return "matched_at_taipei>=?", (_taipei_text(since),)
+
+
+def _trade_print(row: tuple[object, ...]) -> TradePrint:
+    matched, session, sequence, price = row
+    return TradePrint(
+        Timestamp(datetime.fromisoformat(str(matched)).astimezone(TAIPEI_TZ)),
+        Decimal(str(price)),
+        (str(matched), str(session), int(str(sequence))),
+    )
 
 
 def _event_from_row(row: tuple[object, ...]) -> RecordedMarketEvent:

@@ -15,6 +15,7 @@ from tfx_quant.application.events.events import (
     InstrumentSwitchCompleted,
     LatestPriceObserved,
     MarketDataFreshnessChanged,
+    MarketDataGapCleared,
     MarketDataGapDetected,
     TradePriceRecorded,
 )
@@ -34,7 +35,10 @@ from tfx_quant.application.market_data.recorder_service import MarketDataRecorde
 from tfx_quant.application.ports.bar_record_repository import BarRecordRepository, BarUpsertOutcome
 from tfx_quant.application.ports.clock import Clock
 from tfx_quant.application.ports.instrument_master import InstrumentMasterRepository
-from tfx_quant.application.ports.market_event_repository import MarketEventRepository
+from tfx_quant.application.ports.market_event_repository import (
+    MarketEventRepository,
+    TradePrint,
+)
 from tfx_quant.application.ports.quote_gateway import QuoteConnectionState, QuoteGateway
 from tfx_quant.application.ports.trading_calendar import TradingCalendarRepository
 from tfx_quant.application.strategy_signal.history_replay import (
@@ -64,6 +68,41 @@ class _Stream:
     symbol: str
     aggregator: RealtimeBarAggregator
     recorder: MarketDataRecorderService
+
+
+class _RecordedTrades:
+    """The replay's view of persisted MXF match prices, keyed by contract."""
+
+    def __init__(self, events: MarketEventRepository, master: InstrumentMasterRepository) -> None:
+        self._events, self._master = events, master
+
+    def _symbol(self, contract: ContractMonth) -> str | None:
+        entry = self._master.get(Instrument.MXF, contract)
+        return None if entry is None else entry.vendor_symbol
+
+    def first_beyond(
+        self,
+        contract: ContractMonth,
+        *,
+        since: TradePrint | Timestamp,
+        before: Timestamp,
+        at_or_below: Decimal,
+        at_or_above: Decimal,
+    ) -> TradePrint | None:
+        symbol = self._symbol(contract)
+        if symbol is None:
+            return None
+        return self._events.first_trade_beyond(
+            symbol, since=since, before=before, at_or_below=at_or_below, at_or_above=at_or_above
+        )
+
+    def last_at_or_before(
+        self, contract: ContractMonth, *, since: TradePrint | Timestamp, at: Timestamp
+    ) -> TradePrint | None:
+        symbol = self._symbol(contract)
+        if symbol is None:
+            return None
+        return self._events.last_trade_at_or_before(symbol, since=since, at=at)
 
 
 class QuoteRuntime:
@@ -99,6 +138,7 @@ class QuoteRuntime:
         self._streams: dict[Instrument, _Stream] = {}
         self._by_symbol: dict[str, _Stream] = {}
         self._recording_started_at: Timestamp | None = None
+        self._recording_stopped_at: Timestamp | None = None
         self._last_cleanup_date: date | None = None
         self._last_stale: bool | None = None
         self._last_event_at: Timestamp | None = None
@@ -155,8 +195,14 @@ class QuoteRuntime:
         # Recording begins here, so every stream is rebuilt against this instant: an
         # aggregator built earlier (an instrument switch made before login) would
         # otherwise carry a cutoff older than the feed it is about to receive.
+        # A re-login after this run's own `stop()` resumes the streams instead: their
+        # forming bars were already flagged for review at the stop, so the bar in
+        # progress is kept (for review) rather than dropped and left as a hole.
+        resuming = self._recording_stopped_at is not None
         self._recording_started_at = self._clock.now()
-        self._streams, self._by_symbol = {}, {}
+        self._recording_stopped_at = None
+        if not resuming:
+            self._streams, self._by_symbol = {}, {}
         self._last_price_at, self._gapped, self._coalesced_price_updates = {}, set(), 0
         self._sync_streams()
         self._live.start(user_id, password, self.recorded_symbols)
@@ -201,6 +247,12 @@ class QuoteRuntime:
 
     def stop(self) -> None:
         self._live.stop()
+        if self._recording_started_at is not None and self._recording_stopped_at is None:
+            # Trades from here until the feed is back are missed: whatever the forming
+            # bars become must be reviewed, never published as complete.
+            self._recording_stopped_at = self._clock.now()
+            for stream in self._streams.values():
+                stream.aggregator.mark_incomplete(self._recording_stopped_at, None)
 
     def query(self, start: date, end: date) -> list[BarRecord]:
         current = self._selection.current
@@ -289,7 +341,9 @@ class QuoteRuntime:
         )
         if records != self._history_replay_input:
             snapshot = replay_history_state(
-                records, lambda end: self.adjacent_history_close(end, 1)
+                records,
+                lambda end: self.adjacent_history_close(end, 1),
+                tape=_RecordedTrades(self._events, self._master),
             )
             self._history_replay_input = records
             self._history_replay_snapshot = snapshot
@@ -448,7 +502,13 @@ class QuoteRuntime:
         def persist(closed: ClosedAggregation) -> None:
             writer.persist(closed)
             # A bar that closed end-to-end proves the feed is whole again for this market.
-            self._gapped.discard(instrument)
+            if closed.is_complete and instrument in self._gapped:
+                self._gapped.discard(instrument)
+                self._bus.publish(
+                    MarketDataGapCleared(
+                        at=self._clock.now(), instrument=instrument, contract=contract
+                    )
+                )
 
         def on_trade(recorded: RecordedMarketEvent) -> None:
             self._on_trade(instrument, contract, recorded)

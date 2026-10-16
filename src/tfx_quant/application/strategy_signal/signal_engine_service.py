@@ -63,7 +63,7 @@ from tfx_quant.domain.contract import ContractMonth
 from tfx_quant.domain.instrument import Instrument
 from tfx_quant.domain.money import Price
 from tfx_quant.domain.order import OrderKind, TimeInForce
-from tfx_quant.domain.quantity import Quantity
+from tfx_quant.domain.quantity import NetPosition, Quantity
 from tfx_quant.domain.risk import is_within_no_entry_window
 from tfx_quant.domain.side import Side
 from tfx_quant.domain.signal import SignalKind
@@ -95,6 +95,7 @@ _DEFAULT_CLOCK_INTERVAL_SECONDS = 5.0
 _EngineKey = tuple[Instrument, ContractMonth]
 
 SelectedAccount = Callable[[], "TradingAccount | None"]
+PositionLookup = Callable[[TradingAccount, Instrument, ContractMonth], NetPosition]
 
 
 class EventBus(Protocol):
@@ -145,8 +146,10 @@ class StrategySignalEngineService:
         bars_reviewed: Callable[[list[Bar]], bool] | None = None,
         risk_gate: RiskEntryWindowGate | None = None,
         clock_interval_seconds: float = _DEFAULT_CLOCK_INTERVAL_SECONDS,
+        position_lookup: PositionLookup | None = None,
     ) -> None:
         self._order_manager = order_manager
+        self._position_lookup = position_lookup
         self._order_repository = order_repository
         self._clock = clock
         self._event_bus = event_bus
@@ -219,6 +222,19 @@ class StrategySignalEngineService:
             position_side=replay.engine.position_side.value,
             position_lots=len(replay.engine.lots),
         )
+
+    def suspend_for_history(self, instrument: Instrument, contract: ContractMonth) -> None:
+        """Drop the live engine while historical fills it never assumed are executed;
+        `install_historical_replay` puts the replay's engine in its place afterwards."""
+        with self._lock:
+            dropped = self._engines.pop((instrument, contract), None)
+        if dropped is not None:
+            log_info(
+                _logger,
+                "strategy_signal_engine_suspended_for_history",
+                instrument=instrument.value,
+                contract=contract.code,
+            )
 
     # -- Lifecycle: the 04:55 clock-tick trigger -------------------------------------------
 
@@ -295,6 +311,17 @@ class StrategySignalEngineService:
                     config=self._engine_config,
                 )
                 self._engines[key] = engine
+            last_start = engine.last_bar_start
+            if last_start is not None and event.bar.start.value <= last_start.value:
+                # Already evaluated, e.g. by a history replay installed meanwhile.
+                log_info(
+                    _logger,
+                    "strategy_signal_bar_already_evaluated",
+                    instrument=event.instrument.value,
+                    contract=event.contract.code,
+                    bar_start=event.bar.start.value.isoformat(),
+                )
+                return
             config = self._engine_config or EngineConfig()
             window = self._review_windows.setdefault(key, [])
             window.append(event.bar)
@@ -426,6 +453,21 @@ class StrategySignalEngineService:
             )
             return
         shape = _order_shape_for(decision)
+        if shape.kind is OrderKind.CLOSE and self._position_lookup is not None:
+            # Close only lots that are actually held: an exit must never open the
+            # opposite side when the position already went flat another way.
+            net = self._position_lookup(account, instrument, contract).lots
+            held = net if decision.position_side is PositionSide.LONG else -net
+            if held <= 0:
+                log_warning(
+                    _logger,
+                    "strategy_signal_exit_skipped_nothing_held",
+                    decision_id=decision.decision_id,
+                    rule=decision.rule,
+                    net_position=net,
+                )
+                return
+            shape = _OrderShape(shape.side, min(shape.quantity, held), shape.kind)
         if shape.kind is OrderKind.OPEN:
             # Independent, strategy-engine-agnostic risk gate — Feature 10's job. Never
             # blocks a CLOSE (risk-driven exits are never subject to the no-entry

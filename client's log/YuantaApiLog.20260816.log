@@ -1,0 +1,26 @@
+20260816 13:08:55.986 YuantaOrd 1.6.1.3 for ActiveX control
+20260816 13:08:55.986 Create
+20260816 13:08:55.990 SetFutOrdConnection(TESTUSER,pw,apitest.yuantafutures.com.tw,80)
+20260816 13:08:55.998 return: 3
+20260816 13:09:06.214 OnLogonS(-1,NULL,NULL,NULL)
+
+20260816 13:12:30.733 YuantaOrd 1.6.1.3 for ActiveX control
+20260816 13:12:30.733 Create
+20260816 13:12:30.737 SetFutOrdConnection(TESTUSER,pw,apitest.yuantafutures.com.tw,80)
+20260816 13:12:30.746 return: 3
+20260816 13:12:41.026 OnLogonS(-1,NULL,NULL,NULL)
+20260816 13:12:45.762 DoLogout
+
+20260816 13:15:03.557 YuantaOrd 1.6.1.3 for ActiveX control
+20260816 13:15:03.557 Create
+20260816 13:15:03.561 SetFutOrdConnection(TESTUSER,pw,apitest.yuantafutures.com.tw,80)
+20260816 13:15:03.568 return: 3
+20260816 13:15:13.805 OnLogonS(-1,NULL,NULL,NULL)
+20260816 13:15:18.592 DoLogout
+
+20260816 13:24:08.988 YuantaOrd 1.6.1.3 for ActiveX control
+20260816 13:24:08.988 Create
+20260816 13:24:08.991 SetFutOrdConnection(TESTUSER,pw,apitest.yuantafutures.com.tw,80)
+20260816 13:24:09.002 return: 3
+20260816 13:24:19.228 OnLogonS(-1,NULL,NULL,NULL)
+20260816 13:24:24.020 DoLogout

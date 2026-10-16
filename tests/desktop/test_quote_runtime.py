@@ -28,6 +28,7 @@ from tfx_quant.application.ports.quote_gateway import (
     QuoteUpdateMode,
 )
 from tfx_quant.desktop.quote_runtime import QuoteRuntime
+from tfx_quant.domain.bar_record import BarPeriod, BarRecord
 from tfx_quant.domain.contract import ContractMonth
 from tfx_quant.domain.instrument import Instrument
 from tfx_quant.domain.instrument_master import InstrumentMasterEntry
@@ -385,7 +386,16 @@ def test_a_gap_marks_only_its_own_symbols_stream_incomplete() -> None:
         assert record.is_complete == (instrument is Instrument.MXF)
 
 
-def test_a_stopped_and_restarted_session_drops_the_boundary_it_restarts_inside() -> None:
+def _bar_at(harness: _Harness, hour: int, minute: int) -> BarRecord | None:
+    return harness.bars.get_one(
+        Instrument.MXF,
+        _CONTRACT,
+        BarPeriod.SIXTY_MINUTE,
+        Timestamp(datetime(2026, 9, 1, hour, minute, tzinfo=TAIPEI_TZ)),
+    )
+
+
+def test_a_quote_relogin_keeps_the_bar_in_progress_for_review() -> None:
     harness = _Harness(datetime(2026, 9, 1, 9, 45, tzinfo=TAIPEI_TZ), charted=Instrument.MXF)
     harness.login()
     harness.gateways[0].on_event(
@@ -395,13 +405,42 @@ def test_a_stopped_and_restarted_session_drops_the_boundary_it_restarts_inside()
 
     harness.clock.value = datetime(2026, 9, 1, 10, 5, tzinfo=TAIPEI_TZ)
     harness.login()
-    harness.gateways[-1].on_event(
-        _trade("MXFI6", 2, datetime(2026, 9, 1, 10, 10, tzinfo=TAIPEI_TZ), price="18020", total=20)
+    gateway = harness.gateways[-1]
+    for sequence, at, price in (
+        (1, datetime(2026, 9, 1, 10, 10, tzinfo=TAIPEI_TZ), "18020"),
+        (2, datetime(2026, 9, 1, 10, 50, tzinfo=TAIPEI_TZ), "18030"),
+    ):
+        # A new quote login is a new vendor session with its own sequence.
+        trade = _trade("MXFI6", sequence, at, price=price, total=19 + sequence)
+        gateway.on_event(replace(trade, session_id="session-2"))
+    harness.clock.value = datetime(2026, 9, 1, 11, 46, tzinfo=TAIPEI_TZ)
+    harness.runtime.refresh()
+
+    # The 09:45 bar spans the re-login: kept with both halves, flagged for review.
+    assert [event.bar.start.value.time() for event in harness.closed] == [time(9, 45), time(10, 45)]
+    interrupted = _bar_at(harness, 9, 45)
+    assert interrupted is not None and not interrupted.is_complete
+    assert (interrupted.bar.open.amount, interrupted.bar.close.amount) == (
+        Decimal("18000"),
+        Decimal("18020"),
     )
+    # The next bar was recorded end to end after the re-login.
+    following = _bar_at(harness, 10, 45)
+    assert following is not None and following.is_complete
+
+
+def test_a_bar_closing_while_the_quote_feed_is_stopped_needs_review() -> None:
+    harness = _Harness(datetime(2026, 9, 1, 9, 45, tzinfo=TAIPEI_TZ), charted=Instrument.MXF)
+    harness.login()
+    harness.gateways[0].on_event(
+        _trade("MXFI6", 1, datetime(2026, 9, 1, 9, 50, tzinfo=TAIPEI_TZ), price="18000", total=10)
+    )
+    harness.runtime.stop()
     harness.clock.value = datetime(2026, 9, 1, 10, 46, tzinfo=TAIPEI_TZ)
     harness.runtime.refresh()
 
-    assert harness.closed == []
+    record = _bar_at(harness, 9, 45)
+    assert record is not None and not record.is_complete
 
 
 def test_no_trade_after_login_leaves_the_recorded_history_empty() -> None:
@@ -690,6 +729,51 @@ def test_history_replay_resets_warmup_after_missing_or_incomplete_bar() -> None:
     assert not replay_history(
         [records[0], replace(records[1], is_complete=False), records[2]], next_close, config
     )
+
+
+def test_history_replay_keeps_stop_active_across_missing_or_incomplete_bar() -> None:
+    from dataclasses import replace
+
+    from tfx_quant.application.strategy_signal.history_replay import replay_history
+    from tfx_quant.domain.side import Side
+    from tfx_quant.domain.strategy_signal_engine import EngineConfig
+
+    h = _Harness(datetime(2026, 9, 15, 12, tzinfo=TAIPEI_TZ))
+    close = Timestamp(datetime(2026, 9, 1, 16, tzinfo=TAIPEI_TZ))
+    records = []
+    for index in range(6):
+        price = 18000 + index * 20 if index < 4 else 17500
+        records.append(
+            h.runtime.save_history_hour(
+                h.runtime.history_start_for_close(close),
+                open=str(price),
+                close=str(price + 10),
+                high=str(price + 10),
+                low=str(price),
+                volume="10",
+            )
+        )
+        close = h.runtime.adjacent_history_close(close, 1)
+    config = EngineConfig(ma_window=2, flat_lookback=2, flat_threshold_points=Decimal("1"))
+
+    def next_close(end: Timestamp) -> Timestamp:
+        return h.runtime.adjacent_history_close(end, 1)
+
+    held = sum(t.quantity for t in replay_history(records[:4], next_close, config))
+    assert held > 0
+
+    # The bar after the entries is missing; the next one closes beyond the stop.
+    missing = replay_history([*records[:4], records[5]], next_close, config)
+    assert missing[-1].decision.rule == "stop_loss"
+    assert missing[-1].record == records[5]
+    assert (missing[-1].side, missing[-1].quantity) == (Side.SELL, held)
+
+    # An unreviewed bar still stops the position out, then the replay re-warms flat.
+    unreviewed = replace(records[4], is_complete=False)
+    incomplete = replay_history([*records[:4], unreviewed, records[5]], next_close, config)
+    assert incomplete[-1].decision.rule == "stop_loss"
+    assert incomplete[-1].record == unreviewed
+    assert (incomplete[-1].side, incomplete[-1].quantity) == (Side.SELL, held)
 
 
 def test_missed_history_excludes_executed_signals_but_keeps_unfilled_quantity() -> None:

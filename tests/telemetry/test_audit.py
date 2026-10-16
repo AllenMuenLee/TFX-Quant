@@ -68,3 +68,27 @@ def test_export_reversal_chain_is_complete_and_sequence_ordered(tmp_path: Path) 
         payload["seq"] for payload in payloads
     )
     assert {payload["workflow_id"] for payload in payloads} == {"wf-1"}
+
+
+def test_a_restarted_run_keeps_every_record_although_its_sequence_restarts(
+    tmp_path: Path,
+) -> None:
+    audit_path = tmp_path / "audit.sqlite3"
+    for run in ("first", "second"):
+        handler = SqliteAuditHandler(audit_path, lambda _exc: None)
+        logger = _audit_logger(handler)
+        for seq in (1, 2):
+            logger.info(
+                json.dumps(
+                    {"seq": seq, "ts_utc": "t", "event": f"{run}-{seq}", "workflow_id": "wf-1"}
+                )
+            )
+        handler.close()
+
+    destination = tmp_path / "wf-1.jsonl"
+    export_reversal_chain(audit_path, "wf-1", destination)
+    events = [
+        json.loads(line)["event"] for line in destination.read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert events == ["first-1", "first-2", "second-1", "second-2"]

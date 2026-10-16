@@ -48,10 +48,14 @@ class SqliteAuditHandler(logging.Handler):
             return
         try:
             with self._lock:
+                # The row's `seq` is assigned by SQLite (the next row id), never the
+                # record's own sequence: that counter restarts every run, and keying on it
+                # silently dropped a new run's records. The run-local `seq` stays in the
+                # payload; the column keeps one ordering across runs.
                 self._connection.execute(
-                    "INSERT OR IGNORE INTO audit_events VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO audit_events VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (
-                        payload["seq"],
+                        None,
                         payload["ts_utc"],
                         record.levelname,
                         record.name,

@@ -165,7 +165,7 @@ def _submit_and_fill(
             contract=current.contract,
             side=side,
             quantity=Quantity(1),
-            price=Price(Decimal("18500")),
+            price=Price(Decimal(price)),
             kind=kind,
             time_in_force=TimeInForce.ROD,
             idempotency_key=key,
@@ -173,9 +173,8 @@ def _submit_and_fill(
             reason="test-env acceptance",
         )
     )
-    gateway = getattr(services.trade_gateway, "_inner", services.trade_gateway)
-    gateway.simulate_ack(intent.client_order_id, f"B-{key}")
-    gateway.simulate_fill(intent.client_order_id, 1, Decimal(price), broker_fill_no=f"F-{key}")
+    # The local simulator acked and filled it inside `submit`, at the order's price.
+    assert services.order_repository.find_by_client_order_id(intent.client_order_id) is not None
     # `stop()` drains every queued event; restart to keep going
     services.event_coordinator.stop(timeout=3)
     services.event_coordinator.start()
@@ -267,7 +266,8 @@ def test_drilldown_walks_trade_to_fills_to_intents(test_env: ServiceContainer) -
         test_env.order_repository,
         test_env.audit_timeline_reader,
     )
-    assert {f.fill_id for f in result.fills} == {"F-open", "F-close"}
+    assert len(result.fills) == 2
+    assert all(f.fill_id.startswith("SIM-F-") for f in result.fills)
     assert {i.workflow_id for i in result.intents} == {"wf-o", "wf-c"}
     assert {i.status.value for i in result.intents} == {"FILLED"}
 

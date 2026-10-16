@@ -145,9 +145,14 @@ class RiskSupervisor:
         eod_flatten_local_time: time = EOD_FLATTEN_LOCAL_TIME,
         entry_gate_local_time: time = ENTRY_GATE_LOCAL_TIME,
         clock_interval_seconds: float = _DEFAULT_CLOCK_INTERVAL_SECONDS,
+        simulation: bool = False,
     ) -> None:
+        """`simulation`: the 測試環境's simulated position is flattened at 04:55 by the
+        simulated strategy itself, at the market price, so no scheduled workflow is
+        started, and one left by an earlier run is retired instead of resumed."""
         self._order_manager = order_manager
         self._order_repository = order_repository
+        self._simulation = simulation
         self._repo = eod_flatten_workflow_repository
         self._trade_gateway = trade_gateway
         self._clock = clock
@@ -180,6 +185,7 @@ class RiskSupervisor:
             if self._running:
                 return
             self._running = True
+            self._retire_simulated_schedules()
             self._reload_tracked()
             self._schedule_next_tick()
 
@@ -208,11 +214,33 @@ class RiskSupervisor:
         on_clock_tick`."""
         resolved_now = now if now is not None else self._clock.now()
         with self._lock:
+            self._retire_simulated_schedules()
             for record in self._repo.list_active():
                 if record.state is EodFlattenWorkflowState.PAUSED_SAFE:
                     continue
                 self._resume_one(record)
-            self._maybe_trigger_scheduled_flatten(resolved_now)
+            if not self._simulation:
+                self._maybe_trigger_scheduled_flatten(resolved_now)
+
+    def _retire_simulated_schedules(self) -> None:
+        if not self._simulation:
+            return
+        for record in self._repo.list_active():
+            if record.trigger is not EodFlattenTrigger.SCHEDULED or record.state not in (
+                EodFlattenWorkflowState.STARTED,
+                EodFlattenWorkflowState.WAITING_ACTIVE_ORDERS,
+            ):
+                continue
+            # Never got past waiting: no close was sent, and that day's simulated
+            # 04:55 exit belongs to the strategy replay.
+            updated = EodFlattenWorkflowStateMachine(record).mark_already_flat(at=self._clock.now())
+            self._repo.update(updated)
+            log_warning(
+                _logger,
+                "eod_flatten_simulation_schedule_retired",
+                workflow_id=str(updated.workflow_id.value),
+                trigger_key=record.trigger_key,
+            )
 
     # -- The independent entry-window gate -----------------------------------------------
 

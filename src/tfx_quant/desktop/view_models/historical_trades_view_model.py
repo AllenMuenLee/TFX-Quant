@@ -23,7 +23,9 @@ def missed_trades(
             and order.instrument == candidate.record.bar.instrument
             and order.contract == candidate.record.bar.contract
             and order.side == candidate.side
-            and order.idempotency_key == candidate.decision.intent_key
+            and candidate.decision.intent_key is not None
+            # A simulated re-execution runs under `<intent key>#retry<n>`.
+            and order.idempotency_key.split("#retry")[0] == candidate.decision.intent_key
         )
         remaining = candidate.quantity - executed
         if remaining > 0:

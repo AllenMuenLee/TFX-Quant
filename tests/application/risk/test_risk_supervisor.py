@@ -164,6 +164,7 @@ def _setup(
     session_healthy: bool = True,
     market_data_healthy: bool = True,
     initial_strategy_state: StrategyState = StrategyState.RUNNING,
+    simulation: bool = False,
 ) -> Harness:
     event_bus = FakeEventBus()
     gateway = MockTradeGateway(event_publisher=event_bus, positions=list(positions))
@@ -197,6 +198,7 @@ def _setup(
         market_data_healthy=lambda i, c: market_data_healthy,
         current_selection=lambda: FakeSelection(),
         selected_account=lambda: _ACCOUNT,
+        simulation=simulation,
     )
     return Harness(
         supervisor,
@@ -314,6 +316,34 @@ def test_scheduled_flatten_waits_for_active_orders_then_proceeds() -> None:
     h.supervisor.on_clock_tick()
     active = h.eod_repo.list_active()
     assert active[0].state is EodFlattenWorkflowState.CLOSE_ORDER_SUBMITTED
+
+
+def test_simulation_leaves_the_0455_flatten_to_the_simulated_strategy() -> None:
+    h = _setup(positions=(_position(1),), now=_at(4, 50), simulation=True)
+    h.supervisor.on_clock_tick()
+    h.clock.set(_at(4, 56))
+    h.supervisor.on_clock_tick()
+    assert h.eod_repo.list_active() == []
+    assert h.gateway.submitted_orders == []
+
+
+def test_simulation_retires_a_scheduled_flatten_left_waiting_by_an_earlier_run() -> None:
+    earlier = _setup(positions=(_position(1),), now=_at(4, 50))
+    earlier.order_repo.save_intent(_active_open_order())
+    earlier.supervisor.on_clock_tick()
+    earlier.clock.set(_at(4, 56))
+    earlier.supervisor.on_clock_tick()
+    (waiting,) = earlier.eod_repo.list_active()
+    assert waiting.state is EodFlattenWorkflowState.WAITING_ACTIVE_ORDERS
+
+    restarted = _setup(positions=(_position(1),), now=_at(13, 0), simulation=True)
+    restarted.eod_repo = earlier.eod_repo
+    restarted.supervisor._repo = earlier.eod_repo  # noqa: SLF001 - same file, next run
+    restarted.supervisor.on_clock_tick()
+
+    retired = earlier.eod_repo.find_by_workflow_id(waiting.workflow_id)
+    assert retired is not None and retired.state is EodFlattenWorkflowState.ALREADY_FLAT
+    assert restarted.gateway.submitted_orders == []
 
 
 def _replace_status(order: OrderIntent, status: OrderStatus) -> OrderIntent:

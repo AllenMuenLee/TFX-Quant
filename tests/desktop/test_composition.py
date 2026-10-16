@@ -15,7 +15,6 @@ from tfx_quant.application.connectivity.gateway_tracking import (
 )
 from tfx_quant.application.events.events import (
     BrokerSessionInvalidated,
-    FillReceived,
 )
 from tfx_quant.application.order_management.errors import OrderExposureExceededError
 from tfx_quant.application.order_management.order_manager import OrderManager, OrderRequest
@@ -33,7 +32,6 @@ from tfx_quant.desktop.composition import (
     load_settings,
 )
 from tfx_quant.domain.account import TradingAccount
-from tfx_quant.domain.fill import Fill
 from tfx_quant.domain.instrument import Instrument
 from tfx_quant.domain.money import Price
 from tfx_quant.domain.order import OrderKind, TimeInForce
@@ -247,18 +245,8 @@ def test_order_manager_position_lookup_is_the_reconciliation_service_not_a_flat_
         workflow_id="wiring-test",
         reason="composition wiring test",
     )
-    intent = services.order_manager.submit(submit_request)
-    fill = Fill(
-        client_order_id=intent.client_order_id,
-        instrument=resolved.instrument,
-        side=Side.BUY,
-        quantity=Quantity(1),
-        price=Price(Decimal("18500")),
-        at=services.clock.now(),
-        broker_fill_no="F-wiring",
-        broker_seq_no=1,
-    )
-    services.event_coordinator.publish(FillReceived(at=fill.at, fill=fill))
+    # The TEST composition's local simulator fills it inside `submit`.
+    services.order_manager.submit(submit_request)
     # Events are only dispatched once EventCoordinator's consumer thread is running;
     # `stop(timeout=...)` drains everything already queued before joining.
     services.event_coordinator.start()
@@ -380,49 +368,15 @@ def test_a_fill_flows_into_the_execution_ledger_via_composition(
             )
         )
 
+    # The TEST composition's local simulator acks and fills it inside `submit`.
     open_intent = _submit("open", Side.BUY, OrderKind.OPEN)
-    now = services.clock.now()
-    services.event_coordinator.publish(
-        _OrderReportReceived_ack(open_intent.client_order_id, "B-open", now)
-    )
-    services.event_coordinator.publish(
-        FillReceived(
-            at=now,
-            fill=Fill(
-                client_order_id=open_intent.client_order_id,
-                instrument=resolved.instrument,
-                side=Side.BUY,
-                quantity=Quantity(1),
-                price=Price(Decimal("18500")),
-                at=now,
-                broker_fill_no="F-open",
-                broker_seq_no=2,
-            ),
-        )
-    )
     services.event_coordinator.start()
     services.event_coordinator.stop(timeout=2)
 
     report = services.trade_report_facade.build_report(date(2020, 1, 1), date(2100, 1, 1))
     assert len(report.fills) == 1
-    assert report.fills[0].fill_id == "F-open"
+    assert report.fills[0].fill_id == f"SIM-F-{open_intent.client_order_id.value}"
     assert report.fills[0].simulation is True  # fixture default env is TEST
-
-
-def _OrderReportReceived_ack(client_id: Any, broker_order_no: str, at: Any) -> Any:
-    from tfx_quant.application.events.events import OrderReportReceived
-    from tfx_quant.domain.order_state_machine import OrderReport, OrderStatus
-
-    return OrderReportReceived(
-        at=at,
-        report=OrderReport(
-            client_order_id=client_id,
-            status=OrderStatus.ACKNOWLEDGED,
-            broker_seq_no=1,
-            at=at,
-            broker_order_no=broker_order_no,
-        ),
-    )
 
 
 def test_full_disconnect_after_login_drives_a_connectivity_safe_pause_via_composition(

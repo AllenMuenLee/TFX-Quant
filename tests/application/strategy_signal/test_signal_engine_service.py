@@ -124,6 +124,8 @@ def _rising_warmup_plus_entry(
 
 def _service(
     bars_reviewed: Callable[[list[Bar]], bool] | None = None,
+    position_lookup: Callable[[TradingAccount, Instrument, ContractMonth], NetPosition]
+    | None = None,
 ) -> tuple[
     StrategySignalEngineService, MockTradeGateway, SqliteOrderRepository, FakeEventBus, FakeClock
 ]:
@@ -146,6 +148,7 @@ def _service(
         event_bus=event_bus,
         selected_account=lambda: _ACCOUNT,
         bars_reviewed=bars_reviewed,
+        position_lookup=position_lookup,
     )
     return service, gateway, repo, event_bus, clock
 
@@ -335,6 +338,36 @@ def test_replaying_the_same_closed_bar_does_not_double_submit() -> None:
     event_bus.publish(
         BarClosed(at=bars[-1].end, instrument=_INSTRUMENT, contract=_CONTRACT, bar=bars[-1])
     )
+    assert len(gateway.submitted_orders) == 1
+
+
+def test_redelivered_bar_after_the_entry_fill_is_not_taken_as_an_add_on_bar() -> None:
+    _service_instance, gateway, _repo, event_bus, _clock = _service()
+    bars = _rising_warmup_plus_entry()
+    _publish_bars(event_bus, bars)
+    entry = gateway.submitted_orders[0]
+    gateway.simulate_ack(entry.client_order_id, "B0001")
+    gateway.simulate_fill(entry.client_order_id, 1, Decimal("10380"), broker_fill_no="F1")
+
+    _publish_bars(event_bus, [bars[-1]])
+
+    assert len(gateway.submitted_orders) == 1
+
+
+def test_exit_is_not_sent_when_nothing_is_actually_held() -> None:
+    _service_instance, gateway, _repo, event_bus, _clock = _service(
+        position_lookup=_flat_position_lookup
+    )
+    bars = _rising_warmup_plus_entry()
+    _publish_bars(event_bus, bars)
+    entry = gateway.submitted_orders[0]
+    gateway.simulate_ack(entry.client_order_id, "B0001")
+    gateway.simulate_fill(entry.client_order_id, 1, Decimal("10380"), broker_fill_no="F1")
+
+    # The engine still holds a lot, but the position was already closed another way:
+    # a 04:55 exit must not sell and open a short.
+    _service_instance.on_clock_tick(Timestamp(datetime(2026, 9, 17, 4, 55, tzinfo=TAIPEI_TZ)))
+
     assert len(gateway.submitted_orders) == 1
 
 

@@ -194,6 +194,39 @@ class StrategySignalEngine:
     def lots(self) -> tuple[LotFill, ...]:
         return tuple(self._lots)
 
+    @property
+    def last_bar_start(self) -> Timestamp | None:
+        """The open label of the most recent bar this engine evaluated."""
+        return self._last_bar_start
+
+    @property
+    def stop_loss_price(self) -> Decimal | None:
+        """The trade price at which the 300-point stop fires; `None` while flat."""
+        if self._position_side is PositionSide.FLAT or self._active_basis is None:
+            return None
+        if self._position_side is PositionSide.LONG:
+            return self._active_basis - self._config.stop_loss_points
+        return self._active_basis + self._config.stop_loss_points
+
+    def exit_watch_prices(self) -> tuple[Decimal, Decimal] | None:
+        """`(at_or_below, at_or_above)`: a trade strictly between the two prices can
+        neither trigger an exit nor move the profit tracking, so a replay may skip it.
+        `None` while flat."""
+        profit_basis = self._profit_basis()
+        stop = self.stop_loss_price
+        if stop is None or profit_basis is None:
+            return None
+        cfg = self._config
+        direction = Decimal(1) if self._position_side is PositionSide.LONG else Decimal(-1)
+        if self._profit_activated and self._max_favorable is not None:
+            pullback = profit_basis + direction * self._max_favorable * (1 - cfg.pullback_ratio)
+            adverse = max(stop, pullback) if direction > 0 else min(stop, pullback)
+            favorable = profit_basis + direction * self._max_favorable
+        else:
+            adverse = stop
+            favorable = profit_basis + direction * cfg.profit_activation_points
+        return (adverse, favorable) if direction > 0 else (favorable, adverse)
+
     # -- Inputs ---------------------------------------------------------------------------
 
     def on_bar_closed(
@@ -300,6 +333,14 @@ class StrategySignalEngine:
                 raise InvalidStrategyEngineError("closing fill exceeds held lots")
             if self._closed_quantity == len(self._lots):
                 self._reset_position()
+
+    def reset_market_history(self) -> None:
+        """Forget the closes and candle streak the 20MA/entry rules are built on, after
+        a missing or unreviewed bar. The held position, its stop basis and its profit
+        tracking are untouched: exits keep being evaluated while entries re-warm."""
+        self._closes = []
+        self._streak = CandleStreakCounter()
+        self._waiting_for_ma_breakout = False
 
     def _is_opening_side(self, side: Side) -> bool:
         if self._position_side is PositionSide.LONG:
