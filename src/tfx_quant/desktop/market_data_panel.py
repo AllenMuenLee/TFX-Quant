@@ -151,6 +151,10 @@ class CandlestickCanvas(wx.Panel):
         plot_w, plot_h = max(1, width - left - right), max(1, height - top - bottom)
         start_index, end_index = self._visible_range(plot_w)
         visible_bars = self._bars[start_index:end_index]
+        if not visible_bars:
+            dc.SetTextForeground(_TEXT)
+            dc.DrawLabel(self._empty_message, wx.Rect(0, 0, width, height), wx.ALIGN_CENTER)
+            return
         low = min(float(bar.low.amount) for bar in visible_bars)
         high = max(float(bar.high.amount) for bar in visible_bars)
         # Use the same zoom factor on both axes. At reset (1.0), the visible
@@ -202,6 +206,7 @@ class MarketDataPanel(wx.Panel):
         super().__init__(parent)
         self._services = services
         self._live_mode = True
+        self._displayed_target: tuple[Instrument, ContractMonth] | None = None
         self.SetBackgroundColour(_BG)
         self._canvas = CandlestickCanvas(self)
 
@@ -366,6 +371,10 @@ class MarketDataPanel(wx.Panel):
             return
         service = self._services.quote_runtime
         instrument, contract = current.instrument, current.contract
+        target = (instrument, contract)
+        if target != self._displayed_target:
+            self._displayed_target = target
+            self._canvas.reset_view()
         if self._live_mode:
             end = self._services.clock.now().value.astimezone(TAIPEI_TZ).date()
             records = service.query(end - timedelta(days=10), end)
@@ -420,4 +429,21 @@ class MarketDataPanel(wx.Panel):
             )
         self._review_button.Show(bool(review_starts))
         self.Layout()
-        self._canvas.set_bars(bars)
+        if not bars:
+            if not self._live_mode:
+                empty_message = f"{instrument.display_name_zh} {contract.code} 此區間沒有 K 線"
+            elif service.state is QuoteConnectionState.LOGGED_ON:
+                empty_message = (
+                    f"{instrument.display_name_zh} {contract.code} 尚無已收盤 K 棒，等待即時行情形成中…"
+                )
+            elif service.state in (QuoteConnectionState.IDLE, QuoteConnectionState.STOPPED):
+                empty_message = (
+                    f"{instrument.display_name_zh} {contract.code} 目前休市或尚未登入行情"
+                )
+            elif service.state in (QuoteConnectionState.CONNECTING, QuoteConnectionState.CONNECTED):
+                empty_message = f"{instrument.display_name_zh} {contract.code} 行情連線中，等待資料…"
+            else:
+                empty_message = f"{instrument.display_name_zh} {contract.code} 等待元大行情 API 資料…"
+        else:
+            empty_message = "此區間沒有 K 線"
+        self._canvas.set_bars(bars, empty_message=empty_message)

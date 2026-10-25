@@ -882,3 +882,26 @@ def test_editor_disables_current_and_future_inputs_and_reopens_after_close() -> 
     close = Timestamp(datetime(2026, 9, 16, 9, 45, tzinfo=TAIPEI_TZ))
     HistoryEditorPanel._update_editability(panel)  # type: ignore[arg-type]
     panel._save_button.Enable.assert_called_with(False)
+
+
+def test_on_switch_marshals_to_wx_main_thread_when_called_from_worker_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import MagicMock
+    import wx
+
+    h = _Harness(datetime(2026, 9, 15, 11, tzinfo=TAIPEI_TZ))
+    mock_app = MagicMock()
+    call_after_mock = MagicMock()
+    monkeypatch.setattr(wx, "GetApp", lambda: mock_app)
+    monkeypatch.setattr(wx, "IsMainThread", lambda: False)
+    monkeypatch.setattr(wx, "CallAfter", call_after_mock)
+
+    event = InstrumentSwitchCompleted(
+        at=h.clock.now(),
+        instrument=Instrument.TXF,
+        contract=_CONTRACT,
+        vendor_symbol=_SYMBOLS[Instrument.TXF],
+    )
+    h.runtime._on_switch(event)
+    call_after_mock.assert_called_once_with(h.runtime._live.select_symbols, h.runtime.recorded_symbols)

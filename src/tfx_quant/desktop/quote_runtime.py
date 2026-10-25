@@ -436,7 +436,16 @@ class QuoteRuntime:
         # left exactly as it is — same aggregator, same forming bar, same cutoff — so
         # switching the view never interrupts or restarts either recording.
         self._sync_streams()
-        self._live.select_symbols(self.recorded_symbols)
+        symbols = self.recorded_symbols
+        try:
+            import wx
+
+            if wx.GetApp() is not None and not wx.IsMainThread():
+                wx.CallAfter(self._live.select_symbols, symbols)
+                return
+        except ImportError:
+            pass
+        self._live.select_symbols(symbols)
 
     def _desired_contracts(self) -> dict[Instrument, ContractMonth]:
         current = self._selection.current
