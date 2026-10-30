@@ -8,7 +8,7 @@ UAT every row is simulated, so the P&L / positions / report tabs also carry the
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import timedelta
 from decimal import Decimal
 
 import wx
@@ -23,7 +23,12 @@ from tfx_quant.desktop.view_models.historical_trades_view_model import missed_tr
 from tfx_quant.desktop.view_models.orders_view_model import build_orders_view
 from tfx_quant.desktop.view_models.pnl_view_model import build_pnl_view
 from tfx_quant.desktop.view_models.positions_view_model import build_positions_view
-from tfx_quant.desktop.view_models.trade_report_view_model import build_trade_report_view
+from tfx_quant.desktop.view_models.trade_report_view_model import (
+    build_trade_report_view,
+    executed_trade_details,
+)
+from tfx_quant.domain.signal import SignalKind
+from tfx_quant.domain.timestamp import TAIPEI_TZ
 
 _ATTENTION_BG = wx.Colour(120, 30, 30)
 _SIM_BG = wx.Colour(60, 45, 12)
@@ -41,7 +46,25 @@ class TradingActivityPanel(wx.Panel):
         notebook = wx.Notebook(self)
         self._notebook = notebook
         self._orders = _grid(
-            notebook, ["本機單號", "券商單號", "方向", "開平", "口數", "已成交", "狀態", "時間"]
+            notebook,
+            [
+                "本機單號",
+                "券商單號",
+                "商品／契約",
+                "方向",
+                "開平",
+                "口數",
+                "已成交",
+                "委託價",
+                "成交均價",
+                "效期",
+                "狀態",
+                "訊號時間",
+                "送單時間",
+                "更新時間",
+                "交易原因",
+                "狀態細節",
+            ],
         )
         self._positions = _grid(
             notebook, ["商品", "契約", "淨口數", "均價", "現價", "未實現", "資料品質", "更新時間"]
@@ -52,16 +75,24 @@ class TradingActivityPanel(wx.Panel):
         self._report = _grid(
             notebook,
             [
-                "交易日／時間",
+                "進場訊號時間",
+                "進場時間",
+                "出場訊號時間",
+                "出場時間",
                 "商品／契約",
                 "方向",
                 "口數",
-                "開倉價／參考價",
+                "開倉價",
                 "平倉價",
                 "毛損益",
+                "手續費",
+                "交易稅",
                 "淨損益",
                 "成交性質",
-                "策略原因",
+                "進場原因",
+                "出場原因",
+                "進場委託／成交號",
+                "出場委託／成交號",
             ],
         )
         notebook.AddPage(self._orders, "委託／成交")
@@ -148,7 +179,7 @@ class TradingActivityPanel(wx.Panel):
 
     def refresh(self) -> None:
         services = self._services
-        end = date.today()
+        end = services.clock.now().value.astimezone(TAIPEI_TZ).date()
         start = end - timedelta(days=62)
 
         orders = build_orders_view(services.order_repository)
@@ -159,12 +190,20 @@ class TradingActivityPanel(wx.Panel):
                     [
                         r.local_order_id[:8],
                         r.broker_order_no or "—",
+                        r.instrument_contract,
                         r.direction,
                         r.effect,
                         str(r.lots),
                         str(r.cumulative_filled),
+                        r.requested_price,
+                        r.average_fill_price,
+                        r.time_in_force,
                         r.status,
+                        r.triggered_at,
+                        r.created_at,
                         r.updated_at,
+                        r.reason,
+                        r.status_detail,
                     ],
                     r.needs_attention,
                     False,
@@ -217,22 +256,33 @@ class TradingActivityPanel(wx.Panel):
             ],
         )
 
+        orders_for_history = list(services.order_repository.list_all())
+        candidates = list(services.quote_runtime.historical_trades())
         report = build_trade_report_view(services.trade_report_facade, start, end).report
+        details = executed_trade_details(report, orders_for_history, candidates)
         _fill_grid(
             self._report,
             [
                 (
                     [
-                        t.trading_day.isoformat(),
-                        t.instrument.value,
-                        t.side.value,
+                        details[t].entry_signal_at,
+                        details[t].entry_at,
+                        details[t].exit_signal_at,
+                        details[t].exit_at,
+                        f"{t.instrument.value} / {t.contract.code}",
+                        "做多" if t.side.value == "BUY" else "做空",
                         str(t.quantity),
                         f"{t.open_price:,.2f}",
                         f"{t.close_price:,.2f}",
                         _money(t.gross_pnl),
+                        _money(t.commission),
+                        _money(t.tax),
                         _money(t.net_pnl),
                         "模擬成交" if t.simulation else "實際成交",
-                        "",
+                        details[t].entry_reason,
+                        details[t].exit_reason,
+                        details[t].entry_reference,
+                        details[t].exit_reference,
                     ],
                     t.provisional,
                     t.simulation,
@@ -242,7 +292,18 @@ class TradingActivityPanel(wx.Panel):
             + [
                 (
                     [
-                        candidate.decision.at.value.strftime("%Y-%m-%d %H:%M"),
+                        (
+                            candidate.decision.at.value.strftime("%Y-%m-%d %H:%M:%S")
+                            if candidate.decision.signal_kind is not SignalKind.EXIT_ALL
+                            else "—"
+                        ),
+                        "—",
+                        (
+                            candidate.decision.at.value.strftime("%Y-%m-%d %H:%M:%S")
+                            if candidate.decision.signal_kind is SignalKind.EXIT_ALL
+                            else "—"
+                        ),
+                        "—",
                         f"{candidate.record.bar.instrument.value} / "
                         f"{candidate.record.bar.contract.code}",
                         "買進" if candidate.side.value == "BUY" else "賣出",
@@ -251,19 +312,28 @@ class TradingActivityPanel(wx.Panel):
                         "—",
                         "—",
                         "—",
+                        "—",
+                        "—",
+                        ("歷史模擬・成交處理中" if services.simulation else "歷史推算・未實際成交"),
                         (
-                            "歷史模擬・成交處理中"
-                            if services.simulation
-                            else "歷史推算・未實際成交"
+                            candidate.decision.reason
+                            if candidate.decision.signal_kind is not SignalKind.EXIT_ALL
+                            else "—"
                         ),
-                        candidate.decision.reason,
+                        (
+                            candidate.decision.reason
+                            if candidate.decision.signal_kind is SignalKind.EXIT_ALL
+                            else "—"
+                        ),
+                        "—",
+                        "—",
                     ],
                     False,
                     True,
                 )
                 for candidate in missed_trades(
-                    services.quote_runtime.historical_trades(),
-                    services.order_repository.list_all(),
+                    candidates,
+                    orders_for_history,
                     services.broker_session.selected_account,
                 )
             ],

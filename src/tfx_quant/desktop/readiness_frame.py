@@ -42,6 +42,7 @@ _NIGHT_RESUME_LEAD = timedelta(seconds=10)
 # wx.Timer takes a signed 32-bit millisecond interval. Long waits are split without
 # resolving contracts until the actual expiry deadline is reached.
 _MAX_TIMER_DELAY_MS = 2_147_483_647
+_QUOTE_WATCHDOG_INTERVAL_MS = 3_000
 
 _ENVIRONMENT_CHOICES: tuple[Environment, ...] = (Environment.TEST, Environment.PRODUCTION)
 _ENVIRONMENT_LABELS = ("模擬下單（真實行情）", "正式下單（PRODUCTION）")
@@ -157,6 +158,13 @@ class ReadinessFrame(wx.Frame):
         self.Bind(wx.EVT_WINDOW_DESTROY, self._on_destroy)
         self._arm_night_resume()
 
+        # Backup path independent of MarketDataPanel's repaint timer. It continuously
+        # drives quote health checks, reconnects and subscription retries even when the
+        # market panel is hidden or its own refresh handler stops running.
+        self._quote_watchdog_timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self._on_quote_watchdog_wake, self._quote_watchdog_timer)
+        self._quote_watchdog_timer.Start(_QUOTE_WATCHDOG_INTERVAL_MS)
+
         self._contract_rollover_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self._on_contract_rollover_wake, self._contract_rollover_timer)
         self._arm_contract_rollover()
@@ -239,11 +247,25 @@ class ReadinessFrame(wx.Frame):
                 error_type=type(exc).__name__,
             )
 
+    def _on_quote_watchdog_wake(self, _event: wx.TimerEvent) -> None:
+        if self._closing:
+            return
+        try:
+            self._services.quote_runtime.refresh()
+        except Exception as exc:  # noqa: BLE001
+            log_warning(
+                _logger,
+                "market_data_backup_watchdog_failed",
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+
     def _on_destroy(self, event: wx.WindowDestroyEvent) -> None:
         if event.GetEventObject() is self:
             self._closing = True
             self._contract_rollover_timer.Stop()
             self._night_resume_timer.Stop()
+            self._quote_watchdog_timer.Stop()
         event.Skip()
 
     def _on_show_trade_history(self, _event: wx.CommandEvent) -> None:
@@ -361,6 +383,7 @@ class ReadinessFrame(wx.Frame):
         self._closing = True
         self._contract_rollover_timer.Stop()
         self._night_resume_timer.Stop()
+        self._quote_watchdog_timer.Stop()
         for unsubscribe in self._unsubscribers:
             unsubscribe()
         event.Skip()

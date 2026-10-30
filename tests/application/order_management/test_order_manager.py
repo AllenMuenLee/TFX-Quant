@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from collections import defaultdict
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any
@@ -19,6 +20,7 @@ from tfx_quant.application.order_management.errors import (
 from tfx_quant.application.order_management.order_manager import OrderManager, OrderRequest
 from tfx_quant.domain.account import TradingAccount
 from tfx_quant.domain.contract import ContractMonth
+from tfx_quant.domain.errors import InvalidOrderError
 from tfx_quant.domain.instrument import Instrument
 from tfx_quant.domain.money import Price
 from tfx_quant.domain.order import ClientOrderId, OrderKind, TimeInForce
@@ -149,6 +151,16 @@ def test_non_mxf_order_is_rejected_before_persistence_or_gateway_call() -> None:
     assert gateway.submitted_orders == []
 
 
+def test_order_without_a_reason_is_rejected_before_persistence() -> None:
+    manager, gateway, repo, _bus = _manager()
+
+    with pytest.raises(InvalidOrderError, match="交易原因"):
+        manager.submit(replace(_request(), reason="  "))
+
+    assert repo.find_by_idempotency_key("key-1") is None
+    assert gateway.submitted_orders == []
+
+
 def test_normal_fill_reaches_filled_with_correct_avg_price() -> None:
     manager, gateway, repo, _bus = _manager()
     intent = manager.submit(_request())
@@ -162,6 +174,10 @@ def test_normal_fill_reaches_filled_with_correct_avg_price() -> None:
     assert resolved.status is OrderStatus.FILLED
     assert resolved.filled_quantity == 1
     assert resolved.avg_fill_price == Price(Decimal("18500"))
+    assert resolved.reason == "test"
+    assert resolved.triggered_at == resolved.created_at
+    assert resolved.requested_price == _PRICE
+    assert resolved.time_in_force is TimeInForce.ROD
     assert len(gateway.submitted_orders) == 1
 
 

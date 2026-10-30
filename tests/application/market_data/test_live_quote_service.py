@@ -156,3 +156,104 @@ def test_reselecting_an_unchanged_set_never_touches_the_running_registrations() 
     service.select_symbols(("MXFI6", "TXFI6"))
     assert gateways[0].unsubscriptions == []
     assert gateways[0].subscriptions == [("TXFI6", 1), ("MXFI6", 1)]
+
+
+@pytest.mark.parametrize("failed_state", (QuoteConnectionState.FAILED, QuoteConnectionState.STALE))
+def test_failed_or_stale_connection_is_rebuilt_and_resubscribed(
+    failed_state: QuoteConnectionState,
+) -> None:
+    service, gateways, clock = _service()
+    service.start("A123456789", SecretStr("secret"), ("TXFI6", "MXFI6"))
+    gateways[0].state = failed_state
+
+    clock.value = clock.value.replace(second=14)
+    service.refresh()
+    assert len(gateways) == 1
+
+    clock.value = clock.value.replace(second=15)
+    service.refresh()
+    assert gateways[0].stopped
+    assert gateways[1].connections == [("apiquote.yuantafutures.com.tw", 80, 1)]
+    assert gateways[1].subscriptions == [("TXFI6", 1), ("MXFI6", 1)]
+
+
+def test_logged_on_but_silent_feed_is_rebuilt_after_thirty_seconds() -> None:
+    service, gateways, clock = _service()
+    service.start("A123456789", SecretStr("secret"), ("TXFI6", "MXFI6"))
+    service.note_event("TXFI6", Timestamp(clock.value))
+    service.note_event("MXFI6", Timestamp(clock.value))
+
+    clock.value = clock.value.replace(second=29)
+    service.refresh()
+    assert len(gateways) == 1
+
+    clock.value = clock.value.replace(second=30)
+    service.refresh()
+    assert gateways[0].stopped
+    assert gateways[1].connections == [("apiquote.yuantafutures.com.tw", 80, 1)]
+    assert gateways[1].subscriptions == [("TXFI6", 1), ("MXFI6", 1)]
+
+
+def test_logged_on_but_never_received_first_event_is_also_rebuilt() -> None:
+    service, gateways, clock = _service()
+    service.start("A123456789", SecretStr("secret"), ("TXFI6", "MXFI6"))
+
+    clock.value = clock.value.replace(second=30)
+    service.refresh()
+
+    assert gateways[0].stopped
+    assert len(gateways) == 2
+
+
+def test_silence_outside_an_actual_market_window_does_not_reconnect() -> None:
+    service, gateways, clock = _service()
+    service._market_is_open = lambda _at: False
+    service.start("A123456789", SecretStr("secret"), ("TXFI6", "MXFI6"))
+
+    clock.value = clock.value.replace(minute=1)
+    service.refresh()
+
+    assert len(gateways) == 1
+    assert not gateways[0].stopped
+
+
+def test_forced_recovery_reports_the_missing_interval() -> None:
+    service, gateways, clock = _service()
+    recovered: list[tuple[Timestamp, Timestamp, str]] = []
+    service._on_forced_recovery = lambda start, end, reason: recovered.append((start, end, reason))
+    service.start("A123456789", SecretStr("secret"), ("TXFI6",))
+
+    clock.value = clock.value.replace(second=30)
+    service.refresh()
+
+    assert gateways[0].stopped
+    assert recovered == [
+        (
+            Timestamp(clock.value.replace(second=0)),
+            Timestamp(clock.value),
+            "logged on but quote feed is silent: TXFI6",
+        )
+    ]
+
+
+def test_each_symbol_has_an_independent_valid_trade_heartbeat() -> None:
+    service, gateways, clock = _service()
+    service.start("A123456789", SecretStr("secret"), ("TXFI6", "MXFI6"))
+    clock.value = clock.value.replace(second=20)
+    service.note_event("TXFI6", Timestamp(clock.value))
+
+    clock.value = clock.value.replace(second=30)
+    service.refresh()
+
+    assert gateways[0].stopped
+    assert len(gateways) == 2
+
+
+def test_invalidated_subscription_is_registered_again() -> None:
+    service, gateways, _clock = _service()
+    service.start("A123456789", SecretStr("secret"), ("TXFI6", "MXFI6"))
+
+    service.invalidate_subscription("MXFI6")
+    service.refresh()
+
+    assert gateways[0].subscriptions == [("TXFI6", 1), ("MXFI6", 1), ("MXFI6", 1)]

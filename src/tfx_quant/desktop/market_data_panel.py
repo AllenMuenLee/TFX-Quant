@@ -13,6 +13,8 @@ from tfx_quant.desktop.composition import ServiceContainer
 from tfx_quant.desktop.history_editor_panel import HistoryEditorPanel
 from tfx_quant.domain.bar import Bar
 from tfx_quant.domain.bar_record import rolling_two_month_start
+from tfx_quant.domain.contract import ContractMonth
+from tfx_quant.domain.instrument import Instrument
 from tfx_quant.domain.timestamp import TAIPEI_TZ, Timestamp
 from tfx_quant.telemetry import get_logger, log_warning
 
@@ -399,8 +401,10 @@ class MarketDataPanel(wx.Panel):
                 QuoteConnectionState.IDLE: "行情尚未連線",
                 QuoteConnectionState.STOPPED: "行情尚未登入或目前休市",
             }.get(service.state, f"行情狀態：{service.state.value}")
+            recoveries = getattr(service, "forced_recovery_count", 0)
             self._status.SetLabel(
                 f"{instrument.display_name_zh} · 自動近月 {contract.code}  |  {health} · {updated}"
+                + (f" · 備援已自動修復 {recoveries} 次" if recoveries else "")
             )
         else:
             start, end = _date(self._start.GetValue()), _date(self._end.GetValue())
@@ -434,16 +438,21 @@ class MarketDataPanel(wx.Panel):
                 empty_message = f"{instrument.display_name_zh} {contract.code} 此區間沒有 K 線"
             elif service.state is QuoteConnectionState.LOGGED_ON:
                 empty_message = (
-                    f"{instrument.display_name_zh} {contract.code} 尚無已收盤 K 棒，等待即時行情形成中…"
+                    f"{instrument.display_name_zh} {contract.code} "
+                    "尚無已收盤 K 棒，等待即時行情形成中…"
                 )
             elif service.state in (QuoteConnectionState.IDLE, QuoteConnectionState.STOPPED):
                 empty_message = (
                     f"{instrument.display_name_zh} {contract.code} 目前休市或尚未登入行情"
                 )
             elif service.state in (QuoteConnectionState.CONNECTING, QuoteConnectionState.CONNECTED):
-                empty_message = f"{instrument.display_name_zh} {contract.code} 行情連線中，等待資料…"
+                empty_message = (
+                    f"{instrument.display_name_zh} {contract.code} 行情連線中，等待資料…"
+                )
             else:
-                empty_message = f"{instrument.display_name_zh} {contract.code} 等待元大行情 API 資料…"
+                empty_message = (
+                    f"{instrument.display_name_zh} {contract.code} 等待元大行情 API 資料…"
+                )
         else:
             empty_message = "此區間沒有 K 線"
         self._canvas.set_bars(bars, empty_message=empty_message)

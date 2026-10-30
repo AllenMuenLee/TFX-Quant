@@ -48,7 +48,7 @@ from tfx_quant.application.ports.order_repository import OrderIntentSaveOutcome,
 from tfx_quant.application.ports.yuanta_gateways import TradeGatewayPort
 from tfx_quant.domain.account import TradingAccount
 from tfx_quant.domain.contract import ContractMonth
-from tfx_quant.domain.errors import IllegalStateTransitionError
+from tfx_quant.domain.errors import IllegalStateTransitionError, InvalidOrderError
 from tfx_quant.domain.fill import Fill
 from tfx_quant.domain.instrument import Instrument
 from tfx_quant.domain.money import Price
@@ -106,6 +106,7 @@ class OrderRequest:
     idempotency_key: str
     workflow_id: str
     reason: str
+    triggered_at: Timestamp | None = None
 
 
 class OrderManager:
@@ -169,6 +170,8 @@ class OrderManager:
 
     def submit(self, request: OrderRequest) -> OrderIntent:
         with self._lock:
+            if not request.reason.strip():
+                raise InvalidOrderError("每筆委託都必須提供非空白的交易原因")
             if request.instrument is not Instrument.MXF:
                 log_warning(
                     _logger,
@@ -225,6 +228,10 @@ class OrderManager:
                 status=OrderStatus.CREATED,
                 created_at=now,
                 updated_at=now,
+                reason=request.reason,
+                triggered_at=request.triggered_at or now,
+                requested_price=request.price,
+                time_in_force=request.time_in_force,
             )
             outcome = self._order_repository.save_intent(intent)
             log_info(

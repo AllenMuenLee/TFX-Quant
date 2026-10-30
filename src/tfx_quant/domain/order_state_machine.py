@@ -28,7 +28,7 @@ from tfx_quant.domain.contract import ContractMonth
 from tfx_quant.domain.errors import IllegalStateTransitionError, InvalidOrderError
 from tfx_quant.domain.instrument import Instrument
 from tfx_quant.domain.money import Price
-from tfx_quant.domain.order import ClientOrderId, OrderKind
+from tfx_quant.domain.order import ClientOrderId, OrderKind, TimeInForce
 from tfx_quant.domain.quantity import NetPosition, Quantity
 from tfx_quant.domain.side import Side
 from tfx_quant.domain.timestamp import Timestamp
@@ -166,6 +166,10 @@ class OrderIntent:
     last_applied_broker_seq_no: int | None = None
     last_event_summary: str = ""
     reject_reason: str | None = None
+    reason: str = ""
+    triggered_at: Timestamp | None = None
+    requested_price: Price | None = None
+    time_in_force: TimeInForce | None = None
 
     def __post_init__(self) -> None:
         if not (0 <= self.filled_quantity <= self.quantity.lots):

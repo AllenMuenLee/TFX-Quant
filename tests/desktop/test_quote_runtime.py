@@ -315,7 +315,7 @@ def test_the_charted_market_selects_which_recorded_stream_the_chart_shows() -> N
     assert harness.runtime.forming_bar is None
 
 
-def test_boundary_under_way_at_login_is_neither_drawn_nor_persisted() -> None:
+def test_boundary_under_way_at_login_is_drawn_and_persisted_for_review() -> None:
     harness = _Harness(datetime(2026, 9, 1, 10, 12, tzinfo=TAIPEI_TZ), charted=Instrument.MXF)
     harness.login()
     gateway = harness.gateways[0]
@@ -330,15 +330,23 @@ def test_boundary_under_way_at_login_is_neither_drawn_nor_persisted() -> None:
             )
         )
 
-    # 09:45-10:45 was already half over at login: nothing to draw...
-    assert harness.runtime.forming_bar is None
+    # 09:45-10:45 was already half over at login. Keep it visible, but make the
+    # missing head explicit so it cannot be treated as reliable strategy input.
+    assert harness.runtime.forming_bar is not None
+    assert harness.runtime.forming_bar.start.value == datetime(
+        2026, 9, 1, 9, 45, tzinfo=TAIPEI_TZ
+    )
+    assert harness.runtime.forming_needs_review
 
     harness.clock.value = datetime(2026, 9, 1, 10, 46, tzinfo=TAIPEI_TZ)
     harness.runtime.refresh()
 
-    # ...and nothing persisted or published when that boundary passes.
-    assert harness.closed == []
-    assert harness.runtime.query(date(2026, 9, 1), date(2026, 9, 1)) == []
+    # The fragment remains visible in history as incomplete and requires review.
+    records = harness.runtime.query(date(2026, 9, 1), date(2026, 9, 1))
+    assert len(harness.closed) == 1
+    assert len(records) == 1
+    assert records[0].bar.start.value == datetime(2026, 9, 1, 9, 45, tzinfo=TAIPEI_TZ)
+    assert not records[0].is_complete
 
 
 def test_login_exactly_on_an_open_label_records_that_boundary() -> None:
@@ -383,7 +391,9 @@ def test_a_gap_marks_only_its_own_symbols_stream_incomplete() -> None:
             Timestamp(datetime(2026, 9, 1, 9, 45, tzinfo=TAIPEI_TZ)),
         )
         assert record is not None
-        assert record.is_complete == (instrument is Instrument.MXF)
+        # The explicit TXF disconnect plus 45 minutes without callbacks from either
+        # highly-liquid recorded market makes both streams unreliable.
+        assert not record.is_complete
 
 
 def _bar_at(harness: _Harness, hour: int, minute: int) -> BarRecord | None:
@@ -424,9 +434,10 @@ def test_a_quote_relogin_keeps_the_bar_in_progress_for_review() -> None:
         Decimal("18000"),
         Decimal("18020"),
     )
-    # The next bar was recorded end to end after the re-login.
+    # The next bar has no callbacks after 10:50. The backup watchdog therefore refuses
+    # to call it complete instead of silently accepting a 55-minute data outage.
     following = _bar_at(harness, 10, 45)
-    assert following is not None and following.is_complete
+    assert following is not None and not following.is_complete
 
 
 def test_a_bar_closing_while_the_quote_feed_is_stopped_needs_review() -> None:

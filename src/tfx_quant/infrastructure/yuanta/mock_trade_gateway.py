@@ -314,6 +314,7 @@ class MockTradeGateway:
         if existing is None or prior == 0 or (prior > 0) != (updated > 0):
             average = fill.price
         elif (prior > 0) == (delta > 0):
+            assert existing.average_price is not None
             total = abs(prior) + abs(delta)
             average = Price(
                 (existing.average_price.amount * abs(prior) + fill.price.amount * abs(delta))

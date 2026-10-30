@@ -54,13 +54,11 @@ class RealtimeBarAggregator:
     proves the configured close boundary has passed.
 
     ``recording_started_at`` is when this aggregator's quote feed actually began
-    delivering events. The boundary that was already in progress at that instant can
-    only ever be observed from its middle, so its open/high/low and volume would be
-    those of a fragment while `LocalClosedBarWriter` would still persist it as a
-    complete bar and publish a `BarClosed` the strategy would treat as real. Such a
-    boundary is therefore dropped whole: aggregation starts at the first boundary whose
-    own open label is at or after ``recording_started_at`` (starting exactly on an open
-    label keeps that boundary — nothing of it was missed). ``None`` disables the rule.
+    delivering events. A boundary already in progress at that instant is exposed and
+    persisted so the operator can still see the live market after a restart, but is
+    marked incomplete: its open/high/low and volume cover only a fragment and must never
+    be published to the strategy as reliable history. Starting exactly on an open label
+    keeps the boundary complete. ``None`` disables the rule.
     """
 
     def __init__(
@@ -93,9 +91,9 @@ class RealtimeBarAggregator:
         boundary = self._resolve(event.matched_at)
         if boundary is None:
             return []
-        if self._started_at is not None and boundary[0].value < self._started_at.value:
-            # A boundary already under way when recording began — see the class docstring.
-            return []
+        started_mid_boundary = (
+            self._started_at is not None and boundary[0].value < self._started_at.value
+        )
         # An open gap ends at the first valid trade observed after it.
         self._review_intervals = [
             (
@@ -105,7 +103,7 @@ class RealtimeBarAggregator:
             for start, end in self._review_intervals
             if end is None or end.value >= boundary[0].value
         ]
-        needs_review = any(
+        needs_review = started_mid_boundary or any(
             start.value < boundary[1].value and (end is None or end.value >= boundary[0].value)
             for start, end in self._review_intervals
         )

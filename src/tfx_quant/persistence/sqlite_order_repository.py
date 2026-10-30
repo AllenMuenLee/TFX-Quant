@@ -31,7 +31,7 @@ from tfx_quant.domain.account import TradingAccount
 from tfx_quant.domain.contract import ContractMonth
 from tfx_quant.domain.instrument import Instrument
 from tfx_quant.domain.money import Price
-from tfx_quant.domain.order import ClientOrderId, OrderKind
+from tfx_quant.domain.order import ClientOrderId, OrderKind, TimeInForce
 from tfx_quant.domain.order_state_machine import LocalOrderId, OrderIntent, OrderStatus
 from tfx_quant.domain.quantity import Quantity
 from tfx_quant.domain.side import Side
@@ -69,7 +69,11 @@ CREATE TABLE IF NOT EXISTS order_intents (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     last_event_summary TEXT NOT NULL,
-    reject_reason TEXT
+    reject_reason TEXT,
+    reason TEXT NOT NULL DEFAULT '',
+    triggered_at TEXT,
+    requested_price TEXT,
+    time_in_force TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_order_intents_status ON order_intents (status);
 CREATE INDEX IF NOT EXISTS idx_order_intents_contract
@@ -88,7 +92,9 @@ _SELECT_COLUMNS = (
     "local_order_id, client_order_id, idempotency_key, workflow_id, account_branch_id, "
     "account_no, account_sub_account, instrument, contract_year, contract_month, side, "
     "kind, quantity_lots, status, broker_order_no, filled_quantity, avg_fill_price, "
-    "last_applied_broker_seq_no, created_at, updated_at, last_event_summary, reject_reason"
+    "last_applied_broker_seq_no, created_at, updated_at, last_event_summary, "
+    "reject_reason, reason, "
+    "triggered_at, requested_price, time_in_force"
 )
 
 
@@ -116,6 +122,18 @@ class SqliteOrderRepository:
         self._lock = threading.Lock()
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            columns = {
+                str(row[1]) for row in self._conn.execute("PRAGMA table_info(order_intents)")
+            }
+            additions = {
+                "reason": "TEXT NOT NULL DEFAULT ''",
+                "triggered_at": "TEXT",
+                "requested_price": "TEXT",
+                "time_in_force": "TEXT",
+            }
+            for name, declaration in additions.items():
+                if name not in columns:
+                    self._conn.execute(f"ALTER TABLE order_intents ADD COLUMN {name} {declaration}")
             self._conn.commit()
 
     # -- Writes -----------------------------------------------------------------------
@@ -127,7 +145,7 @@ class SqliteOrderRepository:
                 self._conn.execute(
                     f"""
                     INSERT INTO order_intents ({_SELECT_COLUMNS})
-                    VALUES ({", ".join("?" * 22)})
+                    VALUES ({", ".join("?" * 26)})
                     """,
                     _intent_to_params(intent),
                 )
@@ -353,6 +371,10 @@ def _intent_to_params(intent: OrderIntent) -> tuple[object, ...]:
         intent.updated_at.value.isoformat(),
         intent.last_event_summary,
         intent.reject_reason,
+        intent.reason,
+        None if intent.triggered_at is None else intent.triggered_at.value.isoformat(),
+        _price_text(intent.requested_price),
+        None if intent.time_in_force is None else intent.time_in_force.value,
     )
 
 
@@ -380,6 +402,10 @@ def _row_to_intent(row: tuple[object, ...]) -> OrderIntent:
         updated_at,
         last_event_summary,
         reject_reason,
+        reason,
+        triggered_at,
+        requested_price,
+        time_in_force,
     ) = row
     assert isinstance(local_order_id_raw, str)
     assert isinstance(client_order_id_raw, str)
@@ -419,6 +445,10 @@ def _row_to_intent(row: tuple[object, ...]) -> OrderIntent:
         updated_at=_dt(updated_at),
         last_event_summary=last_event_summary,
         reject_reason=None if reject_reason is None else str(reject_reason),
+        reason=str(reason),
+        triggered_at=None if triggered_at is None else _dt(str(triggered_at)),
+        requested_price=_parse_price(requested_price),
+        time_in_force=None if time_in_force is None else TimeInForce(str(time_in_force)),
     )
 
 

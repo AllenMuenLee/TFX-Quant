@@ -210,9 +210,7 @@ class StrategySignalEngineService:
         with self._lock:
             self._engines[key] = replay.engine
             self._last_trade_at.pop(key, None)
-            self._review_windows[key] = [
-                record.bar for record in replay.review_bars[-max_review:]
-            ]
+            self._review_windows[key] = [record.bar for record in replay.review_bars[-max_review:]]
         log_info(
             _logger,
             "strategy_signal_engine_history_installed",
@@ -495,6 +493,7 @@ class StrategySignalEngineService:
             idempotency_key=decision.intent_key,
             workflow_id=decision.intent_key,
             reason=decision.reason,
+            triggered_at=decision.at,
         )
         try:
             self._order_manager.submit(request)

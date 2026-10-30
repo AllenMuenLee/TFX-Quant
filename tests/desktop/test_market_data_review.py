@@ -63,6 +63,18 @@ def test_night_wake_connects_immediately_without_waiting_until_1500() -> None:
     deferred.assert_not_called()
 
 
+def test_backup_watchdog_refreshes_quotes_independently_of_market_panel() -> None:
+    runtime = MagicMock()
+    frame = SimpleNamespace(
+        _closing=False,
+        _services=SimpleNamespace(quote_runtime=runtime),
+    )
+
+    ReadinessFrame._on_quote_watchdog_wake(frame, None)  # type: ignore[arg-type]
+
+    runtime.refresh.assert_called_once()
+
+
 def test_market_data_panel_resets_view_and_sets_empty_message_on_contract_change() -> None:
     from types import SimpleNamespace
     from unittest.mock import MagicMock
@@ -88,7 +100,9 @@ def test_market_data_panel_resets_view_and_sets_empty_message_on_contract_change
         state=QuoteConnectionState.LOGGED_ON,
         has_market_data_warning=False,
     )
-    clock = SimpleNamespace(now=MagicMock(return_value=Timestamp(datetime(2026, 10, 24, 10, 0, tzinfo=TAIPEI_TZ))))
+    clock = SimpleNamespace(
+        now=MagicMock(return_value=Timestamp(datetime(2026, 10, 24, 10, 0, tzinfo=TAIPEI_TZ)))
+    )
     services = SimpleNamespace(
         quote_runtime=quote_runtime,
         instrument_selection=selection_service,
@@ -115,7 +129,10 @@ def test_market_data_panel_resets_view_and_sets_empty_message_on_contract_change
     canvas.set_bars.assert_called_once()
     bars_arg, kwargs = canvas.set_bars.call_args
     assert bars_arg[0] == []
-    assert f"{Instrument.TXF.display_name_zh} 202611 尚無已收盤 K 棒，等待即時行情形成中…" in kwargs["empty_message"]
+    assert (
+        f"{Instrument.TXF.display_name_zh} 202611 尚無已收盤 K 棒，等待即時行情形成中…"
+        in kwargs["empty_message"]
+    )
 
 
 def test_candlestick_canvas_handles_empty_bars_without_error() -> None:

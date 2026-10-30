@@ -22,6 +22,7 @@ from tfx_quant.desktop.view_models.positions_view_model import build_positions_v
 from tfx_quant.desktop.view_models.trade_report_view_model import (
     build_trade_report_view,
     drill_down,
+    executed_trade_details,
 )
 from tfx_quant.domain.account import TradingAccount
 from tfx_quant.domain.contract import ContractMonth
@@ -161,6 +162,12 @@ def test_orders_view_rows_and_attention_flag() -> None:
     assert rows[0].lots == 2
     assert rows[0].cumulative_filled == 2
     assert rows[0].status == "全部成交"
+    assert rows[0].instrument_contract == "MXF / 202609"
+    assert rows[0].requested_price == "18500"
+    assert rows[0].average_fill_price == "18500"
+    assert rows[0].time_in_force == "ROD"
+    assert rows[0].reason == "test"
+    assert rows[0].triggered_at == "2026-08-25 11:00:00"
     assert rows[0].needs_attention is False
     assert "*" in (rows[0].broker_order_no or "")
 
@@ -283,3 +290,42 @@ def test_trade_report_drilldown_walks_fills_intents_and_audit_timeline() -> None
     assert set(result.order_correlations) == {"corr-1", "corr-2"}
     assert {i.workflow_id for i in result.intents} == {"corr-1", "corr-2"}
     assert [s.seq for s in result.timeline] == [1, 2]
+
+
+def test_executed_trade_details_show_both_fill_times_and_saved_reasons() -> None:
+    w = _wire()
+    _fill(
+        w,
+        key="buy",
+        wf="corr-open",
+        side=Side.BUY,
+        qty=1,
+        price="100",
+        fill_no="F-open",
+        kind=OrderKind.OPEN,
+    )
+    _fill(
+        w,
+        key="sell",
+        wf="corr-close",
+        side=Side.SELL,
+        qty=1,
+        price="110",
+        fill_no="F-close",
+        kind=OrderKind.CLOSE,
+    )
+    report = build_trade_report_view(w["facade"], *_WIDE).report
+
+    details = executed_trade_details(report, list(w["order_repo"].list_all()), [])
+    row = details[report.realized_trades[0]]
+
+    fills = {fill.fill_id: fill for fill in report.fills}
+    assert row.entry_at == fills["F-open"].filled_at.value.strftime("%Y-%m-%d %H:%M:%S")
+    assert row.exit_at == fills["F-close"].filled_at.value.strftime("%Y-%m-%d %H:%M:%S")
+    assert row.entry_reason == "test"
+    assert row.exit_reason == "test"
+    assert row.entry_signal_at == "2026-08-25 11:00:00"
+    assert row.exit_signal_at == "2026-08-25 11:00:00"
+    trade = report.realized_trades[0]
+    assert trade.open_fill_ids[0] in row.entry_reference
+    assert trade.close_fill_id in row.exit_reference

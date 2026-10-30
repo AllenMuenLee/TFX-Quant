@@ -532,9 +532,9 @@ def build_services(
         clock=clock,
         id_generator=id_generator,
         event_bus=event_coordinator,
-        # 測試環境 only: the simulated strategy's engine is rebuilt from the replay, so an
-        # exit is sized to what the simulator actually holds and never reverses it.
-        position_lookup=reconciliation_service.expected_net_lookup if is_test_env else None,
+        # Use reconciled positions in both environments so exposure validation and
+        # close sizing never assume an always-flat production account.
+        position_lookup=reconciliation_service.expected_net_lookup,
     )
 
     # Must run after `reconciliation_service`/`order_manager` have all subscribed their
@@ -667,9 +667,9 @@ def build_services(
         selected_account=lambda: broker_session.selected_account,
         risk_gate=risk_supervisor.validate_entry_window,
         bars_reviewed=quote_runtime.bars_reviewed,
-        # 測試環境 only: the simulated strategy's engine is rebuilt from the replay, so an
-        # exit is sized to what the simulator actually holds and never reverses it.
-        position_lookup=reconciliation_service.expected_net_lookup if is_test_env else None,
+        # Size exits from reconciled holdings in both environments so a stale strategy
+        # assumption can never close too many lots and accidentally reverse a position.
+        position_lookup=reconciliation_service.expected_net_lookup,
     )
     bar_signal_state_store.add(signal_engine_service)
 

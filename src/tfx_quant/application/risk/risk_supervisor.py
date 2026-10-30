@@ -518,7 +518,8 @@ class RiskSupervisor:
             time_in_force=TimeInForce.ROD,
             idempotency_key=f"{record.workflow_id.value}:close",
             workflow_id=str(record.workflow_id.value),
-            reason=f"eod flatten workflow {record.workflow_id.value} ({record.trigger.value})",
+            reason=f"風控強制平倉（觸發原因：{record.trigger.value}）",
+            triggered_at=record.created_at,
         )
         try:
             order_intent = self._order_manager.submit(request)

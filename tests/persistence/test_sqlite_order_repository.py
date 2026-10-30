@@ -56,11 +56,39 @@ def repo() -> SqliteOrderRepository:
 
 
 def test_save_intent_inserts(repo: SqliteOrderRepository) -> None:
-    intent = _intent()
+    intent = replace(_intent(), reason="均線突破進場")
     outcome = repo.save_intent(intent)
     assert outcome is OrderIntentSaveOutcome.INSERTED
     found = repo.find_by_local_order_id(intent.local_order_id)
     assert found == intent
+
+
+def test_existing_database_is_migrated_with_empty_reason() -> None:
+    connection = sqlite3.connect(":memory:", check_same_thread=False)
+    connection.execute(
+        """
+        CREATE TABLE order_intents (
+            local_order_id TEXT PRIMARY KEY, client_order_id TEXT NOT NULL UNIQUE,
+            idempotency_key TEXT NOT NULL UNIQUE, workflow_id TEXT NOT NULL,
+            account_branch_id TEXT NOT NULL, account_no TEXT NOT NULL,
+            account_sub_account TEXT NOT NULL, instrument TEXT NOT NULL,
+            contract_year INTEGER NOT NULL, contract_month INTEGER NOT NULL,
+            side TEXT NOT NULL, kind TEXT NOT NULL, quantity_lots INTEGER NOT NULL,
+            status TEXT NOT NULL, broker_order_no TEXT, filled_quantity INTEGER NOT NULL,
+            avg_fill_price TEXT, last_applied_broker_seq_no INTEGER,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            last_event_summary TEXT NOT NULL, reject_reason TEXT
+        )
+        """
+    )
+    connection.commit()
+
+    repo = SqliteOrderRepository(connection)
+    intent = _intent()
+    assert repo.save_intent(intent) is OrderIntentSaveOutcome.INSERTED
+    assert repo.find_by_local_order_id(intent.local_order_id) == intent
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(order_intents)")}
+    assert {"reason", "triggered_at", "requested_price", "time_in_force"} <= columns
 
 
 def test_save_intent_duplicate_idempotency_key_is_not_inserted_twice(

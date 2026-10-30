@@ -151,7 +151,12 @@ class QuoteRuntime:
         self._last_price_at: dict[Instrument, Timestamp] = {}
         self._gapped: set[Instrument] = set()
         self._coalesced_price_updates = 0
-        self._live = LiveQuoteService(lambda: gateway_factory(self._on_event, self._on_gap), clock)
+        self._live = LiveQuoteService(
+            lambda: gateway_factory(self._on_event, self._on_gap),
+            clock,
+            market_is_open=self._market_is_open,
+            on_forced_recovery=self._on_forced_quote_recovery,
+        )
         event_bus.subscribe(InstrumentSwitchCompleted, self._on_switch)
 
     @property
@@ -166,6 +171,14 @@ class QuoteRuntime:
     @property
     def event_count(self) -> int:
         return self._event_count
+
+    @property
+    def forced_recovery_count(self) -> int:
+        return self._live.forced_recovery_count
+
+    @property
+    def last_recovery_reason(self) -> str | None:
+        return self._live.last_recovery_reason
 
     @property
     def forming_bar(self) -> Bar | None:
@@ -545,6 +558,9 @@ class QuoteRuntime:
     ) -> None:
         if recorded.match_price is None or recorded.matched_at is None:
             return
+        # Health is based on a successfully parsed trade, not merely any OCX callback;
+        # malformed or pre-market packets must not hide a dead price stream.
+        self._live.note_event(recorded.raw.symbol, recorded.raw.received_at)
         if instrument in self._gapped:
             quality = "GAP"
         elif self._live.state is QuoteConnectionState.LOGGED_ON:
@@ -588,7 +604,22 @@ class QuoteRuntime:
             return
         stream.recorder.record(event)
 
+    def _market_is_open(self, at: Timestamp) -> bool:
+        for stream in self._streams.values():
+            entry = self._master.get(stream.instrument, stream.contract)
+            if entry is not None and self._calendar.boundary_containing(at, entry) is not None:
+                return True
+        return False
+
+    def _on_forced_quote_recovery(
+        self, started_at: Timestamp, ended_at: Timestamp, reason: str
+    ) -> None:
+        for symbol in self.recorded_symbols:
+            self._on_gap(MarketDataGap(symbol, started_at, ended_at, reason))
+
     def _on_gap(self, gap: MarketDataGap) -> None:
+        if gap.reason.startswith("registration"):
+            self._live.invalidate_subscription(gap.symbol)
         log_warning(
             _logger,
             "market_data_gap_detected",

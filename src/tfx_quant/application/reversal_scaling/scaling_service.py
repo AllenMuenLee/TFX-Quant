@@ -137,6 +137,7 @@ class ScalingService:
             idempotency_key=idempotency_key,
             workflow_id=idempotency_key,
             reason=signal.reason,
+            triggered_at=signal.at,
         )
         order_intent = self._order_manager.submit(request)
         return ScalingDecision(allowed=True, reason=None, order_intent=order_intent)

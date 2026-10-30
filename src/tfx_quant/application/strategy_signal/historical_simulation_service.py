@@ -271,6 +271,7 @@ class HistoricalSimulationService:
                 idempotency_key=key,
                 workflow_id=key,
                 reason=f"歷史模擬成交：{candidate.decision.reason}",
+                triggered_at=candidate.decision.at,
             )
             self._suspend_live_engine(candidate)
             try:

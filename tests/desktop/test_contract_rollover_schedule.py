@@ -24,6 +24,7 @@ def _frame(now: datetime) -> SimpleNamespace:
         _closing=False,
         _contract_rollover_timer=MagicMock(),
         _night_resume_timer=MagicMock(),
+        _quote_watchdog_timer=MagicMock(),
         _selector=MagicMock(),
         _refresh=MagicMock(),
         _unsubscribers=[MagicMock()],
@@ -90,6 +91,7 @@ def test_close_cancels_rollover_and_ignores_pending_ui_signal() -> None:
     frame = _frame(datetime(2026, 9, 16, 13, 30, tzinfo=TAIPEI_TZ))
     ReadinessFrame._on_close(frame, MagicMock())  # type: ignore[arg-type]
     frame._contract_rollover_timer.Stop.assert_called_once()
+    frame._quote_watchdog_timer.Stop.assert_called_once()
     ReadinessFrame._on_contract_rollover_wake(frame, None)  # type: ignore[arg-type]
     frame._apply_contract_change()
     frame._services.instrument_selection.refresh_auto_selection.assert_not_called()
