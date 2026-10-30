@@ -13,6 +13,7 @@ from tfx_quant.domain.instrument import Instrument
 from tfx_quant.domain.side import Side
 from tfx_quant.domain.signal import SignalKind
 from tfx_quant.domain.strategy_signal_engine import (
+    FIXED_ENTRY_LOTS,
     EngineConfig,
     PositionSide,
     StrategyDecision,
@@ -150,13 +151,11 @@ def replay_history_state(
         if decision.signal_kind is SignalKind.EXIT_ALL:
             side = Side.SELL if decision.position_side is PositionSide.LONG else Side.BUY
             quantity = decision.position_lots
+        elif decision.signal_kind in (SignalKind.ENTER_LONG, SignalKind.ENTER_SHORT):
+            side = Side.BUY if decision.signal_kind is SignalKind.ENTER_LONG else Side.SELL
+            quantity = FIXED_ENTRY_LOTS
         else:
-            side = (
-                Side.BUY
-                if decision.signal_kind in (SignalKind.ENTER_LONG, SignalKind.ADD_LONG)
-                else Side.SELL
-            )
-            quantity = 1
+            raise ValueError("fixed two-lot history replay does not permit add-on decisions")
         results.append(HistoricalTrade(record, decision, side, quantity))
         # Keep replay decisions stateful. TEST composition separately persists the same
         # assumed fills through the simulator; production merely displays candidates.

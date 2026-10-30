@@ -17,7 +17,6 @@ from tfx_quant.application.strategy_signal.history_replay import (
     HistoricalReplay,
     replay_history_state,
 )
-from tfx_quant.desktop.view_models.historical_trades_view_model import missed_trades
 from tfx_quant.domain.account import TradingAccount
 from tfx_quant.domain.bar import Bar
 from tfx_quant.domain.bar_record import BarDataSource, BarPeriod, BarRecord, MarketSession
@@ -89,20 +88,17 @@ def _record(index: int, close: str) -> BarRecord:
     )
 
 
-def test_history_signals_fill_in_order_update_inventory_and_enable_add_on() -> None:
+def test_history_signal_opens_two_lots_once_without_an_add_on() -> None:
     records = tuple(
-        _record(index, close)
-        for index, close in enumerate(("100", "110", "120", "130", "140"))
+        _record(index, close) for index, close in enumerate(("100", "110", "120", "130", "140"))
     )
     replay = replay_history_state(
         records,
         lambda end: Timestamp(end.value + timedelta(hours=1)),
         EngineConfig(ma_window=2, flat_lookback=2, flat_threshold_points=Decimal("1")),
     )
-    assert [trade.decision.signal_kind for trade in replay.trades] == [
-        SignalKind.ENTER_LONG,
-        SignalKind.ADD_LONG,
-    ]
+    assert [trade.decision.signal_kind for trade in replay.trades] == [SignalKind.ENTER_LONG]
+    assert replay.trades[0].quantity == 2
 
     bus = _Bus()
     gateway = MockTradeGateway(
@@ -144,25 +140,24 @@ def test_history_signals_fill_in_order_update_inventory_and_enable_add_on() -> N
 
     service.sync(replay)
 
-    assert len(gateway.submitted_orders) == 2
+    assert len(gateway.submitted_orders) == 1
     assert all(order.status.value == "FILLED" for order in repository.list_all())
     positions = gateway.query_positions()
     assert len(positions) == 1
     assert positions[0].net == NetPosition(2)
-    assert positions[0].average_price == Price(Decimal("135"))
+    assert positions[0].average_price == Price(Decimal("130"))
     assert installed == [replay]
     assert replay.engine is not None
     assert replay.engine.position_side is PositionSide.LONG
     assert len(replay.engine.lots) == 2
 
     service.sync(replay)
-    assert len(gateway.submitted_orders) == 2
+    assert len(gateway.submitted_orders) == 1
 
 
 def _replay() -> HistoricalReplay:
     records = tuple(
-        _record(index, close)
-        for index, close in enumerate(("100", "110", "120", "130", "140"))
+        _record(index, close) for index, close in enumerate(("100", "110", "120", "130", "140"))
     )
     return replay_history_state(
         records,
@@ -217,7 +212,7 @@ def _earlier_run_submit(repository: SqliteOrderRepository, key: str, price: str)
             instrument=Instrument.MXF,
             contract=_CONTRACT,
             side=Side.BUY,
-            quantity=Quantity(1),
+            quantity=Quantity(2),
             price=Price(Decimal(price)),
             kind=OrderKind.OPEN,
             time_in_force=TimeInForce.ROD,
@@ -240,7 +235,7 @@ def test_order_left_open_by_an_earlier_run_is_executed_at_the_replay_price() -> 
     service.sync(replay)
 
     orders = repository.list_all()
-    assert len(orders) == 2
+    assert len(orders) == 1
     assert all(order.status is OrderStatus.FILLED for order in orders)
     entry = repository.find_by_idempotency_key(entry_key)
     assert entry is not None
@@ -268,15 +263,15 @@ def test_restart_restores_filled_inventory_and_only_executes_what_is_missing() -
     first = MockTradeGateway(track_positions_from_fills=True, execute_on_submit=True)
     _, _, service = _simulation(repository, first)
     service.sync(replace(replay, trades=replay.trades[:1]))
-    assert first.query_positions()[0].net == NetPosition(1)
+    assert first.query_positions()[0].net == NetPosition(2)
 
     restarted = MockTradeGateway(track_positions_from_fills=True, execute_on_submit=True)
     restarted.restore_filled(repository.list_all())
-    assert restarted.query_positions()[0].net == NetPosition(1)
+    assert restarted.query_positions()[0].net == NetPosition(2)
     _, _, service = _simulation(repository, restarted)
     service.sync(replay)
 
-    assert len(restarted.submitted_orders) == 1
+    assert len(restarted.submitted_orders) == 0
     assert restarted.query_positions()[0].net == NetPosition(2)
 
 
@@ -297,25 +292,13 @@ def test_position_already_at_the_replay_target_is_not_traded_again() -> None:
     _, _, service = _simulation(repository, gateway)
     service.sync(replay)
 
-    # The entry already happened another way; only the add-on is executed.
+    # The fixed entry target is two lots, so only the one missing lot is executed.
     assert [order.quantity.lots for order in gateway.submitted_orders] == [1]
     assert gateway.query_positions()[0].net == NetPosition(2)
 
 
-def test_order_left_open_for_a_later_candidate_is_cancelled_and_that_candidate_retried() -> None:
+def test_fixed_entry_has_no_later_add_on_candidate_to_retry() -> None:
     replay = _replay()
-    repository = SqliteOrderRepository(sqlite3.connect(":memory:", check_same_thread=False))
-    add_key = replay.trades[1].decision.intent_key
-    assert add_key is not None
-    _earlier_run_submit(repository, add_key, "999")
-
-    gateway = MockTradeGateway(track_positions_from_fills=True, execute_on_submit=True)
-    _, _, service = _simulation(repository, gateway)
-    service.sync(replay)
-
-    stale = repository.find_by_idempotency_key(add_key)
-    assert stale is not None and stale.status is OrderStatus.CANCELLED
-    retried = repository.find_by_idempotency_key(f"{add_key}#retry1")
-    assert retried is not None and retried.status is OrderStatus.FILLED
-    assert gateway.query_positions()[0].net == NetPosition(2)
-    assert missed_trades(replay.trades, repository.list_all(), _ACCOUNT) == []
+    assert len(replay.trades) == 1
+    assert replay.trades[0].decision.signal_kind is SignalKind.ENTER_LONG
+    assert replay.trades[0].quantity == 2

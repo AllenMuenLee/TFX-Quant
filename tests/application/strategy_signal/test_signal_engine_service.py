@@ -35,6 +35,7 @@ from tfx_quant.persistence.sqlite_order_repository import SqliteOrderRepository
 _ACCOUNT = TradingAccount(branch_id="0001", account_no="1234567")
 _INSTRUMENT = Instrument.MXF
 _CONTRACT = ContractMonth(year=2026, month=9)
+_OCTOBER_CONTRACT = ContractMonth(year=2026, month=10)
 _MA_WINDOW = 20
 _FLAT_LOOKBACK = 5
 _WARMUP = _MA_WINDOW + _FLAT_LOOKBACK
@@ -122,6 +123,16 @@ def _rising_warmup_plus_entry(
     return _bars(closes, opens=opens)
 
 
+def _falling_warmup_plus_short_entry_at_45088() -> list[Bar]:
+    warmup = [str(Decimal("46000") - Decimal("10") * i) for i in range(_WARMUP - 2)]
+    bars = _bars(
+        warmup + ["45098", "45088"],
+        opens=warmup + ["45108", "45098"],
+        final_start=datetime(2026, 10, 30, 9, 45, tzinfo=TAIPEI_TZ),
+    )
+    return [replace(bar, contract=_OCTOBER_CONTRACT) for bar in bars]
+
+
 def _service(
     bars_reviewed: Callable[[list[Bar]], bool] | None = None,
     position_lookup: Callable[[TradingAccount, Instrument, ContractMonth], NetPosition]
@@ -180,7 +191,7 @@ def test_entry_signal_submits_order_via_order_manager() -> None:
     assert len(gateway.submitted_orders) == 1
     order = gateway.submitted_orders[0]
     assert order.side is Side.BUY
-    assert order.quantity.lots == 1
+    assert order.quantity.lots == 2
     assert order.kind is OrderKind.OPEN
     assert order.price == Price(Decimal("10380"))
 
@@ -228,25 +239,21 @@ def test_unconfirmed_bar_used_by_ma_lookback_blocks_until_it_rolls_out() -> None
     assert len(gateway.submitted_orders) == 1
 
 
-def test_fill_confirmation_enables_add_on_signal() -> None:
-    service, gateway, repo, event_bus, _clock = _service()
+def test_fixed_two_lot_fill_never_enables_an_add_on_order() -> None:
+    _service_instance, gateway, _repo, event_bus, _clock = _service()
     bars = _rising_warmup_plus_entry()
     _publish_bars(event_bus, bars)
     entry_order = gateway.submitted_orders[0]
 
     gateway.simulate_ack(entry_order.client_order_id, "B0001")
-    gateway.simulate_fill(entry_order.client_order_id, 1, Decimal("10380"), broker_fill_no="F1")
+    gateway.simulate_fill(entry_order.client_order_id, 2, Decimal("10380"), broker_fill_no="F1")
 
     add_bar = _bars(
         ["10390"], opens=["10380"], final_start=bars[-1].start.value + timedelta(hours=1)
     )[0]
     _publish_bars(event_bus, [add_bar])
 
-    assert len(gateway.submitted_orders) == 2
-    add_order = gateway.submitted_orders[1]
-    assert add_order.side is Side.BUY
-    assert add_order.quantity.lots == 1
-    assert add_order.price == Price(Decimal("10390"))
+    assert len(gateway.submitted_orders) == 1
 
 
 def test_persisted_trade_price_triggers_intrabar_two_lot_profit_close() -> None:
@@ -255,17 +262,9 @@ def test_persisted_trade_price_triggers_intrabar_two_lot_profit_close() -> None:
     _publish_bars(event_bus, bars)
     entry = gateway.submitted_orders[0]
     gateway.simulate_ack(entry.client_order_id, "B0001")
-    gateway.simulate_fill(entry.client_order_id, 1, Decimal("10380"), broker_fill_no="F1")
+    gateway.simulate_fill(entry.client_order_id, 2, Decimal("10380"), broker_fill_no="F1")
 
-    add_bar = _bars(
-        ["10390"], opens=["10380"], final_start=bars[-1].start.value + timedelta(hours=1)
-    )[0]
-    _publish_bars(event_bus, [add_bar])
-    add = gateway.submitted_orders[1]
-    gateway.simulate_ack(add.client_order_id, "B0002")
-    gateway.simulate_fill(add.client_order_id, 1, Decimal("10390"), broker_fill_no="F2")
-
-    at = Timestamp(add_bar.end.value + timedelta(minutes=10))
+    at = Timestamp(bars[-1].end.value + timedelta(minutes=10))
     event_bus.publish(
         TradePriceRecorded(
             at=at,
@@ -276,7 +275,7 @@ def test_persisted_trade_price_triggers_intrabar_two_lot_profit_close() -> None:
             quality="GAP",
         )
     )
-    assert len(gateway.submitted_orders) == 2
+    assert len(gateway.submitted_orders) == 1
     event_bus.publish(
         TradePriceRecorded(
             at=at,
@@ -297,7 +296,7 @@ def test_persisted_trade_price_triggers_intrabar_two_lot_profit_close() -> None:
             quality="OK",
         )
     )
-    assert len(gateway.submitted_orders) == 2
+    assert len(gateway.submitted_orders) == 1
     event_bus.publish(
         TradePriceRecorded(
             at=at,
@@ -308,8 +307,8 @@ def test_persisted_trade_price_triggers_intrabar_two_lot_profit_close() -> None:
             quality="OK",
         )
     )
-    assert len(gateway.submitted_orders) == 3
-    close = gateway.submitted_orders[2]
+    assert len(gateway.submitted_orders) == 2
+    close = gateway.submitted_orders[1]
     assert close.side is Side.SELL
     assert close.kind is OrderKind.CLOSE
     assert close.quantity.lots == 2
@@ -324,7 +323,61 @@ def test_persisted_trade_price_triggers_intrabar_two_lot_profit_close() -> None:
             quality="OK",
         )
     )
-    assert len(gateway.submitted_orders) == 3
+    assert len(gateway.submitted_orders) == 2
+
+
+def test_short_45088_stops_both_lots_on_the_first_intrabar_trade_at_45388() -> None:
+    _service_instance, gateway, repo, event_bus, _clock = _service()
+    bars = _falling_warmup_plus_short_entry_at_45088()
+    _publish_bars(event_bus, bars)
+
+    assert len(gateway.submitted_orders) == 1
+    entry = gateway.submitted_orders[0]
+    assert entry.side is Side.SELL
+    assert entry.kind is OrderKind.OPEN
+    assert entry.quantity.lots == 2
+    assert entry.price == Price(Decimal("45088"))
+    gateway.simulate_ack(entry.client_order_id, "B-SHORT")
+    gateway.simulate_fill(entry.client_order_id, 2, Decimal("45088"), broker_fill_no="F-SHORT")
+
+    before_stop = Timestamp(datetime(2026, 10, 30, 11, 0, tzinfo=TAIPEI_TZ))
+    event_bus.publish(
+        TradePriceRecorded(
+            at=before_stop,
+            instrument=_INSTRUMENT,
+            contract=_OCTOBER_CONTRACT,
+            price=Decimal("45387"),
+            observed_at=before_stop,
+            quality="OK",
+        )
+    )
+    assert len(gateway.submitted_orders) == 1
+
+    stop_at = Timestamp(datetime(2026, 10, 30, 11, 1, tzinfo=TAIPEI_TZ))
+    event_bus.publish(
+        TradePriceRecorded(
+            at=stop_at,
+            instrument=_INSTRUMENT,
+            contract=_OCTOBER_CONTRACT,
+            price=Decimal("45388"),
+            observed_at=stop_at,
+            quality="OK",
+        )
+    )
+
+    assert len(gateway.submitted_orders) == 2
+    stop = gateway.submitted_orders[1]
+    assert stop.side is Side.BUY
+    assert stop.kind is OrderKind.CLOSE
+    assert stop.quantity.lots == 2
+    assert stop.price == Price(Decimal("45388"))
+    persisted = repo.find_by_client_order_id(stop.client_order_id)
+    assert persisted is not None
+    assert persisted.triggered_at == stop_at
+    assert "停損" in persisted.reason
+    assert "300" in persisted.reason
+    assert "30000" in persisted.reason
+    assert "實際成交依券商回報" in persisted.reason
 
 
 def test_replaying_the_same_closed_bar_does_not_double_submit() -> None:
@@ -451,7 +504,7 @@ def test_clock_tick_submits_flatten_order_once_position_established() -> None:
     _publish_bars(event_bus, bars)
     entry_order = gateway.submitted_orders[0]
     gateway.simulate_ack(entry_order.client_order_id, "B0001")
-    gateway.simulate_fill(entry_order.client_order_id, 1, Decimal("10380"), broker_fill_no="F1")
+    gateway.simulate_fill(entry_order.client_order_id, 2, Decimal("10380"), broker_fill_no="F1")
 
     service.on_clock_tick(Timestamp(datetime(2026, 9, 17, 4, 55, tzinfo=TAIPEI_TZ)))
 
@@ -459,4 +512,4 @@ def test_clock_tick_submits_flatten_order_once_position_established() -> None:
     flatten_order = gateway.submitted_orders[1]
     assert flatten_order.side is Side.SELL
     assert flatten_order.kind is OrderKind.CLOSE
-    assert flatten_order.quantity.lots == 1
+    assert flatten_order.quantity.lots == 2

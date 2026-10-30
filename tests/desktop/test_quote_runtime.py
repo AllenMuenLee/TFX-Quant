@@ -695,7 +695,8 @@ def test_history_replay_recomputes_after_edits_without_live_orders() -> None:
     candidates = h.runtime.historical_trades()
     assert candidates
     assert any(c.decision.rule == "enter_long" for c in candidates)
-    assert any(c.decision.rule == "add_long" for c in candidates)
+    assert all(c.decision.rule != "add_long" for c in candidates)
+    assert next(c for c in candidates if c.decision.rule == "enter_long").quantity == 2
     assert any(c.decision.rule == "eod_flatten" for c in candidates)
     assert len({c.decision.intent_key for c in candidates}) == len(candidates)
     assert h.runtime.historical_trades() is candidates
@@ -833,6 +834,7 @@ def test_missed_history_excludes_executed_signals_but_keeps_unfilled_quantity() 
 
     from dataclasses import replace
 
+    order.filled_quantity = 1
     partial = replace(candidate, quantity=2)
     assert missed_trades([partial], [order], account)[0].quantity == 1
 

@@ -237,9 +237,7 @@ def test_six_small_ma_changes_also_block_add_on() -> None:
     opens = closes[:-1] + [str(Decimal(closes[-1]) + 5)]
     bars = _bars(closes, opens=opens)
     _feed(engine, bars[:-1])
-    engine.on_fill_confirmed(
-        side=Side.SELL, price=Decimal(closes[-2]), quantity=1, at=bars[-2].end
-    )
+    engine.on_fill_confirmed(side=Side.SELL, price=Decimal(closes[-2]), quantity=1, at=bars[-2].end)
 
     decision = _feed(engine, bars[-1:])
 
@@ -392,10 +390,10 @@ def test_entry_blocked_before_1045_then_allowed_at_1045() -> None:
     assert decision2.signal_kind is SignalKind.ENTER_LONG
 
 
-# -- Add-on -----------------------------------------------------------------------------------
+# -- Fixed two-lot entry ----------------------------------------------------------------------
 
 
-def test_add_long_after_first_lot_confirmed_and_one_more_red() -> None:
+def test_fixed_two_lot_fill_never_adds_on_a_later_red_bar() -> None:
     engine = _engine()
     tail_closes = ["10370", "10380"]
     tail_opens = ["10360", "10370"]
@@ -403,17 +401,18 @@ def test_add_long_after_first_lot_confirmed_and_one_more_red() -> None:
     decision = _feed(engine, bars)
     assert decision.signal_kind is SignalKind.ENTER_LONG
 
-    engine.on_fill_confirmed(side=Side.BUY, price=Decimal("10380"), quantity=1, at=bars[-1].end)
+    engine.on_fill_confirmed(side=Side.BUY, price=Decimal("10380"), quantity=2, at=bars[-1].end)
     assert engine.position_side is PositionSide.LONG
-    assert len(engine.lots) == 1
+    assert len(engine.lots) == 2
 
     next_bar = _bars(
         ["10390"], opens=["10380"], final_start=bars[-1].start.value + timedelta(hours=1)
     )[0]
-    add_decision = engine.on_bar_closed(
+    next_decision = engine.on_bar_closed(
         next_bar, data_reliable=True, has_active_order=False, position_state_uncertain=False
     )
-    assert add_decision.signal_kind is SignalKind.ADD_LONG
+    assert next_decision.signal_kind is None
+    assert "不追加" in next_decision.reason
 
 
 def test_add_blocked_until_first_lot_fill_confirmed() -> None:
@@ -434,7 +433,7 @@ def test_add_blocked_until_first_lot_fill_confirmed() -> None:
     assert engine.position_side is PositionSide.FLAT
 
 
-def test_max_two_lots_blocks_further_adds() -> None:
+def test_two_partial_fills_complete_the_fixed_entry_without_enabling_adds() -> None:
     engine = _engine(EngineConfig())
     tail_closes = ["10370", "10380"]
     tail_opens = ["10360", "10370"]
@@ -445,10 +444,10 @@ def test_max_two_lots_blocks_further_adds() -> None:
     add_bar = _bars(
         ["10390"], opens=["10380"], final_start=bars[-1].start.value + timedelta(hours=1)
     )[0]
-    add_decision = engine.on_bar_closed(
+    no_add = engine.on_bar_closed(
         add_bar, data_reliable=True, has_active_order=False, position_state_uncertain=False
     )
-    assert add_decision.signal_kind is SignalKind.ADD_LONG
+    assert no_add.signal_kind is None
     engine.on_fill_confirmed(side=Side.BUY, price=Decimal("10390"), quantity=1, at=add_bar.end)
     assert len(engine.lots) == 2
 
@@ -459,7 +458,7 @@ def test_max_two_lots_blocks_further_adds() -> None:
         third_bar, data_reliable=True, has_active_order=False, position_state_uncertain=False
     )
     assert third_decision.signal_kind is None
-    assert third_decision.reason == "已達最大口數，禁止加碼"
+    assert "不追加" in third_decision.reason
 
 
 def test_opening_beyond_max_lots_raises() -> None:
@@ -511,7 +510,7 @@ def test_stop_loss_not_yet_triggered_below_300_points() -> None:
     assert decision.signal_kind is None
 
 
-def test_stop_loss_two_lots_rebases_to_second_lot_and_closes_all() -> None:
+def test_stop_loss_two_lots_uses_actual_average_fill_and_closes_all() -> None:
     engine = _engine()
     tail_closes = ["10370", "10380"]
     tail_opens = ["10360", "10370"]
@@ -519,19 +518,11 @@ def test_stop_loss_two_lots_rebases_to_second_lot_and_closes_all() -> None:
     _feed(engine, bars)
     engine.on_fill_confirmed(side=Side.BUY, price=Decimal("10380"), quantity=1, at=bars[-1].end)
 
-    add_bar = _bars(
-        ["10390"], opens=["10380"], final_start=bars[-1].start.value + timedelta(hours=1)
-    )[0]
-    add_decision = engine.on_bar_closed(
-        add_bar, data_reliable=True, has_active_order=False, position_state_uncertain=False
-    )
-    assert add_decision.signal_kind is SignalKind.ADD_LONG
-    engine.on_fill_confirmed(side=Side.BUY, price=Decimal("10390"), quantity=1, at=add_bar.end)
+    engine.on_fill_confirmed(side=Side.BUY, price=Decimal("10390"), quantity=1, at=bars[-1].end)
 
-    # Price only 300 below lot1's basis (10380) would NOT trigger under the rebased basis
-    # (10390) — must be 300 below the *second* lot's price to trigger.
+    # Actual average fill is 10385, so 10086 is safe and 10085 is the exact stop.
     just_under_bar = _bars(
-        ["10091"], opens=["10390"], final_start=add_bar.start.value + timedelta(hours=1)
+        ["10086"], opens=["10390"], final_start=bars[-1].start.value + timedelta(hours=1)
     )[0]
     not_yet = engine.on_bar_closed(
         just_under_bar, data_reliable=True, has_active_order=False, position_state_uncertain=False
@@ -539,14 +530,14 @@ def test_stop_loss_two_lots_rebases_to_second_lot_and_closes_all() -> None:
     assert not_yet.signal_kind is None
 
     stop_bar = _bars(
-        ["10090"], opens=["10091"], final_start=just_under_bar.start.value + timedelta(hours=1)
+        ["10085"], opens=["10086"], final_start=just_under_bar.start.value + timedelta(hours=1)
     )[0]
     decision = engine.on_bar_closed(
         stop_bar, data_reliable=True, has_active_order=False, position_state_uncertain=False
     )
     assert decision.signal_kind is SignalKind.EXIT_ALL
     assert decision.rule == "stop_loss"
-    assert decision.stop_basis == Decimal("10390")
+    assert decision.stop_basis == Decimal("10385")
     assert decision.position_lots == 2
 
 
@@ -647,7 +638,7 @@ def test_intrabar_trade_price_triggers_two_lot_profit_exit_before_bar_close() ->
     assert peak.signal_kind is None
     assert peak.profit_tracking_active is True
     assert peak.profit_basis == Decimal("48833")
-    assert peak.stop_basis == Decimal("48905")
+    assert peak.stop_basis == Decimal("48833")
     assert peak.max_favorable_points == Decimal("659")
 
     above_trigger = engine.on_trade_price(

@@ -7,10 +7,10 @@ intent. Never calls a broker, never treats a submitted order as filled; the call
 (application layer) is responsible for turning a decision's `signal_kind` into an actual
 order via `OrderManager`, keyed by `intent_key` for idempotent, replay-safe submission.
 
-**Position bases**: the 300-point stop-loss keeps the most recently filled lot's
-actual price. Profit activation and pullback use the arithmetic mean of confirmed
-opening fills; both lots exit together. A tracked price peak is rebased into points
-when a new lot fills so the same observed market high/low remains the peak.
+**Position bases**: every entry is one fixed two-lot order and there is no add-on.
+The 300-point stop-loss, profit activation and pullback all use the arithmetic mean of
+the confirmed opening fills; both lots exit together. Partial fill reports may arrive
+one lot at a time, but they belong to the same entry order and never create a new signal.
 
 **20MA slope**: an exact Decimal one-bar delta between the current and immediately
 preceding closed bar's 20MA (see `domain.moving_average.determine_slope`) — also an
@@ -46,7 +46,8 @@ from tfx_quant.domain.side import Side
 from tfx_quant.domain.signal import SignalKind
 from tfx_quant.domain.timestamp import Timestamp
 
-STRATEGY_VERSION = "3"
+STRATEGY_VERSION = "4"
+FIXED_ENTRY_LOTS = MAX_LOTS
 
 _DEFAULT_MA_WINDOW = 20
 _DEFAULT_FLAT_LOOKBACK = 5
@@ -301,9 +302,7 @@ class StrategySignalEngine:
         if quantity <= 0:
             raise InvalidStrategyEngineError(f"quantity must be > 0, got {quantity}")
         if self._position_side is PositionSide.FLAT or self._is_opening_side(side):
-            if quantity != 1:
-                raise InvalidStrategyEngineError("opening fills must be exactly 1 lot at a time")
-            if len(self._lots) >= self._config.max_lots:
+            if len(self._lots) + quantity > FIXED_ENTRY_LOTS:
                 raise InvalidStrategyEngineError("cannot open beyond max_lots")
             old_profit_basis = self._profit_basis()
             old_peak_price: Decimal | None = None
@@ -315,8 +314,8 @@ class StrategySignalEngine:
                 )
             if self._position_side is PositionSide.FLAT:
                 self._position_side = PositionSide.LONG if side is Side.BUY else PositionSide.SHORT
-            self._lots.append(LotFill(price=price, at=at))
-            self._active_basis = price
+            self._lots.extend(LotFill(price=price, at=at) for _ in range(quantity))
+            self._active_basis = self._profit_basis()
             if old_peak_price is not None:
                 new_profit_basis = self._profit_basis()
                 assert new_profit_basis is not None
@@ -483,20 +482,30 @@ class StrategySignalEngine:
         points = self._signed_points(self._last_price, self._active_basis)
         if points > -self._config.stop_loss_points:
             return None
+        detail = (
+            f"現價 {self._last_price}、成交均價 {self._active_basis}、"
+            f"持倉 {len(self._lots)} 口、逆向 {-points} 點"
+        )
+        if self._instrument is Instrument.MXF:
+            configured_gross = self._config.stop_loss_points * Decimal(50) * len(self._lots)
+            detail += (
+                f"；設定門檻 {self._config.stop_loss_points} 點 × 小台每點 50 元 × "
+                f"{len(self._lots)} 口 = {configured_gross} 元（觸發值，實際成交依券商回報）"
+            )
         if ctx.has_active_order:
             return self._make(
                 ctx,
                 rule="stop_loss",
                 passed=False,
                 signal_kind=None,
-                reason=f"停損已觸發（逆向 {-points} 點），但已有活動委託",
+                reason=f"停損已觸發：{detail}；但已有活動委託",
             )
         return self._make(
             ctx,
             rule="stop_loss",
             passed=True,
             signal_kind=SignalKind.EXIT_ALL,
-            reason=f"停損觸發：逆向達 {-points} 點（基準 {self._active_basis}）",
+            reason=f"停損觸發：{detail}",
         )
 
     # -- Priority 3: 30% profit-pullback exit -------------------------------------------------
@@ -555,7 +564,7 @@ class StrategySignalEngine:
                 rule="no_signal",
                 passed=False,
                 signal_kind=None,
-                reason="行情資料不可靠（stale/gap/修訂未解決），禁止新進場或加碼",
+                reason="行情資料不可靠（stale/gap/修訂未解決），禁止新進場",
             )
         if ctx.ma_current is None:
             return self._make(
@@ -572,8 +581,7 @@ class StrategySignalEngine:
                 passed=False,
                 signal_kind=None,
                 reason=(
-                    f"近{self._config.flat_lookback}根20MA樣本不足，"
-                    "無法判斷均線走平，禁止新進場或加碼"
+                    f"近{self._config.flat_lookback}根20MA樣本不足，無法判斷均線走平，禁止新進場"
                 ),
             )
         if ctx.ma_is_choppy:
@@ -609,28 +617,18 @@ class StrategySignalEngine:
                 rule="no_signal",
                 passed=False,
                 signal_kind=None,
-                reason="已有活動委託，禁止新進場或加碼",
+                reason="已有活動委託，禁止新進場",
             )
 
         if self._position_side is PositionSide.FLAT:
             return self._check_flat_entry(ctx)
-        if len(self._lots) >= self._config.max_lots:
-            return self._make(
-                ctx,
-                rule="no_signal",
-                passed=False,
-                signal_kind=None,
-                reason="已達最大口數，禁止加碼",
-            )
-        if len(self._lots) != 1:
-            return self._make(
-                ctx,
-                rule="no_signal",
-                passed=False,
-                signal_kind=None,
-                reason="第1口尚未以實際成交回報確認，禁止加碼",
-            )
-        return self._check_add_on(ctx)
+        return self._make(
+            ctx,
+            rule="no_signal",
+            passed=False,
+            signal_kind=None,
+            reason="固定2口持倉中；本策略不追加部位",
+        )
 
     def _check_flat_entry(self, ctx: _EvalContext) -> StrategyDecision:
         if self._streak.color is CandleColor.RED and self._streak.length >= 2:
@@ -640,7 +638,7 @@ class StrategySignalEngine:
                     rule="enter_long",
                     passed=True,
                     signal_kind=SignalKind.ENTER_LONG,
-                    reason="連續兩根紅K且20MA向上",
+                    reason="連續兩根紅K且20MA向上：固定進場2口，不加碼",
                 )
             return self._make(
                 ctx,
@@ -656,7 +654,7 @@ class StrategySignalEngine:
                     rule="enter_short",
                     passed=True,
                     signal_kind=SignalKind.ENTER_SHORT,
-                    reason="連續兩根黑K且20MA向下",
+                    reason="連續兩根黑K且20MA向下：固定進場2口，不加碼",
                 )
             return self._make(
                 ctx,
@@ -667,31 +665,6 @@ class StrategySignalEngine:
             )
         return self._make(
             ctx, rule="no_signal", passed=False, signal_kind=None, reason="未滿足連續兩根同色K"
-        )
-
-    def _check_add_on(self, ctx: _EvalContext) -> StrategyDecision:
-        if self._position_side is PositionSide.LONG:
-            if ctx.candle_color is CandleColor.RED:
-                return self._make(
-                    ctx,
-                    rule="add_long",
-                    passed=True,
-                    signal_kind=SignalKind.ADD_LONG,
-                    reason="多單加碼：再一根紅K",
-                )
-            return self._make(
-                ctx, rule="no_signal", passed=False, signal_kind=None, reason="非紅K，不加碼"
-            )
-        if ctx.candle_color is CandleColor.BLACK:
-            return self._make(
-                ctx,
-                rule="add_short",
-                passed=True,
-                signal_kind=SignalKind.ADD_SHORT,
-                reason="空單加碼：再一根黑K",
-            )
-        return self._make(
-            ctx, rule="no_signal", passed=False, signal_kind=None, reason="非黑K，不加碼"
         )
 
     # -- Shared helpers -----------------------------------------------------------------------

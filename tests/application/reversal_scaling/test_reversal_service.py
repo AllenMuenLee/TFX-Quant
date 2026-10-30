@@ -220,11 +220,11 @@ def test_reversal_from_short_two_lots_completes() -> None:
     assert entry_id is not None
     entry_order = next(o for o in h.gateway.submitted_orders if o.client_order_id == entry_id)
     assert entry_order.side is Side.BUY
-    assert entry_order.quantity == Quantity(1)
+    assert entry_order.quantity == Quantity(2)
     assert entry_order.kind is OrderKind.OPEN
 
     h.gateway.simulate_ack(entry_id, "B-entry")
-    h.gateway.simulate_fill(entry_id, 1, Decimal("18500"), broker_fill_no="F-entry")
+    h.gateway.simulate_fill(entry_id, 2, Decimal("18500"), broker_fill_no="F-entry")
     final = h.reversal_repo.find_by_workflow_id(record.workflow_id)
     assert final is not None
     assert final.state is ReversalWorkflowState.COMPLETED

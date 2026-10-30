@@ -18,7 +18,6 @@ from tfx_quant.domain.contract import ContractMonth
 from tfx_quant.domain.instrument import Instrument
 from tfx_quant.domain.money import Price
 from tfx_quant.domain.order import OrderKind, TimeInForce
-from tfx_quant.domain.order_state_machine import OrderStatus
 from tfx_quant.domain.position import Position
 from tfx_quant.domain.quantity import NetPosition, Quantity
 from tfx_quant.domain.side import Side
@@ -110,30 +109,29 @@ def _setup(
     return scaling, gateway, repo, order_manager, clock
 
 
-# -- Allowed path ------------------------------------------------------------------------
+# -- Permanently disabled add-on path ----------------------------------------------------
 
 
-def test_scaling_allowed_submits_exactly_one_order() -> None:
+def test_scaling_long_is_rejected_without_submitting_an_order() -> None:
     scaling, gateway, _repo, _om, _clock = _setup(positions=(_position(1),))
     decision = scaling.evaluate_and_submit(
         _signal(SignalKind.ADD_LONG), account=_ACCOUNT, price=_PRICE, idempotency_key="scale-1"
     )
-    assert decision.allowed is True
-    assert decision.order_intent is not None
-    assert decision.order_intent.status is OrderStatus.SUBMITTING
-    assert decision.order_intent.side is Side.BUY
-    assert decision.order_intent.quantity == Quantity(1)
-    assert len(gateway.submitted_orders) == 1
+    assert decision.allowed is False
+    assert decision.order_intent is None
+    assert decision.reason is not None and "固定單次進場 2 口" in decision.reason
+    assert gateway.submitted_orders == []
 
 
-def test_scaling_allowed_for_short_position_add_short() -> None:
+def test_scaling_short_is_rejected_without_submitting_an_order() -> None:
     scaling, gateway, _repo, _om, _clock = _setup(positions=(_position(-1),))
     decision = scaling.evaluate_and_submit(
         _signal(SignalKind.ADD_SHORT), account=_ACCOUNT, price=_PRICE, idempotency_key="scale-1"
     )
-    assert decision.allowed is True
-    assert decision.order_intent is not None
-    assert decision.order_intent.side is Side.SELL
+    assert decision.allowed is False
+    assert decision.order_intent is None
+    assert decision.reason is not None and "永久停用" in decision.reason
+    assert gateway.submitted_orders == []
 
 
 # -- Gate rejections ------------------------------------------------------------------------
@@ -146,7 +144,7 @@ def test_scaling_rejects_when_position_is_not_exactly_one_lot() -> None:
     )
     assert decision.allowed is False
     assert decision.reason is not None
-    assert "±1" in decision.reason
+    assert "永久停用" in decision.reason
     assert len(gateway.submitted_orders) == 0
 
 
@@ -173,7 +171,7 @@ def test_scaling_rejects_when_active_order_exists() -> None:
     )
     assert decision.allowed is False
     assert decision.reason is not None
-    assert "委託" in decision.reason
+    assert "永久停用" in decision.reason
     assert len(gateway.submitted_orders) == 1  # only the unrelated setup order
 
 
@@ -193,7 +191,7 @@ def test_scaling_rejects_too_close_to_eod() -> None:
     )
     assert decision.allowed is False
     assert decision.reason is not None
-    assert "04:55" in decision.reason
+    assert "永久停用" in decision.reason
     assert len(gateway.submitted_orders) == 0
 
 
@@ -216,7 +214,6 @@ def test_duplicate_idempotency_key_never_resends() -> None:
     second = scaling.evaluate_and_submit(
         _signal(SignalKind.ADD_LONG), account=_ACCOUNT, price=_PRICE, idempotency_key="scale-1"
     )
-    assert first.order_intent is not None
-    assert second.order_intent is not None
-    assert first.order_intent.local_order_id == second.order_intent.local_order_id
-    assert len(gateway.submitted_orders) == 1
+    assert first.order_intent is None
+    assert second.order_intent is None
+    assert len(gateway.submitted_orders) == 0

@@ -68,6 +68,7 @@ from tfx_quant.domain.risk import is_within_no_entry_window
 from tfx_quant.domain.side import Side
 from tfx_quant.domain.signal import SignalKind
 from tfx_quant.domain.strategy_signal_engine import (
+    FIXED_ENTRY_LOTS,
     EngineConfig,
     PositionSide,
     StrategyDecision,
@@ -118,13 +119,13 @@ class _OrderShape:
 
 def _order_shape_for(decision: StrategyDecision) -> _OrderShape:
     if decision.signal_kind is SignalKind.ENTER_LONG:
-        return _OrderShape(Side.BUY, 1, OrderKind.OPEN)
+        return _OrderShape(Side.BUY, FIXED_ENTRY_LOTS, OrderKind.OPEN)
     if decision.signal_kind is SignalKind.ENTER_SHORT:
-        return _OrderShape(Side.SELL, 1, OrderKind.OPEN)
+        return _OrderShape(Side.SELL, FIXED_ENTRY_LOTS, OrderKind.OPEN)
     if decision.signal_kind is SignalKind.ADD_LONG:
-        return _OrderShape(Side.BUY, 1, OrderKind.OPEN)
+        raise ValueError("fixed two-lot strategy does not permit ADD_LONG")
     if decision.signal_kind is SignalKind.ADD_SHORT:
-        return _OrderShape(Side.SELL, 1, OrderKind.OPEN)
+        raise ValueError("fixed two-lot strategy does not permit ADD_SHORT")
     if decision.signal_kind is SignalKind.EXIT_ALL:
         closing_side = Side.SELL if decision.position_side is PositionSide.LONG else Side.BUY
         return _OrderShape(closing_side, decision.position_lots, OrderKind.CLOSE)

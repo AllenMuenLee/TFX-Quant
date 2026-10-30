@@ -367,13 +367,13 @@ class ReversalWorkflowService:
             instrument=record.instrument,
             contract=record.contract,
             side=record.reversal_side,
-            quantity=Quantity(1),
+            quantity=Quantity(2),
             price=record.price,
             kind=OrderKind.OPEN,
             time_in_force=TimeInForce.ROD,
             idempotency_key=f"{record.workflow_id.value}:entry",
             workflow_id=str(record.workflow_id.value),
-            reason=f"反手流程（觸發鍵 {record.trigger_key}）：確認淨部位為 0 後建立反向部位",
+            reason=(f"反手流程（觸發鍵 {record.trigger_key}）：確認淨部位為 0 後固定建立反向 2 口"),
             triggered_at=record.created_at,
         )
         try:

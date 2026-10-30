@@ -19,8 +19,7 @@ from tfx_quant.domain.timestamp import TAIPEI_TZ, Timestamp
 
 _CONTRACT = ContractMonth(2026, 10)
 _CONFIG = EngineConfig(ma_window=2, flat_lookback=2, flat_threshold_points=Decimal("1"))
-# Enters long at 48761 on the 4th close and adds at 48905 on the 5th — the client's
-# 10/2 example: average cost 48833, stop basis 48905.
+# Enters two lots at 48761 on the 4th close. The 5th bar must never add.
 _RISING = ("48500", "48600", "48700", "48761", "48905")
 
 
@@ -108,53 +107,53 @@ def _exits(
     return [
         (t.decision.rule, t.side, t.quantity, t.decision.current_price, t.decision.at)
         for t in trades
-        if t.decision.rule not in ("enter_long", "add_long")
+        if t.decision.rule != "enter_long"
     ]
 
 
 def test_profit_pullback_exits_both_lots_at_the_first_trade_past_30_percent() -> None:
-    # Peak 49492 = 659 points over the 48833 average; 30% back is 49294.3.
+    # Peak 49492 = 731 points over 48761; 30% back is 49272.7.
     records = [*_rising(), _record(5, "49205", "49492", "49205", "49210")]
     tape = _Tape(
         [
             (_at(15, 50), "49205"),
             (_at(16, 0), "49492"),
-            (_at(16, 10), "49300"),
-            (_at(16, 20), "49294"),
+            (_at(16, 10), "49273"),
+            (_at(16, 20), "49272"),
             (_at(16, 30), "49205"),
         ]
     )
 
     trades = replay_history(records, _next_close, _CONFIG, tape)
 
-    assert _exits(trades) == [("profit_pullback", Side.SELL, 2, Decimal("49294"), _at(16, 20))]
+    assert _exits(trades) == [("profit_pullback", Side.SELL, 2, Decimal("49272"), _at(16, 20))]
 
 
-def test_stop_fills_at_the_first_trade_300_points_against_the_last_lot() -> None:
-    records = [*_rising(), _record(5, "48905", "48910", "48500", "48530")]
-    tape = _Tape([(_at(16, 0), "48700"), (_at(16, 10), "48605"), (_at(16, 20), "48500")])
+def test_stop_fills_at_the_first_trade_300_points_against_the_fixed_entry() -> None:
+    records = [*_rising(), _record(5, "48905", "48910", "48400", "48430")]
+    tape = _Tape([(_at(16, 0), "48700"), (_at(16, 10), "48461"), (_at(16, 20), "48400")])
 
     trades = replay_history(records, _next_close, _CONFIG, tape)
 
-    assert _exits(trades) == [("stop_loss", Side.SELL, 2, Decimal("48605"), _at(16, 10))]
+    assert _exits(trades) == [("stop_loss", Side.SELL, 2, Decimal("48461"), _at(16, 10))]
 
 
 def test_stop_fires_on_trades_recorded_inside_a_missing_bar() -> None:
     # The 15:45 bar is missing (e.g. a quote re-login); its trades still count.
-    records = [*_rising(), _record(6, "48600", "48650", "48550", "48600")]
-    tape = _Tape([(_at(16, 5), "48800"), (_at(16, 34), "48604"), (_at(17, 0), "48600")])
+    records = [*_rising(), _record(6, "48450", "48500", "48350", "48400")]
+    tape = _Tape([(_at(16, 5), "48800"), (_at(16, 34), "48460"), (_at(17, 0), "48400")])
 
     trades = replay_history(records, _next_close, _CONFIG, tape)
 
-    assert _exits(trades) == [("stop_loss", Side.SELL, 2, Decimal("48604"), _at(16, 34))]
+    assert _exits(trades) == [("stop_loss", Side.SELL, 2, Decimal("48460"), _at(16, 34))]
 
 
 def test_bar_without_recorded_trades_stops_at_the_stop_price() -> None:
-    records = [*_rising(), _record(5, "48900", "48910", "48500", "48530")]
+    records = [*_rising(), _record(5, "48900", "48910", "48400", "48430")]
 
     trades = replay_history(records, _next_close, _CONFIG, _Tape([]))
 
-    assert _exits(trades) == [("stop_loss", Side.SELL, 2, Decimal("48605"), _at(16, 45))]
+    assert _exits(trades) == [("stop_loss", Side.SELL, 2, Decimal("48461"), _at(16, 45))]
 
 
 def test_eod_flatten_uses_the_last_trade_before_the_flatten_time() -> None:
@@ -170,8 +169,8 @@ def test_eod_flatten_uses_the_last_trade_before_the_flatten_time() -> None:
 
 
 def test_without_a_tape_exits_are_still_evaluated_at_the_close() -> None:
-    records = [*_rising(), _record(5, "48905", "48910", "48500", "48530")]
+    records = [*_rising(), _record(5, "48905", "48910", "48400", "48430")]
 
     trades = replay_history(records, _next_close, _CONFIG)
 
-    assert _exits(trades) == [("stop_loss", Side.SELL, 2, Decimal("48530"), _at(16, 45))]
+    assert _exits(trades) == [("stop_loss", Side.SELL, 2, Decimal("48430"), _at(16, 45))]
